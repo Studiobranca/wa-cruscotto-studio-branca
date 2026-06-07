@@ -1,15 +1,17 @@
 import { useState, useEffect, useRef } from 'react';
-import { useConversations, useMessages, useSendMessage, useSetPriority, useSSE } from '../lib/hooks';
+import { useConversations, useMessages, useSendMessage, useSetPriority, useAutoReply, useSSE } from '../lib/hooks';
 import PriorityBadge from '../components/PriorityBadge';
 import Loader from '../components/Loader';
 import type { Conversation } from '../lib/types';
-import { Search, Send, ArrowLeft, MoreVertical, Star, AlertTriangle, User, Volume2 } from 'lucide-react';
+import { Search, Send, ArrowLeft, MoreVertical, Star, AlertTriangle, User, Volume2, Bot, X } from 'lucide-react';
 
 export default function Inbox() {
   const [selectedPhone, setSelectedPhone] = useState<string | null>(null);
   const [search, setSearch] = useState('');
   const [messageInput, setMessageInput] = useState('');
   const [showPriorityMenu, setShowPriorityMenu] = useState(false);
+  const [showAutoReplyPanel, setShowAutoReplyPanel] = useState(false);
+  const [autoReplyText, setAutoReplyText] = useState('');
   const [isMobile, setIsMobile] = useState(window.innerWidth <= 600);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -17,6 +19,7 @@ export default function Inbox() {
   const { data: messages = [], refetch: refetchMessages } = useMessages(selectedPhone || '');
   const sendMsg = useSendMessage(selectedPhone || '');
   const setPriority = useSetPriority(selectedPhone || '');
+  const autoReplyMutation = useAutoReply(selectedPhone || '');
 
   const connectSSE = useSSE((type, data) => {
     if (type === 'message' && data.phone === selectedPhone) {
@@ -39,6 +42,13 @@ export default function Inbox() {
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
+
+  // Aggiorna il testo auto-reply quando cambia la conversazione
+  useEffect(() => {
+    const conv = conversations.find(c => c.phone === selectedPhone);
+    setAutoReplyText(conv?.autoReplyMessage || '');
+    setShowAutoReplyPanel(false);
+  }, [selectedPhone]);
 
   const selectedConv = conversations.find(c => c.phone === selectedPhone);
 
@@ -183,9 +193,19 @@ export default function Inbox() {
                   <div className="chat-contact-phone">{selectedPhone}</div>
                 </div>
                 <div className="chat-header-actions">
+                  {/* Pulsante Auto-reply */}
                   <button
                     className="btn-icon"
-                    onClick={() => setShowPriorityMenu(v => !v)}
+                    onClick={() => { setShowAutoReplyPanel(v => !v); setShowPriorityMenu(false); }}
+                    title="Risposta automatica"
+                    style={selectedConv?.autoReplyEnabled ? { color: '#25D366' } : undefined}
+                  >
+                    <Bot size={18} />
+                  </button>
+                  {/* Pulsante Priorità */}
+                  <button
+                    className="btn-icon"
+                    onClick={() => { setShowPriorityMenu(v => !v); setShowAutoReplyPanel(false); }}
                     title="Priorità"
                   >
                     <MoreVertical size={18} />
@@ -256,6 +276,54 @@ export default function Inbox() {
                 )}
                 <div ref={messagesEndRef} />
               </div>
+
+              {/* Pannello Auto-reply */}
+              {showAutoReplyPanel && (
+                <div className="autoreply-panel">
+                  <div className="autoreply-header">
+                    <Bot size={15} />
+                    <span>Risposta Automatica</span>
+                    <button className="btn-icon" onClick={() => setShowAutoReplyPanel(false)} style={{ marginLeft: 'auto' }}>
+                      <X size={14} />
+                    </button>
+                  </div>
+                  <textarea
+                    className="autoreply-input"
+                    placeholder="Scrivi il messaggio automatico (es: Sono fuori ufficio, ti rispondo presto)..."
+                    value={autoReplyText}
+                    onChange={e => setAutoReplyText(e.target.value)}
+                    rows={3}
+                  />
+                  <div className="autoreply-actions">
+                    <button
+                      className="btn-primary"
+                      onClick={() => {
+                        autoReplyMutation.mutate({ enabled: true, message: autoReplyText });
+                        setShowAutoReplyPanel(false);
+                      }}
+                      disabled={!autoReplyText.trim()}
+                    >
+                      Attiva risposta automatica
+                    </button>
+                    {selectedConv?.autoReplyEnabled ? (
+                      <button
+                        className="btn-secondary"
+                        onClick={() => {
+                          autoReplyMutation.mutate({ enabled: false, message: '' });
+                          setShowAutoReplyPanel(false);
+                        }}
+                      >
+                        Disattiva
+                      </button>
+                    ) : null}
+                  </div>
+                  {selectedConv?.autoReplyEnabled && (
+                    <div className="autoreply-status">
+                      <span style={{ color: '#25D366' }}>● Attiva:</span> {selectedConv.autoReplyMessage}
+                    </div>
+                  )}
+                </div>
+              )}
 
               {/* Input */}
               <div className="chat-input-wrap">

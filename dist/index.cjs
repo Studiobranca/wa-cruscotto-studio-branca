@@ -24149,7 +24149,7 @@ function isPollingRunning() {
 // server/routes.ts
 var router = (0, import_express.Router)();
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.1.0", built: "2026-06-07T08:30:00Z" });
+  res.json({ version: "2.2.0", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/debug/laura", (_req, res) => {
   try {
@@ -24164,8 +24164,8 @@ router.get("/debug/laura", (_req, res) => {
 router.get("/analytics/overview", (req, res) => {
   try {
     const today = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
-    const totalReceived = db_default.prepare(`SELECT COALESCE(SUM(total_received), 0) as val FROM conversations`).get().val;
-    const totalSent = db_default.prepare(`SELECT COALESCE(SUM(total_sent), 0) as val FROM conversations`).get().val;
+    const totalReceived = db_default.prepare(`SELECT COUNT(*) as val FROM live_messages WHERE direction='received'`).get().val;
+    const totalSent = db_default.prepare(`SELECT COUNT(*) as val FROM live_messages WHERE direction='sent'`).get().val;
     const todayReceived = db_default.prepare(`SELECT COUNT(*) as val FROM live_messages WHERE direction='received' AND DATE(created_at) = ?`).get(today).val;
     const unread = db_default.prepare(`SELECT COALESCE(SUM(unread_count), 0) as val FROM conversations`).get().val;
     const activeAlerts = db_default.prepare(`SELECT COUNT(*) as val FROM conversations WHERE priority IN ('vip', 'high')`).get().val;
@@ -24257,6 +24257,7 @@ router.get("/conversations", (req, res) => {
         is_archived as isArchived, priority, priority_label as priorityLabel, created_at as createdAt
       FROM conversations
       WHERE is_archived = ?
+      AND phone NOT LIKE '%@newsletter%'
     `;
     const params = [archived === "1" ? 1 : 0];
     if (search) {
@@ -24387,7 +24388,7 @@ router.post("/webhook/message", async (req, res) => {
     const isImage = msgType === "image";
     const imageUrl = body.image?.imageUrl || body.image?.url || body.imageUrl || null;
     const caption = body.image?.caption || body.caption || "";
-    if (isGroup || phone && phone.includes("-")) {
+    if (isGroup || phone && phone.includes("-") || phone && phone.includes("@newsletter")) {
       return res.json({ ignored: true, reason: "group" });
     }
     if (!phone) {

@@ -8,7 +8,7 @@ const router = Router();
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.1.0', built: '2026-06-07T08:30:00Z' });
+  res.json({ version: '2.2.0', built: new Date().toISOString() });
 });
 
 // ─── Debug ───────────────────────────────────────────────────────────────────
@@ -27,8 +27,8 @@ router.get('/analytics/overview', (req: Request, res: Response) => {
   try {
     const today = new Date().toISOString().split('T')[0];
 
-    const totalReceived = (db.prepare(`SELECT COALESCE(SUM(total_received), 0) as val FROM conversations`).get() as any).val;
-    const totalSent = (db.prepare(`SELECT COALESCE(SUM(total_sent), 0) as val FROM conversations`).get() as any).val;
+    const totalReceived = (db.prepare(`SELECT COUNT(*) as val FROM live_messages WHERE direction='received'`).get() as any).val;
+    const totalSent = (db.prepare(`SELECT COUNT(*) as val FROM live_messages WHERE direction='sent'`).get() as any).val;
     const todayReceived = (db.prepare(`SELECT COUNT(*) as val FROM live_messages WHERE direction='received' AND DATE(created_at) = ?`).get(today) as any).val;
     const unread = (db.prepare(`SELECT COALESCE(SUM(unread_count), 0) as val FROM conversations`).get() as any).val;
     const activeAlerts = (db.prepare(`SELECT COUNT(*) as val FROM conversations WHERE priority IN ('vip', 'high')`).get() as any).val;
@@ -128,6 +128,7 @@ router.get('/conversations', (req: Request, res: Response) => {
         is_archived as isArchived, priority, priority_label as priorityLabel, created_at as createdAt
       FROM conversations
       WHERE is_archived = ?
+      AND phone NOT LIKE '%@newsletter%'
     `;
     const params: any[] = [archived === '1' ? 1 : 0];
 
@@ -291,7 +292,7 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
     const caption = body.image?.caption || body.caption || '';
 
     // Ignore groups
-    if (isGroup || (phone && phone.includes('-'))) {
+    if (isGroup || (phone && phone.includes('-')) || (phone && phone.includes('@newsletter'))) {
       return res.json({ ignored: true, reason: 'group' });
     }
 
