@@ -17,7 +17,7 @@ export default function Report() {
   };
 
   const chartData = report
-    .filter(r => !r.phone?.includes('120363') && r.phone?.length >= 10)
+    .filter(r => !r.phone?.includes('120363') && r.phone?.length >= 10 && r.phone !== '393457050479')
     .slice(0, 12)
     .map(r => ({
       name: (r.contact_name || r.phone).substring(0, 18),

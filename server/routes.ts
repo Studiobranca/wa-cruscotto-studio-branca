@@ -8,7 +8,7 @@ const router = Router();
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.7.0', built: new Date().toISOString() });
+  res.json({ version: '2.7.1', built: new Date().toISOString() });
 });
 
 // ─── Debug ───────────────────────────────────────────────────────────────────
@@ -55,6 +55,7 @@ router.get('/analytics/today-report', (req: Request, res: Response) => {
         AND phone NOT LIKE '%@newsletter%'
         AND phone NOT LIKE '%@g.us%'
         AND phone NOT LIKE '%120363%'
+        AND phone != '393457050479'
         AND length(phone) >= 10
       GROUP BY phone
       ORDER BY last_activity DESC
@@ -83,6 +84,7 @@ router.get('/analytics/daily-email-report', (req: Request, res: Response) => {
         AND lm.phone NOT LIKE '%@newsletter%'
         AND lm.phone NOT LIKE '%@g.us%'
         AND lm.phone NOT LIKE '%120363%'
+        AND lm.phone != '393457050479'
         AND length(lm.phone) >= 10
       GROUP BY lm.phone
       ORDER BY last_activity DESC
