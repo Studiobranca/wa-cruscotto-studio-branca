@@ -6,6 +6,21 @@ import { startPolling, stopPolling, isPollingRunning } from './polling.js';
 
 const router = Router();
 
+// ─── Version ─────────────────────────────────────────────────────────────────
+router.get('/version', (_req: Request, res: Response) => {
+  res.json({ version: '2.1.0', built: '2026-06-07T08:30:00Z' });
+});
+
+// ─── Debug ───────────────────────────────────────────────────────────────────
+router.get('/debug/laura', (_req: Request, res: Response) => {
+  try {
+    const lm = db.prepare(`SELECT COUNT(*) as c FROM live_messages WHERE phone = '393713499168'`).get() as any;
+    const conv = db.prepare(`SELECT id, phone, total_received, last_message FROM conversations WHERE phone = '393713499168' LIMIT 1`).get() as any;
+    const msg = db.prepare(`SELECT content, created_at FROM live_messages WHERE phone = '393713499168' ORDER BY created_at DESC LIMIT 1`).get() as any;
+    res.json({ live_messages_count: lm.c, conversation: conv, last_live_msg: msg });
+  } catch(e: any) { res.status(500).json({ error: e.message }); }
+});
+
 // ─── Analytics ───────────────────────────────────────────────────────────────
 
 router.get('/analytics/overview', (req: Request, res: Response) => {

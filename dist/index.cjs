@@ -24133,6 +24133,19 @@ function isPollingRunning() {
 
 // server/routes.ts
 var router = (0, import_express.Router)();
+router.get("/version", (_req, res) => {
+  res.json({ version: "2.1.0", built: "2026-06-07T08:30:00Z" });
+});
+router.get("/debug/laura", (_req, res) => {
+  try {
+    const lm = db_default.prepare(`SELECT COUNT(*) as c FROM live_messages WHERE phone = '393713499168'`).get();
+    const conv = db_default.prepare(`SELECT id, phone, total_received, last_message FROM conversations WHERE phone = '393713499168' LIMIT 1`).get();
+    const msg = db_default.prepare(`SELECT content, created_at FROM live_messages WHERE phone = '393713499168' ORDER BY created_at DESC LIMIT 1`).get();
+    res.json({ live_messages_count: lm.c, conversation: conv, last_live_msg: msg });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 router.get("/analytics/overview", (req, res) => {
   try {
     const today = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
