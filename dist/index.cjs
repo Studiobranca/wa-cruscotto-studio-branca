@@ -24179,10 +24179,311 @@ function isPollingRunning() {
   return pollingInterval !== null;
 }
 
+// server/integrations.ts
+init_db();
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS integration_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      integration TEXT NOT NULL,
+      action TEXT NOT NULL,
+      status TEXT NOT NULL,
+      detail TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    )
+  `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS integration_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT
+    )
+  `);
+} catch {
+}
+function logIntegration(entry) {
+  try {
+    db.prepare(`
+      INSERT INTO integration_logs (integration, action, status, detail)
+      VALUES (?, ?, ?, ?)
+    `).run(entry.integration, entry.action, entry.status, entry.detail);
+  } catch {
+  }
+}
+async function getGoogleAccessToken() {
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  const refreshToken = process.env.GOOGLE_REFRESH_TOKEN;
+  if (!clientId || !clientSecret || !refreshToken) return null;
+  try {
+    const resp = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        refresh_token: refreshToken,
+        grant_type: "refresh_token"
+      })
+    });
+    const data = await resp.json();
+    return data.access_token ?? null;
+  } catch {
+    return null;
+  }
+}
+async function findGoogleContact(phone) {
+  const token = await getGoogleAccessToken();
+  if (!token) return null;
+  try {
+    const cleanPhone = phone.replace(/\D/g, "");
+    const resp = await fetch(
+      `https://people.googleapis.com/v1/people:searchContacts?query=${encodeURIComponent(cleanPhone)}&readMask=names,phoneNumbers&pageSize=5`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    const results = data.results || [];
+    for (const r of results) {
+      const phones = r.person?.phoneNumbers || [];
+      for (const p of phones) {
+        const normalized = (p.value || "").replace(/\D/g, "");
+        if (normalized.endsWith(cleanPhone) || cleanPhone.endsWith(normalized)) {
+          const name = r.person?.names?.[0]?.displayName;
+          return name || null;
+        }
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+async function createGoogleContact(params) {
+  const token = await getGoogleAccessToken();
+  if (!token) {
+    return { success: false, error: "Google OAuth non configurato" };
+  }
+  const displayName = params.name || params.phone;
+  try {
+    const body = {
+      names: [{ displayName }],
+      phoneNumbers: [{ value: params.phone, type: "mobile" }],
+      biographies: params.note ? [{ value: params.note, contentType: "TEXT_PLAIN" }] : []
+    };
+    const resp = await fetch("https://people.googleapis.com/v1/people:createContact", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(body)
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      logIntegration({
+        integration: "google_contacts",
+        action: "create_contact",
+        status: "success",
+        detail: `Creato: ${displayName} (${params.phone})`
+      });
+      return { success: true, resourceName: data.resourceName };
+    } else {
+      const err = await resp.text();
+      logIntegration({
+        integration: "google_contacts",
+        action: "create_contact",
+        status: "error",
+        detail: `Errore HTTP ${resp.status}: ${err.substring(0, 100)}`
+      });
+      return { success: false, error: `HTTP ${resp.status}` };
+    }
+  } catch (e) {
+    logIntegration({
+      integration: "google_contacts",
+      action: "create_contact",
+      status: "error",
+      detail: e.message
+    });
+    return { success: false, error: e.message };
+  }
+}
+async function createCalendarEvent(params) {
+  const token = await getGoogleAccessToken();
+  if (!token) {
+    return { success: false, error: "Google OAuth non configurato" };
+  }
+  const calId = params.calendarId || process.env.GOOGLE_CALENDAR_ID || "primary";
+  try {
+    const event = {
+      summary: params.title,
+      description: params.description,
+      start: { dateTime: params.startDate, timeZone: "Europe/Rome" },
+      end: { dateTime: params.endDate, timeZone: "Europe/Rome" },
+      reminders: {
+        useDefault: false,
+        overrides: [
+          { method: "popup", minutes: 60 },
+          { method: "email", minutes: 1440 }
+        ]
+      }
+    };
+    const resp = await fetch(
+      `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calId)}/events`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(event)
+      }
+    );
+    if (resp.ok) {
+      const data = await resp.json();
+      logIntegration({
+        integration: "google_calendar",
+        action: "create_event",
+        status: "success",
+        detail: `Evento: "${params.title}" \u2014 ${params.startDate}`
+      });
+      return { success: true, eventId: data.id, eventLink: data.htmlLink };
+    } else {
+      const err = await resp.text();
+      logIntegration({
+        integration: "google_calendar",
+        action: "create_event",
+        status: "error",
+        detail: `HTTP ${resp.status}: ${err.substring(0, 100)}`
+      });
+      return { success: false, error: `HTTP ${resp.status}` };
+    }
+  } catch (e) {
+    logIntegration({
+      integration: "google_calendar",
+      action: "create_event",
+      status: "error",
+      detail: e.message
+    });
+    return { success: false, error: e.message };
+  }
+}
+var NOTION_VERSION = "2022-06-28";
+async function saveToNotionComunicazioni(params) {
+  const notionToken = process.env.NOTION_API_KEY;
+  const dbId = process.env.NOTION_COMUNICAZIONI_DB_ID || "2373e517cc104920a7cc346bd22b9515";
+  if (!notionToken) {
+    return { success: false, error: "NOTION_API_KEY non configurata" };
+  }
+  try {
+    const properties = {
+      Oggetto: { title: [{ text: { content: params.oggetto } }] },
+      Canale: { select: { name: params.canale } },
+      Direzione: { select: { name: params.direzione } },
+      Stato: { select: { name: params.stato || "Da rispondere" } },
+      Data: { date: { start: params.data } }
+    };
+    if (params.estratto) {
+      properties.Estratto = { rich_text: [{ text: { content: params.estratto.substring(0, 2e3) } }] };
+    }
+    if (params.note) {
+      properties.Note = { rich_text: [{ text: { content: params.note.substring(0, 2e3) } }] };
+    }
+    const resp = await fetch("https://api.notion.com/v1/pages", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${notionToken}`,
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        parent: { database_id: dbId },
+        properties
+      })
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      logIntegration({
+        integration: "notion",
+        action: "save_comunicazione",
+        status: "success",
+        detail: `Salvato: "${params.oggetto}"`
+      });
+      return { success: true, pageId: data.id };
+    } else {
+      const err = await resp.text();
+      logIntegration({
+        integration: "notion",
+        action: "save_comunicazione",
+        status: "error",
+        detail: `HTTP ${resp.status}: ${err.substring(0, 100)}`
+      });
+      return { success: false, error: `HTTP ${resp.status}` };
+    }
+  } catch (e) {
+    logIntegration({
+      integration: "notion",
+      action: "save_comunicazione",
+      status: "error",
+      detail: e.message
+    });
+    return { success: false, error: e.message };
+  }
+}
+var APPOINTMENT_KEYWORDS = [
+  "appuntamento",
+  "incontro",
+  "riunione",
+  "meeting",
+  "chiamata",
+  "colloquio",
+  "quando ci vediamo",
+  "possiamo vederci",
+  "disponibile",
+  "libero il",
+  "prenota",
+  "prenotare",
+  "fissare",
+  "fissare un",
+  "quando sei"
+];
+function detectAppointmentRequest(text) {
+  const lower = text.toLowerCase();
+  return APPOINTMENT_KEYWORDS.some((kw) => lower.includes(kw));
+}
+function getIntegrationLogs(limit = 50) {
+  try {
+    return db.prepare(`
+      SELECT * FROM integration_logs
+      ORDER BY created_at DESC
+      LIMIT ?
+    `).all(limit);
+  } catch {
+    return [];
+  }
+}
+function getIntegrationStats() {
+  try {
+    const stats = db.prepare(`
+      SELECT integration, status, COUNT(*) as count
+      FROM integration_logs
+      WHERE created_at >= datetime('now', '-7 days')
+      GROUP BY integration, status
+    `).all();
+    const result = {};
+    for (const row of stats) {
+      if (!result[row.integration]) result[row.integration] = { success: 0, error: 0, skipped: 0 };
+      result[row.integration][row.status] = (result[row.integration][row.status] || 0) + row.count;
+    }
+    return result;
+  } catch {
+    return {};
+  }
+}
+
 // server/routes.ts
 var router = (0, import_express.Router)();
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.8.0", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.9.0", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/debug/laura", (_req, res) => {
   try {
@@ -24614,6 +24915,66 @@ _(Originale: ${textToTranslate})_`;
       isAudio,
       priority: convForSSE?.priority || "none"
     });
+    if (!fromMe && !isGroup && content && content.trim().length > 2) {
+      setImmediate(async () => {
+        try {
+          const integrationsEnabled = db_default.prepare(`SELECT value FROM app_settings WHERE key = 'integrations_enabled'`).get();
+          if (integrationsEnabled?.value !== "0") {
+            const existingConv = db_default.prepare(`SELECT contact_name FROM conversations WHERE phone = ?`).get(phone);
+            const isUnknown = !existingConv?.contact_name || existingConv.contact_name === phone;
+            if (isUnknown) {
+              const googleName = await findGoogleContact(phone);
+              if (googleName) {
+                db_default.prepare(`UPDATE conversations SET contact_name = ? WHERE phone = ?`).run(googleName, phone);
+                console.log(`[Integrations] Contatto aggiornato da Google Contacts: ${googleName}`);
+              }
+            }
+            const calEnabled = db_default.prepare(`SELECT value FROM app_settings WHERE key = 'integration_calendar'`).get();
+            if (calEnabled?.value === "1" && detectAppointmentRequest(content)) {
+              const contactName = existingConv?.contact_name || senderName || phone;
+              const today = /* @__PURE__ */ new Date();
+              const start = new Date(today.getTime() + 24 * 60 * 60 * 1e3);
+              start.setHours(10, 0, 0, 0);
+              const end = new Date(start.getTime() + 60 * 60 * 1e3);
+              await createCalendarEvent({
+                title: `\u{1F4F1} Richiesta appuntamento \u2014 ${contactName}`,
+                description: `Messaggio WhatsApp da ${contactName} (${phone}):
+
+"${content.substring(0, 500)}"
+
+Data/ora da confermare.`,
+                startDate: start.toISOString(),
+                endDate: end.toISOString()
+              });
+              console.log(`[Integrations] Evento calendario creato per richiesta da ${contactName}`);
+            }
+            const notionEnabled = db_default.prepare(`SELECT value FROM app_settings WHERE key = 'integration_notion'`).get();
+            if (notionEnabled?.value === "1") {
+              const conv = db_default.prepare(`SELECT priority, contact_name FROM conversations WHERE phone = ?`).get(phone);
+              const FISCAL_KEYWORDS = ["730", "dichiarazione", "iva", "irpef", "unico", "scadenza", "fattura", "detra", "bonus", "f24", "agenzia entrate"];
+              const isFiscal = FISCAL_KEYWORDS.some((kw) => content.toLowerCase().includes(kw));
+              const isVIP = conv?.priority === "high";
+              if (isVIP || isFiscal) {
+                const contactName = conv?.contact_name || senderName || phone;
+                const today = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
+                await saveToNotionComunicazioni({
+                  oggetto: `WA da ${contactName} \u2014 ${isFiscal ? "Argomento fiscale" : "Contatto VIP"}`,
+                  estratto: content.substring(0, 500),
+                  canale: "WhatsApp",
+                  direzione: "Ricevuto",
+                  data: today,
+                  stato: "Da rispondere",
+                  note: `Telefono: ${phone}`
+                });
+                console.log(`[Integrations] Salvato in Notion: ${contactName} (${isFiscal ? "fiscale" : "VIP"})`);
+              }
+            }
+          }
+        } catch (intErr) {
+          console.error("[Integrations] Background error:", intErr.message);
+        }
+      });
+    }
     res.json({ success: true });
   } catch (err) {
     console.error("[Webhook] Error:", err);
@@ -24762,6 +25123,85 @@ router.get("/conversations/:phone/requests", (req, res) => {
       topics: topicsList,
       requests
     });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.get("/integrations/status", (_req, res) => {
+  try {
+    const stats = getIntegrationStats();
+    const googleConfigured = !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_REFRESH_TOKEN);
+    const notionConfigured = !!process.env.NOTION_API_KEY;
+    const calEnabled = db_default.prepare(`SELECT value FROM app_settings WHERE key = 'integration_calendar'`).get()?.value === "1";
+    const notionEnabled = db_default.prepare(`SELECT value FROM app_settings WHERE key = 'integration_notion'`).get()?.value === "1";
+    const intEnabled = db_default.prepare(`SELECT value FROM app_settings WHERE key = 'integrations_enabled'`).get()?.value !== "0";
+    res.json({
+      integrations_enabled: intEnabled,
+      google_contacts: { configured: googleConfigured, enabled: intEnabled },
+      google_calendar: { configured: googleConfigured, enabled: calEnabled },
+      notion: { configured: notionConfigured, enabled: notionEnabled },
+      stats
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.get("/integrations/logs", (_req, res) => {
+  try {
+    const limit = 100;
+    const logs = getIntegrationLogs(limit);
+    res.json(logs);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.post("/integrations/toggle", (req, res) => {
+  try {
+    const { key, value } = req.body;
+    const allowed = ["integrations_enabled", "integration_calendar", "integration_notion"];
+    if (!allowed.includes(key)) return res.status(400).json({ error: "Key non valida" });
+    db_default.prepare(`INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)`).run(key, value ? "1" : "0");
+    res.json({ success: true, key, value });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.post("/integrations/google-contacts/create", async (req, res) => {
+  try {
+    const { phone, name, note } = req.body;
+    if (!phone) return res.status(400).json({ error: "phone is required" });
+    const result = await createGoogleContact({ phone, name, note });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.post("/integrations/calendar/create", async (req, res) => {
+  try {
+    const { title, description, startDate, endDate } = req.body;
+    if (!title || !startDate || !endDate) {
+      return res.status(400).json({ error: "title, startDate, endDate obbligatori" });
+    }
+    const result = await createCalendarEvent({ title, description: description || "", startDate, endDate });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.post("/integrations/notion/save", async (req, res) => {
+  try {
+    const { oggetto, estratto, canale, direzione, data, stato, note } = req.body;
+    if (!oggetto) return res.status(400).json({ error: "oggetto is required" });
+    const result = await saveToNotionComunicazioni({
+      oggetto,
+      estratto: estratto || "",
+      canale: canale || "WhatsApp",
+      direzione: direzione || "Ricevuto",
+      data: data || (/* @__PURE__ */ new Date()).toISOString().split("T")[0],
+      stato: stato || "Da rispondere",
+      note
+    });
+    res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

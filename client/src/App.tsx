@@ -6,6 +6,7 @@ import Dashboard from './pages/Dashboard';
 import Inbox from './pages/Inbox';
 import Report from './pages/Report';
 import Settings from './pages/Settings';
+import Integrations from './pages/Integrations';
 
 export default function App() {
   return (
@@ -17,6 +18,7 @@ export default function App() {
             <Route path="/inbox" component={Inbox} />
             <Route path="/report" component={Report} />
             <Route path="/settings" component={Settings} />
+            <Route path="/integrations" component={Integrations} />
           </Switch>
         </div>
         <BottomNav />

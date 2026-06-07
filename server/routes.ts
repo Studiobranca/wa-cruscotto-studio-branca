@@ -3,12 +3,21 @@ import db from './db.js';
 import { sendTextMessage, syncContacts } from './zapi.js';
 import { addSSEClient, broadcastEvent, getClientCount } from './sse.js';
 import { startPolling, stopPolling, isPollingRunning } from './polling.js';
+import {
+  findGoogleContact,
+  createGoogleContact,
+  createCalendarEvent,
+  saveToNotionComunicazioni,
+  detectAppointmentRequest,
+  getIntegrationLogs,
+  getIntegrationStats,
+} from './integrations.js';
 
 const router = Router();
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.8.0', built: new Date().toISOString() });
+  res.json({ version: '2.9.0', built: new Date().toISOString() });
 });
 
 // ─── Debug ───────────────────────────────────────────────────────────────────
@@ -507,6 +516,74 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
       priority: convForSSE?.priority || 'none',
     });
 
+    // ─── INTEGRAZIONI AUTOMATICHE (async, non bloccante) ────────────────────
+    if (!fromMe && !isGroup && content && content.trim().length > 2) {
+      setImmediate(async () => {
+        try {
+          // 1. Google Contacts: arricchisci nome se sconosciuto
+          const integrationsEnabled = db.prepare(`SELECT value FROM app_settings WHERE key = 'integrations_enabled'`).get() as any;
+          if (integrationsEnabled?.value !== '0') {
+
+            // Controlla se il contatto è già conosciuto
+            const existingConv = db.prepare(`SELECT contact_name FROM conversations WHERE phone = ?`).get(phone) as any;
+            const isUnknown = !existingConv?.contact_name || existingConv.contact_name === phone;
+
+            if (isUnknown) {
+              const googleName = await findGoogleContact(phone);
+              if (googleName) {
+                db.prepare(`UPDATE conversations SET contact_name = ? WHERE phone = ?`).run(googleName, phone);
+                console.log(`[Integrations] Contatto aggiornato da Google Contacts: ${googleName}`);
+              }
+            }
+
+            // 2. Rilevamento appuntamenti → Google Calendar
+            const calEnabled = db.prepare(`SELECT value FROM app_settings WHERE key = 'integration_calendar'`).get() as any;
+            if (calEnabled?.value === '1' && detectAppointmentRequest(content)) {
+              const contactName = existingConv?.contact_name || senderName || phone;
+              const today = new Date();
+              const start = new Date(today.getTime() + 24 * 60 * 60 * 1000);
+              start.setHours(10, 0, 0, 0);
+              const end = new Date(start.getTime() + 60 * 60 * 1000);
+              await createCalendarEvent({
+                title: `📱 Richiesta appuntamento — ${contactName}`,
+                description: `Messaggio WhatsApp da ${contactName} (${phone}):\n\n"${content.substring(0, 500)}"\n\nData/ora da confermare.`,
+                startDate: start.toISOString(),
+                endDate: end.toISOString(),
+              });
+              console.log(`[Integrations] Evento calendario creato per richiesta da ${contactName}`);
+            }
+
+            // 3. Notion: salva messaggi marcati VIP o con parole chiave fiscali
+            const notionEnabled = db.prepare(`SELECT value FROM app_settings WHERE key = 'integration_notion'`).get() as any;
+            if (notionEnabled?.value === '1') {
+              const conv = db.prepare(`SELECT priority, contact_name FROM conversations WHERE phone = ?`).get(phone) as any;
+              const FISCAL_KEYWORDS = ['730', 'dichiarazione', 'iva', 'irpef', 'unico', 'scadenza', 'fattura', 'detra', 'bonus', 'f24', 'agenzia entrate'];
+              const isFiscal = FISCAL_KEYWORDS.some(kw => content.toLowerCase().includes(kw));
+              const isVIP = conv?.priority === 'high';
+
+              if (isVIP || isFiscal) {
+                const contactName = conv?.contact_name || senderName || phone;
+                const today = new Date().toISOString().split('T')[0];
+                await saveToNotionComunicazioni({
+                  oggetto: `WA da ${contactName} — ${isFiscal ? 'Argomento fiscale' : 'Contatto VIP'}`,
+                  estratto: content.substring(0, 500),
+                  canale: 'WhatsApp',
+                  direzione: 'Ricevuto',
+                  data: today,
+                  stato: 'Da rispondere',
+                  note: `Telefono: ${phone}`,
+                });
+                console.log(`[Integrations] Salvato in Notion: ${contactName} (${isFiscal ? 'fiscale' : 'VIP'})`);
+              }
+            }
+          }
+        } catch (intErr: any) {
+          console.error('[Integrations] Background error:', intErr.message);
+        }
+      });
+    }
+    // ────────────────────────────────────────────────────────────────────────
+
     res.json({ success: true });
   } catch (err: any) {
     console.error('[Webhook] Error:', err);
@@ -704,6 +781,102 @@ router.get('/conversations/:phone/requests', (req: Request, res: Response) => {
 });
 
 // ─── Health ───────────────────────────────────────────────────────────────────
+
+// ─── INTEGRAZIONI ───────────────────────────────────────────────────────────
+
+// Stato e log integrazioni
+router.get('/integrations/status', (_req: Request, res: Response) => {
+  try {
+    const stats = getIntegrationStats();
+    const googleConfigured = !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_REFRESH_TOKEN);
+    const notionConfigured = !!process.env.NOTION_API_KEY;
+
+    // Leggi toggle dal db settings
+    const calEnabled = (db.prepare(`SELECT value FROM app_settings WHERE key = 'integration_calendar'`).get() as any)?.value === '1';
+    const notionEnabled = (db.prepare(`SELECT value FROM app_settings WHERE key = 'integration_notion'`).get() as any)?.value === '1';
+    const intEnabled = (db.prepare(`SELECT value FROM app_settings WHERE key = 'integrations_enabled'`).get() as any)?.value !== '0';
+
+    res.json({
+      integrations_enabled: intEnabled,
+      google_contacts: { configured: googleConfigured, enabled: intEnabled },
+      google_calendar: { configured: googleConfigured, enabled: calEnabled },
+      notion: { configured: notionConfigured, enabled: notionEnabled },
+      stats,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Log integrazioni
+router.get('/integrations/logs', (_req: Request, res: Response) => {
+  try {
+    const limit = 100;
+    const logs = getIntegrationLogs(limit);
+    res.json(logs);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Toggle integrazione specifica
+router.post('/integrations/toggle', (req: Request, res: Response) => {
+  try {
+    const { key, value } = req.body;
+    const allowed = ['integrations_enabled', 'integration_calendar', 'integration_notion'];
+    if (!allowed.includes(key)) return res.status(400).json({ error: 'Key non valida' });
+    db.prepare(`INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)`).run(key, value ? '1' : '0');
+    res.json({ success: true, key, value });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Crea contatto Google manualmente
+router.post('/integrations/google-contacts/create', async (req: Request, res: Response) => {
+  try {
+    const { phone, name, note } = req.body;
+    if (!phone) return res.status(400).json({ error: 'phone is required' });
+    const result = await createGoogleContact({ phone, name, note });
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Crea evento calendario manualmente
+router.post('/integrations/calendar/create', async (req: Request, res: Response) => {
+  try {
+    const { title, description, startDate, endDate } = req.body;
+    if (!title || !startDate || !endDate) {
+      return res.status(400).json({ error: 'title, startDate, endDate obbligatori' });
+    }
+    const result = await createCalendarEvent({ title, description: description || '', startDate, endDate });
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Salva messaggio in Notion manualmente
+router.post('/integrations/notion/save', async (req: Request, res: Response) => {
+  try {
+    const { oggetto, estratto, canale, direzione, data, stato, note } = req.body;
+    if (!oggetto) return res.status(400).json({ error: 'oggetto is required' });
+    const result = await saveToNotionComunicazioni({
+      oggetto,
+      estratto: estratto || '',
+      canale: canale || 'WhatsApp',
+      direzione: direzione || 'Ricevuto',
+      data: data || new Date().toISOString().split('T')[0],
+      stato: stato || 'Da rispondere',
+      note,
+    });
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 router.get('/health', (req: Request, res: Response) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
