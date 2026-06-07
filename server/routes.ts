@@ -95,9 +95,18 @@ router.get('/conversations', (req: Request, res: Response) => {
     const { archived, search } = req.query;
     let query = `
       SELECT 
-        id, phone, contact_name as contactName, last_message as lastMessage,
-        last_message_at as lastMessageAt, unread_count as unreadCount,
-        total_received as totalReceived, total_sent as totalSent,
+        id, phone, contact_name as contactName,
+        COALESCE(
+          (SELECT content FROM live_messages WHERE phone = conversations.phone ORDER BY created_at DESC LIMIT 1),
+          last_message
+        ) as lastMessage,
+        COALESCE(
+          (SELECT created_at FROM live_messages WHERE phone = conversations.phone ORDER BY created_at DESC LIMIT 1),
+          last_message_at
+        ) as lastMessageAt,
+        COALESCE((SELECT COUNT(*) FROM live_messages WHERE phone = conversations.phone AND is_read = 0 AND direction = 'received'), unread_count) as unreadCount,
+        COALESCE((SELECT COUNT(*) FROM live_messages WHERE phone = conversations.phone AND direction = 'received'), total_received) as totalReceived,
+        total_sent as totalSent,
         auto_reply_enabled as autoReplyEnabled, auto_reply_message as autoReplyMessage,
         is_archived as isArchived, priority, priority_label as priorityLabel, created_at as createdAt
       FROM conversations
@@ -117,6 +126,7 @@ router.get('/conversations', (req: Request, res: Response) => {
         WHEN 'normal' THEN 3 
         ELSE 4 
       END,
+      CASE WHEN (SELECT COUNT(*) FROM live_messages lm WHERE lm.phone = conversations.phone) > 0 THEN 0 ELSE 1 END,
       COALESCE(last_message_at, created_at) DESC
     `;
 
