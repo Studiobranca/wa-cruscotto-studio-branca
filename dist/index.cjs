@@ -23927,6 +23927,9 @@ var init_db = __esm({
     is_read INTEGER DEFAULT 0,
     is_audio INTEGER DEFAULT 0,
     audio_url TEXT,
+    is_image INTEGER DEFAULT 0,
+    image_url TEXT,
+    caption TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   );
 
@@ -23935,6 +23938,18 @@ var init_db = __esm({
     value TEXT
   );
 `);
+    try {
+      db.exec(`ALTER TABLE live_messages ADD COLUMN is_image INTEGER DEFAULT 0`);
+    } catch {
+    }
+    try {
+      db.exec(`ALTER TABLE live_messages ADD COLUMN image_url TEXT`);
+    } catch {
+    }
+    try {
+      db.exec(`ALTER TABLE live_messages ADD COLUMN caption TEXT`);
+    } catch {
+    }
     console.log("[DB] Tables created/verified");
     db_default = db;
   }
@@ -24272,7 +24287,9 @@ router.get("/conversations/:phone/messages", (req, res) => {
       SELECT 
         id, message_id as messageId, phone, contact_name as contactName,
         content, direction, timestamp, is_read as isRead,
-        is_audio as isAudio, audio_url as audioUrl, created_at as createdAt
+        is_audio as isAudio, audio_url as audioUrl,
+        is_image as isImage, image_url as imageUrl, caption,
+        created_at as createdAt
       FROM live_messages
       WHERE phone = ?
       ORDER BY COALESCE(timestamp, created_at) DESC
@@ -24366,7 +24383,10 @@ router.post("/webhook/message", async (req, res) => {
     const fromMe = body.fromMe === true;
     const msgType = body.type || "text";
     const isAudio = msgType === "audio" || msgType === "ptt";
-    const audioUrl = body.audio?.audioUrl || null;
+    const audioUrl = body.audio?.audioUrl || body.audio?.url || null;
+    const isImage = msgType === "image";
+    const imageUrl = body.image?.imageUrl || body.image?.url || body.imageUrl || null;
+    const caption = body.image?.caption || body.caption || "";
     if (isGroup || phone && phone.includes("-")) {
       return res.json({ ignored: true, reason: "group" });
     }
@@ -24374,14 +24394,39 @@ router.post("/webhook/message", async (req, res) => {
       return res.json({ ignored: true, reason: "no phone" });
     }
     const direction = fromMe ? "sent" : "received";
-    const content = isAudio ? "[Messaggio audio]" : text || "";
+    let content;
+    if (isImage) content = caption ? `[Immagine: ${caption}]` : "[Immagine]";
+    else if (isAudio) content = "[Messaggio vocale \u{1F3A4}]";
+    else content = text || "";
+    const openaiKey = process.env.OPENAI_API_KEY;
+    if (isAudio && audioUrl && openaiKey) {
+      try {
+        const audioResp = await fetch(audioUrl);
+        const audioBuffer = await audioResp.arrayBuffer();
+        const form = new globalThis.FormData();
+        form.append("file", new Blob([audioBuffer], { type: "audio/ogg" }), "audio.ogg");
+        form.append("model", "whisper-1");
+        form.append("language", "it");
+        const wResp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+          method: "POST",
+          headers: { "Authorization": `Bearer ${openaiKey}` },
+          body: form
+        });
+        if (wResp.ok) {
+          const wData = await wResp.json();
+          if (wData.text) content = `\u{1F3A4} ${wData.text}`;
+        }
+      } catch (e) {
+        console.error("[Whisper] Error:", e);
+      }
+    }
     const timestamp = new Date(momment * 1e3).toISOString();
     const now = (/* @__PURE__ */ new Date()).toISOString();
     db_default.prepare(`
       INSERT OR IGNORE INTO live_messages 
-        (message_id, phone, contact_name, content, direction, timestamp, is_read, is_audio, audio_url, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(messageId, phone, senderName || phone, content, direction, timestamp, fromMe ? 1 : 0, isAudio ? 1 : 0, audioUrl, now);
+        (message_id, phone, contact_name, content, direction, timestamp, is_read, is_audio, audio_url, is_image, image_url, caption, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(messageId, phone, senderName || phone, content, direction, timestamp, fromMe ? 1 : 0, isAudio ? 1 : 0, audioUrl, isImage ? 1 : 0, imageUrl, caption || null, now);
     db_default.prepare(`
       INSERT INTO conversations (phone, contact_name, last_message, last_message_at, unread_count, total_received, total_sent)
       VALUES (?, ?, ?, ?, ?, ?, ?)

@@ -163,7 +163,9 @@ router.get('/conversations/:phone/messages', (req: Request, res: Response) => {
       SELECT 
         id, message_id as messageId, phone, contact_name as contactName,
         content, direction, timestamp, is_read as isRead,
-        is_audio as isAudio, audio_url as audioUrl, created_at as createdAt
+        is_audio as isAudio, audio_url as audioUrl,
+        is_image as isImage, image_url as imageUrl, caption,
+        created_at as createdAt
       FROM live_messages
       WHERE phone = ?
       ORDER BY COALESCE(timestamp, created_at) DESC
@@ -283,7 +285,10 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
     const fromMe = body.fromMe === true;
     const msgType = body.type || 'text';
     const isAudio = msgType === 'audio' || msgType === 'ptt';
-    const audioUrl = body.audio?.audioUrl || null;
+    const audioUrl = body.audio?.audioUrl || body.audio?.url || null;
+    const isImage = msgType === 'image';
+    const imageUrl = body.image?.imageUrl || body.image?.url || body.imageUrl || null;
+    const caption = body.image?.caption || body.caption || '';
 
     // Ignore groups
     if (isGroup || (phone && phone.includes('-'))) {
@@ -296,16 +301,44 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
     }
 
     const direction = fromMe ? 'sent' : 'received';
-    const content = isAudio ? '[Messaggio audio]' : (text || '');
+    let content: string;
+    if (isImage) content = caption ? `[Immagine: ${caption}]` : '[Immagine]';
+    else if (isAudio) content = '[Messaggio vocale 🎤]';
+    else content = text || '';
+
+    // Trascrizione Whisper opzionale (richiede OPENAI_API_KEY env var)
+    const openaiKey = process.env.OPENAI_API_KEY;
+    if (isAudio && audioUrl && openaiKey) {
+      try {
+        const audioResp = await fetch(audioUrl);
+        const audioBuffer = await audioResp.arrayBuffer();
+        const form = new (globalThis as any).FormData();
+        form.append('file', new Blob([audioBuffer], { type: 'audio/ogg' }), 'audio.ogg');
+        form.append('model', 'whisper-1');
+        form.append('language', 'it');
+        const wResp = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${openaiKey}` },
+          body: form,
+        });
+        if (wResp.ok) {
+          const wData = await wResp.json() as any;
+          if (wData.text) content = `🎤 ${wData.text}`;
+        }
+      } catch (e) {
+        console.error('[Whisper] Error:', e);
+      }
+    }
+
     const timestamp = new Date(momment * 1000).toISOString();
     const now = new Date().toISOString();
 
     // Save message
     db.prepare(`
       INSERT OR IGNORE INTO live_messages 
-        (message_id, phone, contact_name, content, direction, timestamp, is_read, is_audio, audio_url, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(messageId, phone, senderName || phone, content, direction, timestamp, fromMe ? 1 : 0, isAudio ? 1 : 0, audioUrl, now);
+        (message_id, phone, contact_name, content, direction, timestamp, is_read, is_audio, audio_url, is_image, image_url, caption, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(messageId, phone, senderName || phone, content, direction, timestamp, fromMe ? 1 : 0, isAudio ? 1 : 0, audioUrl, isImage ? 1 : 0, imageUrl, caption || null, now);
 
     // Upsert conversation
     db.prepare(`

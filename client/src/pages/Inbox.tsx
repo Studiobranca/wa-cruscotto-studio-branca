@@ -219,16 +219,34 @@ export default function Inbox() {
                       key={msg.id}
                       className={`message-bubble ${msg.direction === 'sent' ? 'sent' : 'received'}`}
                     >
-                      {msg.isAudio ? (
+                      {msg.isImage && msg.imageUrl ? (
+                        <div className="image-message">
+                          <a href={msg.imageUrl} target="_blank" rel="noopener noreferrer">
+                            <img
+                              src={msg.imageUrl}
+                              alt={msg.caption || 'Immagine'}
+                              className="msg-image"
+                              onError={e => { (e.target as HTMLImageElement).style.display = 'none'; }}
+                            />
+                          </a>
+                          {msg.caption && <div className="image-caption">{msg.caption}</div>}
+                        </div>
+                      ) : msg.isAudio ? (
                         <div className="audio-message">
-                          <Volume2 size={16} />
-                          <span>Messaggio audio</span>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                            <Volume2 size={15} style={{ flexShrink: 0 }} />
+                            {msg.content && msg.content !== '[Messaggio vocale 🎤]' ? (
+                              <span className="audio-transcript">{msg.content}</span>
+                            ) : (
+                              <span style={{ opacity: 0.7, fontSize: 13 }}>Messaggio vocale</span>
+                            )}
+                          </div>
                           {msg.audioUrl && (
-                            <audio controls src={msg.audioUrl} style={{ height: 28 }} />
+                            <audio controls src={msg.audioUrl} style={{ height: 32, maxWidth: '100%' }} />
                           )}
                         </div>
                       ) : (
-                        <span>{msg.content}</span>
+                        <span style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{msg.content}</span>
                       )}
                       <div className="message-time">
                         {formatTime(msg.timestamp || msg.createdAt)}

@@ -600,10 +600,51 @@ input, textarea, select {
 
 .audio-message {
   display: flex;
-  align-items: center;
-  gap: 8px;
+  flex-direction: column;
+  gap: 6px;
   color: var(--text-muted);
   font-size: 13px;
+  min-width: 160px;
+}
+
+.audio-message > div:first-child {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.audio-transcript {
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.4;
+  font-style: italic;
+}
+
+.image-message {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 240px;
+}
+
+.msg-image {
+  width: 100%;
+  max-width: 240px;
+  border-radius: 8px;
+  cursor: pointer;
+  display: block;
+  object-fit: cover;
+  transition: opacity 0.2s;
+}
+
+.msg-image:hover {
+  opacity: 0.9;
+}
+
+.image-caption {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.4;
 }
 
 .chat-input-wrap {

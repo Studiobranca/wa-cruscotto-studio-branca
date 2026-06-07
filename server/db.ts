@@ -49,6 +49,9 @@ db.exec(`
     is_read INTEGER DEFAULT 0,
     is_audio INTEGER DEFAULT 0,
     audio_url TEXT,
+    is_image INTEGER DEFAULT 0,
+    image_url TEXT,
+    caption TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   );
 
@@ -57,6 +60,11 @@ db.exec(`
     value TEXT
   );
 `);
+
+// Migration: aggiungi colonne nuove se non esistono
+try { db.exec(`ALTER TABLE live_messages ADD COLUMN is_image INTEGER DEFAULT 0`); } catch {}  
+try { db.exec(`ALTER TABLE live_messages ADD COLUMN image_url TEXT`); } catch {}
+try { db.exec(`ALTER TABLE live_messages ADD COLUMN caption TEXT`); } catch {}
 
 console.log('[DB] Tables created/verified');
 

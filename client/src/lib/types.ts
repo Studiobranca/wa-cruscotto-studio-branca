@@ -26,6 +26,9 @@ export interface Message {
   isRead: number;
   isAudio: number;
   audioUrl: string | null;
+  isImage: number;
+  imageUrl: string | null;
+  caption: string | null;
   createdAt: string;
 }
 
