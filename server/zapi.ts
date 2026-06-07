@@ -1,0 +1,103 @@
+// Z-API Configuration
+export const ZAPI_INSTANCE = process.env.ZAPI_INSTANCE || '3F439036DDF9C25F4C5C7AE31EDEB32B';
+export const ZAPI_TOKEN = process.env.ZAPI_TOKEN || '0AB4EBF088FF1F7AADA158F3';
+export const ZAPI_CLIENT_TOKEN = process.env.ZAPI_CLIENT_TOKEN || 'F2bcb0c8154e74f3d9ff7b0482f6dd57bS';
+export const ZAPI_BASE = process.env.ZAPI_BASE || `https://api.z-api.io/instances/${ZAPI_INSTANCE}/token/${ZAPI_TOKEN}/`;
+
+export const zapiHeaders = {
+  'Content-Type': 'application/json',
+  'client-token': ZAPI_CLIENT_TOKEN,
+};
+
+export async function zapiGet(endpoint: string): Promise<any> {
+  const url = `${ZAPI_BASE}${endpoint}`;
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: zapiHeaders,
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Z-API GET ${endpoint} failed: ${response.status} - ${text}`);
+  }
+  return response.json();
+}
+
+export async function zapiPost(endpoint: string, body: any): Promise<any> {
+  const url = `${ZAPI_BASE}${endpoint}`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: zapiHeaders,
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Z-API POST ${endpoint} failed: ${response.status} - ${text}`);
+  }
+  return response.json();
+}
+
+export async function sendTextMessage(phone: string, message: string): Promise<any> {
+  return zapiPost('send-text', { phone, message });
+}
+
+export async function syncContacts(): Promise<number> {
+  const { db } = await import('./db.js');
+  let page = 1;
+  const pageSize = 100;
+  let totalSynced = 0;
+
+  const insertConv = db.prepare(`
+    INSERT OR REPLACE INTO conversations 
+      (phone, contact_name, last_message, last_message_at, unread_count, created_at)
+    VALUES 
+      (@phone, @contact_name, @last_message, @last_message_at, @unread_count, COALESCE(
+        (SELECT created_at FROM conversations WHERE phone = @phone),
+        datetime('now')
+      ))
+  `);
+
+  while (true) {
+    try {
+      const data = await zapiGet(`chats?page=${page}&pageSize=${pageSize}`);
+      const chats = Array.isArray(data) ? data : (data.chats || data.data || []);
+
+      if (!chats || chats.length === 0) break;
+
+      const insertMany = db.transaction((items: any[]) => {
+        for (const chat of items) {
+          const phone = chat.id || chat.phone || '';
+          if (!phone || phone.includes('@g.us') || phone.includes('-')) continue; // skip groups
+
+          let lastMessageAt = new Date().toISOString();
+          try {
+            if (chat.lastMessageTime && chat.lastMessageTime > 0) {
+              const d = new Date(chat.lastMessageTime);
+              if (!isNaN(d.getTime())) lastMessageAt = d.toISOString();
+            }
+          } catch {}
+
+
+          insertConv.run({
+            phone,
+            contact_name: chat.name || chat.contactName || phone,
+            last_message: chat.lastMessage || '',
+            last_message_at: lastMessageAt,
+            unread_count: chat.unreadMessages || 0,
+          });
+          totalSynced++;
+        }
+      });
+
+      insertMany(chats);
+
+      if (chats.length < pageSize) break;
+      page++;
+    } catch (err) {
+      console.error(`[ZAPI] Sync error page ${page}:`, err);
+      break;
+    }
+  }
+
+  console.log(`[ZAPI] Synced ${totalSynced} contacts`);
+  return totalSynced;
+}
