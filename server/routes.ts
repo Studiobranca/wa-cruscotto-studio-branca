@@ -8,7 +8,7 @@ const router = Router();
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.6.1', built: new Date().toISOString() });
+  res.json({ version: '2.6.2', built: new Date().toISOString() });
 });
 
 // ─── Debug ───────────────────────────────────────────────────────────────────
@@ -144,10 +144,9 @@ router.get('/conversations', (req: Request, res: Response) => {
         WHEN 'normal' THEN 3 
         ELSE 4 
       END,
-      COALESCE(
-        (SELECT created_at FROM live_messages WHERE phone = conversations.phone ORDER BY created_at DESC LIMIT 1),
-        last_message_at,
-        created_at
+      MAX(
+        COALESCE((SELECT created_at FROM live_messages WHERE phone = conversations.phone ORDER BY created_at DESC LIMIT 1), '1970-01-01'),
+        COALESCE(last_message_at, '1970-01-01')
       ) DESC
     `;
 

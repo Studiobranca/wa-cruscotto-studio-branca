@@ -24167,7 +24167,7 @@ function isPollingRunning() {
 // server/routes.ts
 var router = (0, import_express.Router)();
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.6.1", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.6.2", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/debug/laura", (_req, res) => {
   try {
@@ -24289,10 +24289,9 @@ router.get("/conversations", (req, res) => {
         WHEN 'normal' THEN 3 
         ELSE 4 
       END,
-      COALESCE(
-        (SELECT created_at FROM live_messages WHERE phone = conversations.phone ORDER BY created_at DESC LIMIT 1),
-        last_message_at,
-        created_at
+      MAX(
+        COALESCE((SELECT created_at FROM live_messages WHERE phone = conversations.phone ORDER BY created_at DESC LIMIT 1), '1970-01-01'),
+        COALESCE(last_message_at, '1970-01-01')
       ) DESC
     `;
     const rows = db_default.prepare(query).all(...params);
