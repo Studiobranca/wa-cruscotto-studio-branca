@@ -24057,10 +24057,10 @@ async function syncContacts() {
           }
           insertConv.run({
             phone,
-            contact_name: chat.name || chat.contactName || phone,
-            last_message: chat.lastMessage || "",
+            contact_name: chat.name || chat.contactName || chat.pushName || phone,
+            last_message: chat.lastMessage || chat.body || "",
             last_message_at: lastMessageAt,
-            unread_count: chat.unreadMessages || 0
+            unread_count: parseInt(chat.messagesUnread || chat.unreadMessages || chat.unread || "0", 10) || 0
           });
           totalSynced++;
         }
@@ -24167,7 +24167,7 @@ function isPollingRunning() {
 // server/routes.ts
 var router = (0, import_express.Router)();
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.6.0", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.6.1", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/debug/laura", (_req, res) => {
   try {

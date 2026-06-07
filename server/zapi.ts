@@ -81,10 +81,10 @@ export async function syncContacts(): Promise<number> {
 
           insertConv.run({
             phone,
-            contact_name: chat.name || chat.contactName || phone,
-            last_message: chat.lastMessage || '',
+            contact_name: chat.name || chat.contactName || chat.pushName || phone,
+            last_message: chat.lastMessage || chat.body || '',
             last_message_at: lastMessageAt,
-            unread_count: chat.unreadMessages || 0,
+            unread_count: parseInt(chat.messagesUnread || chat.unreadMessages || chat.unread || '0', 10) || 0,
           });
           totalSynced++;
         }
