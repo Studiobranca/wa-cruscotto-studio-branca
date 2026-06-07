@@ -24421,6 +24421,7 @@ router.post("/webhook/message", async (req, res) => {
         }
       }
     }
+    const convForSSE = db_default.prepare(`SELECT priority FROM conversations WHERE phone = ?`).get(phone);
     broadcastEvent("message", {
       type: direction,
       phone,
@@ -24428,7 +24429,8 @@ router.post("/webhook/message", async (req, res) => {
       content,
       timestamp,
       messageId,
-      isAudio
+      isAudio,
+      priority: convForSSE?.priority || "none"
     });
     res.json({ success: true });
   } catch (err) {

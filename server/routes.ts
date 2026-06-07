@@ -343,7 +343,8 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
       }
     }
 
-    // Broadcast SSE
+    // Broadcast SSE — includi priority per suono VIP nel frontend
+    const convForSSE = db.prepare(`SELECT priority FROM conversations WHERE phone = ?`).get(phone) as any;
     broadcastEvent('message', {
       type: direction,
       phone,
@@ -352,6 +353,7 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
       timestamp,
       messageId,
       isAudio,
+      priority: convForSSE?.priority || 'none',
     });
 
     res.json({ success: true });

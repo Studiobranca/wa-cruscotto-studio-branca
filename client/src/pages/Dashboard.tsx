@@ -14,8 +14,33 @@ export default function Dashboard() {
   const { data: weekly = [] } = useWeeklyData();
   const { data: hourly = [] } = useHourlyData();
   const { data: todayReport = [] } = useTodayReport();
+  // Suono VIP via Web Audio API
+  const playVipSound = () => {
+    try {
+      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const play = (freq: number, start: number, duration: number, vol = 0.4) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(freq, ctx.currentTime + start);
+        gain.gain.setValueAtTime(0, ctx.currentTime + start);
+        gain.gain.linearRampToValueAtTime(vol, ctx.currentTime + start + 0.01);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + start + duration);
+        osc.start(ctx.currentTime + start);
+        osc.stop(ctx.currentTime + start + duration);
+      };
+      // Doppio tono: Do5 poi Mi5 — caldo e riconoscibile
+      play(523, 0,    0.18, 0.45);
+      play(659, 0.22, 0.28, 0.55);
+    } catch {}
+  };
+
   const connectSSE = useSSE((type, data) => {
-    // handled by useSSE
+    if (type === 'message' && data?.type === 'received' && data?.priority === 'vip') {
+      playVipSound();
+    }
   });
   const esRef = useRef<EventSource | null>(null);
 
