@@ -8,7 +8,7 @@ const router = Router();
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.3.0', built: new Date().toISOString() });
+  res.json({ version: '2.4.0', built: new Date().toISOString() });
 });
 
 // ─── Debug ───────────────────────────────────────────────────────────────────
@@ -310,27 +310,40 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
     else if (isAudio) content = '[Messaggio vocale 🎤]';
     else content = text || '';
 
-    // Trascrizione Whisper opzionale (richiede OPENAI_API_KEY env var)
-    const openaiKey = process.env.OPENAI_API_KEY;
-    if (isAudio && audioUrl && openaiKey) {
+    // Trascrizione Deepgram (richiede DEEPGRAM_API_KEY env var)
+    const deepgramKey = process.env.DEEPGRAM_API_KEY;
+    if (isAudio && audioUrl && deepgramKey) {
       try {
+        // Scarica audio
         const audioResp = await fetch(audioUrl);
         const audioBuffer = await audioResp.arrayBuffer();
-        const form = new (globalThis as any).FormData();
-        form.append('file', new Blob([audioBuffer], { type: 'audio/ogg' }), 'audio.ogg');
-        form.append('model', 'whisper-1');
-        form.append('language', 'it');
-        const wResp = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-          method: 'POST',
-          headers: { 'Authorization': `Bearer ${openaiKey}` },
-          body: form,
-        });
-        if (wResp.ok) {
-          const wData = await wResp.json() as any;
-          if (wData.text) content = `🎤 ${wData.text}`;
+        // Invia a Deepgram nova-2 con rilevamento lingua automatico
+        const dgResp = await fetch(
+          'https://api.deepgram.com/v1/listen?model=nova-2&detect_language=true&punctuate=true&smart_format=true',
+          {
+            method: 'POST',
+            headers: {
+              'Authorization': `Token ${deepgramKey}`,
+              'Content-Type': 'audio/ogg; codecs=opus',
+            },
+            body: audioBuffer,
+          }
+        );
+        if (dgResp.ok) {
+          const dgData = await dgResp.json() as any;
+          const transcript = dgData?.results?.channels?.[0]?.alternatives?.[0]?.transcript?.trim();
+          if (transcript) {
+            content = `🎤 ${transcript}`;
+            console.log(`[Deepgram] Trascritto: ${transcript.substring(0, 80)}`);
+          } else {
+            console.log('[Deepgram] Audio ricevuto ma trascrizione vuota (silenzio o rumore)');
+          }
+        } else {
+          const errText = await dgResp.text();
+          console.error('[Deepgram] Errore API:', dgResp.status, errText.substring(0, 100));
         }
       } catch (e) {
-        console.error('[Whisper] Error:', e);
+        console.error('[Deepgram] Error:', e);
       }
     }
 

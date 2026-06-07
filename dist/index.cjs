@@ -24159,7 +24159,7 @@ function isPollingRunning() {
 // server/routes.ts
 var router = (0, import_express.Router)();
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.3.0", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.4.0", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/debug/laura", (_req, res) => {
   try {
@@ -24410,26 +24410,37 @@ router.post("/webhook/message", async (req, res) => {
     if (isImage) content = caption ? `[Immagine: ${caption}]` : "[Immagine]";
     else if (isAudio) content = "[Messaggio vocale \u{1F3A4}]";
     else content = text || "";
-    const openaiKey = process.env.OPENAI_API_KEY;
-    if (isAudio && audioUrl && openaiKey) {
+    const deepgramKey = process.env.DEEPGRAM_API_KEY;
+    if (isAudio && audioUrl && deepgramKey) {
       try {
         const audioResp = await fetch(audioUrl);
         const audioBuffer = await audioResp.arrayBuffer();
-        const form = new globalThis.FormData();
-        form.append("file", new Blob([audioBuffer], { type: "audio/ogg" }), "audio.ogg");
-        form.append("model", "whisper-1");
-        form.append("language", "it");
-        const wResp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-          method: "POST",
-          headers: { "Authorization": `Bearer ${openaiKey}` },
-          body: form
-        });
-        if (wResp.ok) {
-          const wData = await wResp.json();
-          if (wData.text) content = `\u{1F3A4} ${wData.text}`;
+        const dgResp = await fetch(
+          "https://api.deepgram.com/v1/listen?model=nova-2&detect_language=true&punctuate=true&smart_format=true",
+          {
+            method: "POST",
+            headers: {
+              "Authorization": `Token ${deepgramKey}`,
+              "Content-Type": "audio/ogg; codecs=opus"
+            },
+            body: audioBuffer
+          }
+        );
+        if (dgResp.ok) {
+          const dgData = await dgResp.json();
+          const transcript = dgData?.results?.channels?.[0]?.alternatives?.[0]?.transcript?.trim();
+          if (transcript) {
+            content = `\u{1F3A4} ${transcript}`;
+            console.log(`[Deepgram] Trascritto: ${transcript.substring(0, 80)}`);
+          } else {
+            console.log("[Deepgram] Audio ricevuto ma trascrizione vuota (silenzio o rumore)");
+          }
+        } else {
+          const errText = await dgResp.text();
+          console.error("[Deepgram] Errore API:", dgResp.status, errText.substring(0, 100));
         }
       } catch (e) {
-        console.error("[Whisper] Error:", e);
+        console.error("[Deepgram] Error:", e);
       }
     }
     const timestamp = new Date(momment * 1e3).toISOString();
