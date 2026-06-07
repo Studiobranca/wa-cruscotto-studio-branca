@@ -11,13 +11,17 @@ import {
   detectAppointmentRequest,
   getIntegrationLogs,
   getIntegrationStats,
+  enqueueEvent,
+  getPendingEvents,
+  markEventProcessed,
+  getQueueStats,
 } from './integrations.js';
 
 const router = Router();
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.9.0', built: new Date().toISOString() });
+  res.json({ version: '2.9.1', built: new Date().toISOString() });
 });
 
 // ─── Debug ───────────────────────────────────────────────────────────────────
@@ -520,65 +524,66 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
     if (!fromMe && !isGroup && content && content.trim().length > 2) {
       setImmediate(async () => {
         try {
-          // 1. Google Contacts: arricchisci nome se sconosciuto
-          const integrationsEnabled = db.prepare(`SELECT value FROM app_settings WHERE key = 'integrations_enabled'`).get() as any;
-          if (integrationsEnabled?.value !== '0') {
+          const intEnabled = db.prepare(`SELECT value FROM app_settings WHERE key = 'integrations_enabled'`).get() as any;
+          if (intEnabled?.value === '0') return;
 
-            // Controlla se il contatto è già conosciuto
-            const existingConv = db.prepare(`SELECT contact_name FROM conversations WHERE phone = ?`).get(phone) as any;
-            const isUnknown = !existingConv?.contact_name || existingConv.contact_name === phone;
+          const existingConv = db.prepare(`SELECT contact_name, priority FROM conversations WHERE phone = ?`).get(phone) as any;
+          const isUnknown = !existingConv?.contact_name || existingConv.contact_name === phone;
+          const cName = existingConv?.contact_name || senderName || phone;
+          const googleOK = !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_REFRESH_TOKEN);
+          const notionOK = !!process.env.NOTION_API_KEY;
 
-            if (isUnknown) {
-              const googleName = await findGoogleContact(phone);
-              if (googleName) {
-                db.prepare(`UPDATE conversations SET contact_name = ? WHERE phone = ?`).run(googleName, phone);
-                console.log(`[Integrations] Contatto aggiornato da Google Contacts: ${googleName}`);
+          // 1. Google Contacts: risolvi nome contatti sconosciuti
+          if (isUnknown) {
+            if (googleOK) {
+              const gName = await findGoogleContact(phone);
+              if (gName) {
+                db.prepare(`UPDATE conversations SET contact_name = ? WHERE phone = ?`).run(gName, phone);
+                console.log(`[Int] Contatto da Google Contacts: ${gName}`);
               }
+            } else {
+              enqueueEvent('google_contacts_lookup', { phone, senderName });
             }
+          }
 
-            // 2. Rilevamento appuntamenti → Google Calendar
-            const calEnabled = db.prepare(`SELECT value FROM app_settings WHERE key = 'integration_calendar'`).get() as any;
-            if (calEnabled?.value === '1' && detectAppointmentRequest(content)) {
-              const contactName = existingConv?.contact_name || senderName || phone;
-              const today = new Date();
-              const start = new Date(today.getTime() + 24 * 60 * 60 * 1000);
-              start.setHours(10, 0, 0, 0);
-              const end = new Date(start.getTime() + 60 * 60 * 1000);
+          // 2. Rilevamento appuntamento → Google Calendar
+          const calOn = db.prepare(`SELECT value FROM app_settings WHERE key = 'integration_calendar'`).get() as any;
+          if (calOn?.value === '1' && detectAppointmentRequest(content)) {
+            if (googleOK) {
+              const s = new Date(Date.now() + 86400000); s.setHours(10,0,0,0);
+              const e = new Date(s.getTime() + 3600000);
               await createCalendarEvent({
-                title: `📱 Richiesta appuntamento — ${contactName}`,
-                description: `Messaggio WhatsApp da ${contactName} (${phone}):\n\n"${content.substring(0, 500)}"\n\nData/ora da confermare.`,
-                startDate: start.toISOString(),
-                endDate: end.toISOString(),
+                title: `📱 Richiesta appuntamento — ${cName}`,
+                description: `Da ${cName} (${phone}):\n\n"${content.substring(0,500)}"\n\nDa confermare.`,
+                startDate: s.toISOString(), endDate: e.toISOString(),
               });
-              console.log(`[Integrations] Evento calendario creato per richiesta da ${contactName}`);
+            } else {
+              enqueueEvent('calendar_appointment', { phone, contactName: cName, content: content.substring(0,500), timestamp });
             }
+          }
 
-            // 3. Notion: salva messaggi marcati VIP o con parole chiave fiscali
-            const notionEnabled = db.prepare(`SELECT value FROM app_settings WHERE key = 'integration_notion'`).get() as any;
-            if (notionEnabled?.value === '1') {
-              const conv = db.prepare(`SELECT priority, contact_name FROM conversations WHERE phone = ?`).get(phone) as any;
-              const FISCAL_KEYWORDS = ['730', 'dichiarazione', 'iva', 'irpef', 'unico', 'scadenza', 'fattura', 'detra', 'bonus', 'f24', 'agenzia entrate'];
-              const isFiscal = FISCAL_KEYWORDS.some(kw => content.toLowerCase().includes(kw));
-              const isVIP = conv?.priority === 'high';
-
-              if (isVIP || isFiscal) {
-                const contactName = conv?.contact_name || senderName || phone;
-                const today = new Date().toISOString().split('T')[0];
+          // 3. Notion: messaggi fiscali o VIP
+          const notionOn = db.prepare(`SELECT value FROM app_settings WHERE key = 'integration_notion'`).get() as any;
+          if (notionOn?.value === '1') {
+            const FK = ['730','dichiarazione','iva','irpef','unico','scadenza','fattura','detra','bonus','f24','agenzia entrate'];
+            const isFiscal = FK.some(kw => content.toLowerCase().includes(kw));
+            const isVIP = existingConv?.priority === 'high';
+            if (isVIP || isFiscal) {
+              const today = new Date().toISOString().split('T')[0];
+              if (notionOK) {
                 await saveToNotionComunicazioni({
-                  oggetto: `WA da ${contactName} — ${isFiscal ? 'Argomento fiscale' : 'Contatto VIP'}`,
-                  estratto: content.substring(0, 500),
-                  canale: 'WhatsApp',
-                  direzione: 'Ricevuto',
-                  data: today,
-                  stato: 'Da rispondere',
+                  oggetto: `WA da ${cName} — ${isFiscal ? 'Argomento fiscale' : 'Contatto VIP'}`,
+                  estratto: content.substring(0,500), canale: 'WhatsApp',
+                  direzione: 'Ricevuto', data: today, stato: 'Da rispondere',
                   note: `Telefono: ${phone}`,
                 });
-                console.log(`[Integrations] Salvato in Notion: ${contactName} (${isFiscal ? 'fiscale' : 'VIP'})`);
+              } else {
+                enqueueEvent('notion_comunicazione', { phone, contactName: cName, content: content.substring(0,500), isFiscal, isVIP, date: today });
               }
             }
           }
         } catch (intErr: any) {
-          console.error('[Integrations] Background error:', intErr.message);
+          console.error('[Int] Error:', intErr.message);
         }
       });
     }
@@ -796,11 +801,15 @@ router.get('/integrations/status', (_req: Request, res: Response) => {
     const notionEnabled = (db.prepare(`SELECT value FROM app_settings WHERE key = 'integration_notion'`).get() as any)?.value === '1';
     const intEnabled = (db.prepare(`SELECT value FROM app_settings WHERE key = 'integrations_enabled'`).get() as any)?.value !== '0';
 
+    const qStats = getQueueStats();
+    const pendingCount = (qStats as any[]).find((r: any) => r.status === 'pending')?.count || 0;
+
     res.json({
       integrations_enabled: intEnabled,
       google_contacts: { configured: googleConfigured, enabled: intEnabled },
       google_calendar: { configured: googleConfigured, enabled: calEnabled },
       notion: { configured: notionConfigured, enabled: notionEnabled },
+      queue_pending: pendingCount,
       stats,
     });
   } catch (err: any) {
@@ -873,6 +882,30 @@ router.post('/integrations/notion/save', async (req: Request, res: Response) => 
       note,
     });
     res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+// Leggi coda eventi pending (per cron Perplexity)
+router.get('/integrations/queue', (_req: Request, res: Response) => {
+  try {
+    const events = getPendingEvents(100);
+    const stats = getQueueStats();
+    res.json({ events, stats });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Segna evento come processato (chiamato da cron Perplexity)
+router.post('/integrations/queue/:id/done', (req: Request, res: Response) => {
+  try {
+    const id = parseInt(req.params.id);
+    const { success, error } = req.body;
+    markEventProcessed(id, success !== false, error);
+    res.json({ success: true });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

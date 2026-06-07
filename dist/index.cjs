@@ -24198,6 +24198,17 @@ try {
       value TEXT
     )
   `);
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS integration_queue (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_type TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      status TEXT DEFAULT 'pending',
+      processed_at TEXT,
+      error TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    )
+  `);
 } catch {
 }
 function logIntegration(entry) {
@@ -24479,11 +24490,56 @@ function getIntegrationStats() {
     return {};
   }
 }
+function enqueueEvent(eventType, payload) {
+  try {
+    const result = db.prepare(`
+      INSERT INTO integration_queue (event_type, payload)
+      VALUES (?, ?)
+    `).run(eventType, JSON.stringify(payload));
+    return result.lastInsertRowid;
+  } catch {
+    return -1;
+  }
+}
+function getPendingEvents(limit = 50) {
+  try {
+    return db.prepare(`
+      SELECT * FROM integration_queue
+      WHERE status = 'pending'
+      ORDER BY created_at ASC
+      LIMIT ?
+    `).all(limit);
+  } catch {
+    return [];
+  }
+}
+function markEventProcessed(id, success, error) {
+  try {
+    db.prepare(`
+      UPDATE integration_queue
+      SET status = ?, processed_at = datetime('now'), error = ?
+      WHERE id = ?
+    `).run(success ? "done" : "error", error || null, id);
+  } catch {
+  }
+}
+function getQueueStats() {
+  try {
+    return db.prepare(`
+      SELECT status, COUNT(*) as count
+      FROM integration_queue
+      WHERE created_at >= datetime('now', '-7 days')
+      GROUP BY status
+    `).all();
+  } catch {
+    return [];
+  }
+}
 
 // server/routes.ts
 var router = (0, import_express.Router)();
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.9.0", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.9.1", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/debug/laura", (_req, res) => {
   try {
@@ -24918,47 +24974,54 @@ _(Originale: ${textToTranslate})_`;
     if (!fromMe && !isGroup && content && content.trim().length > 2) {
       setImmediate(async () => {
         try {
-          const integrationsEnabled = db_default.prepare(`SELECT value FROM app_settings WHERE key = 'integrations_enabled'`).get();
-          if (integrationsEnabled?.value !== "0") {
-            const existingConv = db_default.prepare(`SELECT contact_name FROM conversations WHERE phone = ?`).get(phone);
-            const isUnknown = !existingConv?.contact_name || existingConv.contact_name === phone;
-            if (isUnknown) {
-              const googleName = await findGoogleContact(phone);
-              if (googleName) {
-                db_default.prepare(`UPDATE conversations SET contact_name = ? WHERE phone = ?`).run(googleName, phone);
-                console.log(`[Integrations] Contatto aggiornato da Google Contacts: ${googleName}`);
+          const intEnabled = db_default.prepare(`SELECT value FROM app_settings WHERE key = 'integrations_enabled'`).get();
+          if (intEnabled?.value === "0") return;
+          const existingConv = db_default.prepare(`SELECT contact_name, priority FROM conversations WHERE phone = ?`).get(phone);
+          const isUnknown = !existingConv?.contact_name || existingConv.contact_name === phone;
+          const cName = existingConv?.contact_name || senderName || phone;
+          const googleOK = !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_REFRESH_TOKEN);
+          const notionOK = !!process.env.NOTION_API_KEY;
+          if (isUnknown) {
+            if (googleOK) {
+              const gName = await findGoogleContact(phone);
+              if (gName) {
+                db_default.prepare(`UPDATE conversations SET contact_name = ? WHERE phone = ?`).run(gName, phone);
+                console.log(`[Int] Contatto da Google Contacts: ${gName}`);
               }
+            } else {
+              enqueueEvent("google_contacts_lookup", { phone, senderName });
             }
-            const calEnabled = db_default.prepare(`SELECT value FROM app_settings WHERE key = 'integration_calendar'`).get();
-            if (calEnabled?.value === "1" && detectAppointmentRequest(content)) {
-              const contactName = existingConv?.contact_name || senderName || phone;
-              const today = /* @__PURE__ */ new Date();
-              const start = new Date(today.getTime() + 24 * 60 * 60 * 1e3);
-              start.setHours(10, 0, 0, 0);
-              const end = new Date(start.getTime() + 60 * 60 * 1e3);
+          }
+          const calOn = db_default.prepare(`SELECT value FROM app_settings WHERE key = 'integration_calendar'`).get();
+          if (calOn?.value === "1" && detectAppointmentRequest(content)) {
+            if (googleOK) {
+              const s = new Date(Date.now() + 864e5);
+              s.setHours(10, 0, 0, 0);
+              const e = new Date(s.getTime() + 36e5);
               await createCalendarEvent({
-                title: `\u{1F4F1} Richiesta appuntamento \u2014 ${contactName}`,
-                description: `Messaggio WhatsApp da ${contactName} (${phone}):
+                title: `\u{1F4F1} Richiesta appuntamento \u2014 ${cName}`,
+                description: `Da ${cName} (${phone}):
 
 "${content.substring(0, 500)}"
 
-Data/ora da confermare.`,
-                startDate: start.toISOString(),
-                endDate: end.toISOString()
+Da confermare.`,
+                startDate: s.toISOString(),
+                endDate: e.toISOString()
               });
-              console.log(`[Integrations] Evento calendario creato per richiesta da ${contactName}`);
+            } else {
+              enqueueEvent("calendar_appointment", { phone, contactName: cName, content: content.substring(0, 500), timestamp });
             }
-            const notionEnabled = db_default.prepare(`SELECT value FROM app_settings WHERE key = 'integration_notion'`).get();
-            if (notionEnabled?.value === "1") {
-              const conv = db_default.prepare(`SELECT priority, contact_name FROM conversations WHERE phone = ?`).get(phone);
-              const FISCAL_KEYWORDS = ["730", "dichiarazione", "iva", "irpef", "unico", "scadenza", "fattura", "detra", "bonus", "f24", "agenzia entrate"];
-              const isFiscal = FISCAL_KEYWORDS.some((kw) => content.toLowerCase().includes(kw));
-              const isVIP = conv?.priority === "high";
-              if (isVIP || isFiscal) {
-                const contactName = conv?.contact_name || senderName || phone;
-                const today = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
+          }
+          const notionOn = db_default.prepare(`SELECT value FROM app_settings WHERE key = 'integration_notion'`).get();
+          if (notionOn?.value === "1") {
+            const FK = ["730", "dichiarazione", "iva", "irpef", "unico", "scadenza", "fattura", "detra", "bonus", "f24", "agenzia entrate"];
+            const isFiscal = FK.some((kw) => content.toLowerCase().includes(kw));
+            const isVIP = existingConv?.priority === "high";
+            if (isVIP || isFiscal) {
+              const today = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
+              if (notionOK) {
                 await saveToNotionComunicazioni({
-                  oggetto: `WA da ${contactName} \u2014 ${isFiscal ? "Argomento fiscale" : "Contatto VIP"}`,
+                  oggetto: `WA da ${cName} \u2014 ${isFiscal ? "Argomento fiscale" : "Contatto VIP"}`,
                   estratto: content.substring(0, 500),
                   canale: "WhatsApp",
                   direzione: "Ricevuto",
@@ -24966,12 +25029,13 @@ Data/ora da confermare.`,
                   stato: "Da rispondere",
                   note: `Telefono: ${phone}`
                 });
-                console.log(`[Integrations] Salvato in Notion: ${contactName} (${isFiscal ? "fiscale" : "VIP"})`);
+              } else {
+                enqueueEvent("notion_comunicazione", { phone, contactName: cName, content: content.substring(0, 500), isFiscal, isVIP, date: today });
               }
             }
           }
         } catch (intErr) {
-          console.error("[Integrations] Background error:", intErr.message);
+          console.error("[Int] Error:", intErr.message);
         }
       });
     }
@@ -25135,11 +25199,14 @@ router.get("/integrations/status", (_req, res) => {
     const calEnabled = db_default.prepare(`SELECT value FROM app_settings WHERE key = 'integration_calendar'`).get()?.value === "1";
     const notionEnabled = db_default.prepare(`SELECT value FROM app_settings WHERE key = 'integration_notion'`).get()?.value === "1";
     const intEnabled = db_default.prepare(`SELECT value FROM app_settings WHERE key = 'integrations_enabled'`).get()?.value !== "0";
+    const qStats = getQueueStats();
+    const pendingCount = qStats.find((r) => r.status === "pending")?.count || 0;
     res.json({
       integrations_enabled: intEnabled,
       google_contacts: { configured: googleConfigured, enabled: intEnabled },
       google_calendar: { configured: googleConfigured, enabled: calEnabled },
       notion: { configured: notionConfigured, enabled: notionEnabled },
+      queue_pending: pendingCount,
       stats
     });
   } catch (err) {
@@ -25202,6 +25269,25 @@ router.post("/integrations/notion/save", async (req, res) => {
       note
     });
     res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.get("/integrations/queue", (_req, res) => {
+  try {
+    const events = getPendingEvents(100);
+    const stats = getQueueStats();
+    res.json({ events, stats });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.post("/integrations/queue/:id/done", (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    const { success, error } = req.body;
+    markEventProcessed(id, success !== false, error);
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

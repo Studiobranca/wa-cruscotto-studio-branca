@@ -9,6 +9,7 @@ interface IntegrationStatus {
   google_calendar: { configured: boolean; enabled: boolean };
   notion: { configured: boolean; enabled: boolean };
   stats: Record<string, { success: number; error: number; skipped: number }>;
+  queue_pending?: number;
 }
 
 interface LogEntry {
@@ -112,7 +113,17 @@ export default function Integrations() {
     <div className="page-container">
       <header className="page-header">
         <h1 className="page-title">Integrazioni</h1>
-        <p className="page-subtitle">Connettori attivi — Studio Branca</p>
+        <p className="page-subtitle">
+          Connettori attivi — Studio Branca
+          {(status?.queue_pending ?? 0) > 0 && (
+            <span style={{
+              marginLeft: 8, background: '#ff9800', color: 'white',
+              borderRadius: 10, padding: '2px 8px', fontSize: 11, fontWeight: 700,
+            }}>
+              {status?.queue_pending} in coda
+            </span>
+          )}
+        </p>
       </header>
 
       {/* Master toggle */}

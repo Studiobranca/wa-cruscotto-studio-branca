@@ -2,8 +2,10 @@
  * Studio Branca — Integrazioni Connettori
  * Google Contacts | Google Calendar | Notion
  *
- * Tutte le chiamate usano OAuth2 token o API key configurate
- * come variabili d'ambiente in Railway.
+ * Architettura ibrida:
+ * - Se GOOGLE_CLIENT_ID + GOOGLE_REFRESH_TOKEN presenti: chiamate dirette OAuth2
+ * - Altrimenti: gli eventi vengono accodati in integration_queue
+ *   e processati dai cron Perplexity che hanno i connettori già collegati.
  */
 
 import { db } from './db.js';
@@ -36,6 +38,18 @@ try {
     CREATE TABLE IF NOT EXISTS integration_settings (
       key TEXT PRIMARY KEY,
       value TEXT
+    )
+  `);
+  // Coda eventi per processamento asincrono da cron Perplexity
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS integration_queue (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_type TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      status TEXT DEFAULT 'pending',
+      processed_at TEXT,
+      error TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
     )
   `);
 } catch {}
@@ -387,5 +401,55 @@ export function getIntegrationStats(): Record<string, any> {
     return result;
   } catch {
     return {};
+  }
+}
+
+// ─── CODA EVENTI (per cron Perplexity) ──────────────────────────────────────
+
+export function enqueueEvent(eventType: string, payload: Record<string, any>): number {
+  try {
+    const result = db.prepare(`
+      INSERT INTO integration_queue (event_type, payload)
+      VALUES (?, ?)
+    `).run(eventType, JSON.stringify(payload));
+    return result.lastInsertRowid as number;
+  } catch {
+    return -1;
+  }
+}
+
+export function getPendingEvents(limit = 50): any[] {
+  try {
+    return db.prepare(`
+      SELECT * FROM integration_queue
+      WHERE status = 'pending'
+      ORDER BY created_at ASC
+      LIMIT ?
+    `).all(limit) as any[];
+  } catch {
+    return [];
+  }
+}
+
+export function markEventProcessed(id: number, success: boolean, error?: string): void {
+  try {
+    db.prepare(`
+      UPDATE integration_queue
+      SET status = ?, processed_at = datetime('now'), error = ?
+      WHERE id = ?
+    `).run(success ? 'done' : 'error', error || null, id);
+  } catch {}
+}
+
+export function getQueueStats(): any {
+  try {
+    return db.prepare(`
+      SELECT status, COUNT(*) as count
+      FROM integration_queue
+      WHERE created_at >= datetime('now', '-7 days')
+      GROUP BY status
+    `).all();
+  } catch {
+    return [];
   }
 }
