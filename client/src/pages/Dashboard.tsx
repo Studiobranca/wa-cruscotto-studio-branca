@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { useOverview, useWeeklyData, useHourlyData, useTodayReport, useSSE } from '../lib/hooks';
+import { flashScreen } from '../lib/useFlash';
 import { queryClient } from '../lib/queryClient';
 import KPICard from '../components/KPICard';
 import Loader from '../components/Loader';
@@ -38,8 +39,17 @@ export default function Dashboard() {
   };
 
   const connectSSE = useSSE((type, data) => {
-    if (type === 'message' && data?.type === 'received' && data?.priority === 'vip') {
-      playVipSound();
+    if (type === 'message' && data?.type === 'received') {
+      // Suono VIP
+      if (data?.priority === 'vip') playVipSound();
+      // Flash schermo: rosso=VIP, giallo=audio, verde=testo
+      if (data?.priority === 'vip') {
+        flashScreen('red');
+      } else if (data?.isAudio) {
+        flashScreen('yellow');
+      } else {
+        flashScreen('green');
+      }
     }
   });
   const esRef = useRef<EventSource | null>(null);

@@ -24167,7 +24167,7 @@ function isPollingRunning() {
 // server/routes.ts
 var router = (0, import_express.Router)();
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.5.1", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.5.2", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/debug/laura", (_req, res) => {
   try {

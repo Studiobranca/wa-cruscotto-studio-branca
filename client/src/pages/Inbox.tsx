@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { useConversations, useMessages, useSendMessage, useSetPriority, useAutoReply, useSSE } from '../lib/hooks';
+import { flashScreen } from '../lib/useFlash';
 import PriorityBadge from '../components/PriorityBadge';
 import Loader from '../components/Loader';
 import type { Conversation } from '../lib/types';
@@ -22,8 +23,18 @@ export default function Inbox() {
   const autoReplyMutation = useAutoReply(selectedPhone || '');
 
   const connectSSE = useSSE((type, data) => {
-    if (type === 'message' && data.phone === selectedPhone) {
-      refetchMessages();
+    if (type === 'message') {
+      if (data.phone === selectedPhone) refetchMessages();
+      // Flash schermo solo per messaggi ricevuti
+      if (data?.type === 'received') {
+        if (data?.priority === 'vip') {
+          flashScreen('red');
+        } else if (data?.isAudio) {
+          flashScreen('yellow');
+        } else {
+          flashScreen('green');
+        }
+      }
     }
   });
   const esRef = useRef<EventSource | null>(null);

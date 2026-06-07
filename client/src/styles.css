@@ -994,3 +994,27 @@ input, textarea, select {
   padding-top: 4px;
   line-height: 1.4;
 }
+
+/* ─── Flash schermo notifica ─────────────────────────────────────────────────── */
+#screen-flash-overlay {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 99999;
+  opacity: 0;
+  mix-blend-mode: screen;
+}
+
+#screen-flash-overlay.flash-green  { background: #00ff44; animation: screen-flash 0.8s ease-out forwards; }
+#screen-flash-overlay.flash-yellow { background: #ffe033; animation: screen-flash 0.8s ease-out forwards; }
+#screen-flash-overlay.flash-red    { background: #ff2244; animation: screen-flash 1.0s ease-out forwards; }
+
+@keyframes screen-flash {
+  0%   { opacity: 0; }
+  8%   { opacity: 0.55; }
+  20%  { opacity: 0.35; }
+  35%  { opacity: 0.55; }
+  55%  { opacity: 0.20; }
+  75%  { opacity: 0.45; }
+  100% { opacity: 0; }
+}
