@@ -166,11 +166,18 @@ export default function Inbox() {
                     <ArrowLeft size={20} />
                   </button>
                 )}
-                <div className="chat-avatar">
+                <div
+                  className="chat-avatar"
+                  style={selectedConv?.priority === 'vip' ? { background: '#fbbf24', color: '#000' } : undefined}
+                >
                   {(selectedConv?.contactName || selectedPhone).charAt(0).toUpperCase()}
                 </div>
                 <div className="chat-contact-info">
-                  <div className="chat-contact-name">
+                  <div
+                    className="chat-contact-name"
+                    style={selectedConv?.priority === 'vip' ? { color: '#fbbf24', fontWeight: 700 } : undefined}
+                  >
+                    {selectedConv?.priority === 'vip' && <Star size={14} style={{ color: '#fbbf24', marginRight: 4, verticalAlign: 'middle', display: 'inline' }} />}
                     {selectedConv?.contactName || selectedPhone}
                   </div>
                   <div className="chat-contact-phone">{selectedPhone}</div>
