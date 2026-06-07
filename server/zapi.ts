@@ -48,14 +48,15 @@ export async function syncContacts(): Promise<number> {
 
   const insertConv = db.prepare(`
     INSERT INTO conversations 
-      (phone, contact_name, last_message, last_message_at, unread_count, created_at)
+      (phone, contact_name, last_message, last_message_at, unread_count, is_group, created_at)
     VALUES 
-      (@phone, @contact_name, @last_message, @last_message_at, @unread_count, datetime('now'))
+      (@phone, @contact_name, @last_message, @last_message_at, @unread_count, @is_group, datetime('now'))
     ON CONFLICT(phone) DO UPDATE SET
       contact_name = excluded.contact_name,
       last_message = excluded.last_message,
       last_message_at = excluded.last_message_at,
-      unread_count = excluded.unread_count
+      unread_count = excluded.unread_count,
+      is_group = COALESCE(is_group, excluded.is_group)
   `);
 
   while (true) {
@@ -68,7 +69,8 @@ export async function syncContacts(): Promise<number> {
       const insertMany = db.transaction((items: any[]) => {
         for (const chat of items) {
           const phone = chat.id || chat.phone || '';
-          if (!phone || phone.includes('@g.us') || phone.includes('-')) continue; // skip groups
+          if (!phone) continue;
+          const isGroup = phone.includes('@g.us') || (phone.includes('-') && !phone.match(/^\d+$/));
 
           let lastMessageAt = new Date().toISOString();
           try {
@@ -85,6 +87,7 @@ export async function syncContacts(): Promise<number> {
             last_message: chat.lastMessage || chat.body || '',
             last_message_at: lastMessageAt,
             unread_count: parseInt(chat.messagesUnread || chat.unreadMessages || chat.unread || '0', 10) || 0,
+            is_group: isGroup ? 1 : 0,
           });
           totalSynced++;
         }

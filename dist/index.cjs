@@ -23966,6 +23966,18 @@ var init_db = __esm({
       db.exec(`ALTER TABLE live_messages ADD COLUMN detected_language TEXT`);
     } catch {
     }
+    try {
+      db.exec(`ALTER TABLE conversations ADD COLUMN is_group INTEGER DEFAULT 0`);
+    } catch {
+    }
+    try {
+      db.exec(`ALTER TABLE live_messages ADD COLUMN is_group INTEGER DEFAULT 0`);
+    } catch {
+    }
+    try {
+      db.exec(`ALTER TABLE live_messages ADD COLUMN sender_name TEXT`);
+    } catch {
+    }
     console.log("[DB] Tables created/verified");
     db_default = db;
   }
@@ -24029,14 +24041,15 @@ async function syncContacts() {
   let totalSynced = 0;
   const insertConv = db2.prepare(`
     INSERT INTO conversations 
-      (phone, contact_name, last_message, last_message_at, unread_count, created_at)
+      (phone, contact_name, last_message, last_message_at, unread_count, is_group, created_at)
     VALUES 
-      (@phone, @contact_name, @last_message, @last_message_at, @unread_count, datetime('now'))
+      (@phone, @contact_name, @last_message, @last_message_at, @unread_count, @is_group, datetime('now'))
     ON CONFLICT(phone) DO UPDATE SET
       contact_name = excluded.contact_name,
       last_message = excluded.last_message,
       last_message_at = excluded.last_message_at,
-      unread_count = excluded.unread_count
+      unread_count = excluded.unread_count,
+      is_group = COALESCE(is_group, excluded.is_group)
   `);
   while (true) {
     try {
@@ -24046,7 +24059,8 @@ async function syncContacts() {
       const insertMany = db2.transaction((items) => {
         for (const chat of items) {
           const phone = chat.id || chat.phone || "";
-          if (!phone || phone.includes("@g.us") || phone.includes("-")) continue;
+          if (!phone) continue;
+          const isGroup = phone.includes("@g.us") || phone.includes("-") && !phone.match(/^\d+$/);
           let lastMessageAt = (/* @__PURE__ */ new Date()).toISOString();
           try {
             if (chat.lastMessageTime && chat.lastMessageTime > 0) {
@@ -24060,7 +24074,8 @@ async function syncContacts() {
             contact_name: chat.name || chat.contactName || chat.pushName || phone,
             last_message: chat.lastMessage || chat.body || "",
             last_message_at: lastMessageAt,
-            unread_count: parseInt(chat.messagesUnread || chat.unreadMessages || chat.unread || "0", 10) || 0
+            unread_count: parseInt(chat.messagesUnread || chat.unreadMessages || chat.unread || "0", 10) || 0,
+            is_group: isGroup ? 1 : 0
           });
           totalSynced++;
         }
@@ -24167,7 +24182,7 @@ function isPollingRunning() {
 // server/routes.ts
 var router = (0, import_express.Router)();
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.7.1", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.8.0", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/debug/laura", (_req, res) => {
   try {
@@ -24206,10 +24221,9 @@ router.get("/analytics/today-report", (req, res) => {
       FROM live_messages
       WHERE DATE(created_at) = ?
         AND phone NOT LIKE '%@newsletter%'
-        AND phone NOT LIKE '%@g.us%'
         AND phone NOT LIKE '%120363%'
         AND phone != '393457050479'
-        AND length(phone) >= 10
+        AND length(phone) >= 8
       GROUP BY phone
       ORDER BY last_activity DESC
       LIMIT 50
@@ -24232,10 +24246,9 @@ router.get("/analytics/daily-email-report", (req, res) => {
       FROM live_messages lm
       WHERE DATE(lm.created_at) = ?
         AND lm.phone NOT LIKE '%@newsletter%'
-        AND lm.phone NOT LIKE '%@g.us%'
         AND lm.phone NOT LIKE '%120363%'
         AND lm.phone != '393457050479'
-        AND length(lm.phone) >= 10
+        AND length(lm.phone) >= 8
       GROUP BY lm.phone
       ORDER BY last_activity DESC
     `).all(today);
@@ -24313,6 +24326,7 @@ router.get("/conversations", (req, res) => {
     let query = `
       SELECT 
         id, phone, contact_name as contactName,
+        COALESCE(is_group, 0) as isGroup,
         CASE 
           WHEN (SELECT COUNT(*) FROM live_messages WHERE phone = conversations.phone) > 0
           THEN (SELECT content FROM live_messages WHERE phone = conversations.phone ORDER BY created_at DESC LIMIT 1)
@@ -24332,7 +24346,6 @@ router.get("/conversations", (req, res) => {
       WHERE is_archived = ?
       AND phone NOT LIKE '%@newsletter%'
       AND phone NOT LIKE '%120363%'
-      AND phone NOT LIKE '%@g.us%'
       AND length(phone) >= 8
     `;
     const params = [archived === "1" ? 1 : 0];
@@ -24468,9 +24481,10 @@ router.post("/webhook/message", async (req, res) => {
     const isImage = msgType === "image" || msgType === "imagemessage" || !!imageUrl;
     const caption = body.image?.caption || body.caption || "";
     console.log(`[Webhook] type=${msgType} isAudio=${isAudio} isImage=${isImage} audioUrl=${audioUrl?.substring(0, 60)} imageUrl=${imageUrl?.substring(0, 60)} body.keys=${Object.keys(body).join(",")}`);
-    if (isGroup || phone && phone.includes("-") || phone && phone.includes("@newsletter")) {
-      return res.json({ ignored: true, reason: "group" });
+    if (phone && phone.includes("@newsletter")) {
+      return res.json({ ignored: true, reason: "newsletter" });
     }
+    const isLegacyGroup = phone && phone.includes("-") && !phone.includes("@g.us");
     if (!phone) {
       return res.json({ ignored: true, reason: "no phone" });
     }
@@ -24540,29 +24554,34 @@ _(Originale: ${textToTranslate})_`;
     }
     const timestamp = new Date(momment * 1e3).toISOString();
     const now = (/* @__PURE__ */ new Date()).toISOString();
+    const groupName = isGroup ? body.groupName || body.name || phone : null;
+    const effectiveSenderName = isGroup ? senderName || body.participantPhone || phone : senderName || phone;
     db_default.prepare(`
       INSERT OR IGNORE INTO live_messages 
-        (message_id, phone, contact_name, content, direction, timestamp, is_read, is_audio, audio_url, is_image, image_url, caption, original_content, detected_language, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(messageId, phone, senderName || phone, content, direction, timestamp, fromMe ? 1 : 0, isAudio ? 1 : 0, audioUrl, isImage ? 1 : 0, imageUrl, caption || null, originalContent, detectedLanguage, now);
+        (message_id, phone, contact_name, content, direction, timestamp, is_read, is_audio, audio_url, is_image, image_url, caption, original_content, detected_language, is_group, sender_name, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(messageId, phone, groupName || effectiveSenderName, content, direction, timestamp, fromMe ? 1 : 0, isAudio ? 1 : 0, audioUrl, isImage ? 1 : 0, imageUrl, caption || null, originalContent, detectedLanguage, isGroup ? 1 : 0, effectiveSenderName, now);
+    const convName = isGroup ? body.groupName || body.name || phone : senderName || phone;
     db_default.prepare(`
-      INSERT INTO conversations (phone, contact_name, last_message, last_message_at, unread_count, total_received, total_sent)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO conversations (phone, contact_name, last_message, last_message_at, unread_count, total_received, total_sent, is_group)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(phone) DO UPDATE SET
         contact_name = CASE WHEN excluded.contact_name != '' AND excluded.contact_name != excluded.phone THEN excluded.contact_name ELSE contact_name END,
         last_message = excluded.last_message,
         last_message_at = excluded.last_message_at,
         unread_count = CASE WHEN ? = 'received' THEN unread_count + 1 ELSE unread_count END,
         total_received = CASE WHEN ? = 'received' THEN total_received + 1 ELSE total_received END,
-        total_sent = CASE WHEN ? = 'sent' THEN total_sent + 1 ELSE total_sent END
+        total_sent = CASE WHEN ? = 'sent' THEN total_sent + 1 ELSE total_sent END,
+        is_group = COALESCE(is_group, excluded.is_group)
     `).run(
       phone,
-      senderName || phone,
+      convName,
       content,
       timestamp,
       fromMe ? 0 : 1,
       fromMe ? 0 : 1,
       fromMe ? 1 : 0,
+      isGroup ? 1 : 0,
       direction,
       direction,
       direction

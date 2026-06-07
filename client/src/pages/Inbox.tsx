@@ -147,7 +147,7 @@ export default function Inbox() {
                   <div className="conv-info">
                     <div className="conv-top">
                       <span className="conv-name">
-                        {conv.contactName || conv.phone}
+                        {conv.isGroup ? '👥 ' : ''}{conv.contactName || conv.phone}
                       </span>
                       <span className="conv-time">{formatTime(conv.lastMessageAt)}</span>
                     </div>

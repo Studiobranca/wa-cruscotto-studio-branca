@@ -73,6 +73,10 @@ try { db.exec(`UPDATE live_messages SET is_image = 1 WHERE image_url IS NOT NULL
 // Migration: colonne traduzione
 try { db.exec(`ALTER TABLE live_messages ADD COLUMN original_content TEXT`); } catch {}
 try { db.exec(`ALTER TABLE live_messages ADD COLUMN detected_language TEXT`); } catch {}
+// Migration: supporto gruppi
+try { db.exec(`ALTER TABLE conversations ADD COLUMN is_group INTEGER DEFAULT 0`); } catch {}
+try { db.exec(`ALTER TABLE live_messages ADD COLUMN is_group INTEGER DEFAULT 0`); } catch {}
+try { db.exec(`ALTER TABLE live_messages ADD COLUMN sender_name TEXT`); } catch {}
 
 console.log('[DB] Tables created/verified');
 
