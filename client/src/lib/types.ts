@@ -29,6 +29,8 @@ export interface Message {
   isImage: number;
   imageUrl: string | null;
   caption: string | null;
+  originalContent: string | null;
+  detectedLanguage: string | null;
   createdAt: string;
 }
 

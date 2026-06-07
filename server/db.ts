@@ -70,6 +70,9 @@ try { db.exec(`ALTER TABLE live_messages ADD COLUMN caption TEXT`); } catch {}
 try { db.exec(`UPDATE live_messages SET is_audio = 1 WHERE audio_url IS NOT NULL AND audio_url != '' AND is_audio = 0`); } catch {}
 // Migration: correggi messaggi con imageUrl ma isImage=0
 try { db.exec(`UPDATE live_messages SET is_image = 1 WHERE image_url IS NOT NULL AND image_url != '' AND is_image = 0`); } catch {}
+// Migration: colonne traduzione
+try { db.exec(`ALTER TABLE live_messages ADD COLUMN original_content TEXT`); } catch {}
+try { db.exec(`ALTER TABLE live_messages ADD COLUMN detected_language TEXT`); } catch {}
 
 console.log('[DB] Tables created/verified');
 

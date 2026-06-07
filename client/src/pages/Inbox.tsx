@@ -265,6 +265,15 @@ export default function Inbox() {
                             <audio controls src={msg.audioUrl} style={{ height: 32, maxWidth: '100%' }} />
                           )}
                         </div>
+                      ) : msg.originalContent ? (
+                        // Messaggio tradotto
+                        <div className="translated-message">
+                          <div className="translated-badge">🌐 Tradotto</div>
+                          <span style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                            {msg.content.split('\n\n_(Originale:')[0].trim()}
+                          </span>
+                          <div className="original-text">✎ {msg.originalContent}</div>
+                        </div>
                       ) : (
                         <span style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{msg.content}</span>
                       )}

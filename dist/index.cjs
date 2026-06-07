@@ -23958,6 +23958,14 @@ var init_db = __esm({
       db.exec(`UPDATE live_messages SET is_image = 1 WHERE image_url IS NOT NULL AND image_url != '' AND is_image = 0`);
     } catch {
     }
+    try {
+      db.exec(`ALTER TABLE live_messages ADD COLUMN original_content TEXT`);
+    } catch {
+    }
+    try {
+      db.exec(`ALTER TABLE live_messages ADD COLUMN detected_language TEXT`);
+    } catch {
+    }
     console.log("[DB] Tables created/verified");
     db_default = db;
   }
@@ -24159,7 +24167,7 @@ function isPollingRunning() {
 // server/routes.ts
 var router = (0, import_express.Router)();
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.4.0", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.5.0", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/debug/laura", (_req, res) => {
   try {
@@ -24300,6 +24308,7 @@ router.get("/conversations/:phone/messages", (req, res) => {
         content, direction, timestamp, is_read as isRead,
         is_audio as isAudio, audio_url as audioUrl,
         is_image as isImage, image_url as imageUrl, caption,
+        original_content as originalContent, detected_language as detectedLanguage,
         created_at as createdAt
       FROM live_messages
       WHERE phone = ?
@@ -24443,13 +24452,39 @@ router.post("/webhook/message", async (req, res) => {
         console.error("[Deepgram] Error:", e);
       }
     }
+    let originalContent = null;
+    let detectedLanguage = null;
+    const textToTranslate = !isImage && !isAudio && content && content.trim().length > 2 && !fromMe ? content : null;
+    if (textToTranslate) {
+      try {
+        const tmUrl = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(textToTranslate)}&langpair=autodetect|it&de=studiobranca.mariano@gmail.com`;
+        const tmResp = await fetch(tmUrl);
+        if (tmResp.ok) {
+          const tmData = await tmResp.json();
+          const translated = tmData?.responseData?.translatedText?.trim();
+          const status = tmData?.responseStatus;
+          if (status === 200 && translated && !translated.includes("PLEASE SELECT")) {
+            if (translated.toLowerCase() !== textToTranslate.toLowerCase()) {
+              originalContent = textToTranslate;
+              detectedLanguage = "auto";
+              content = `${translated}
+
+_(Originale: ${textToTranslate})_`;
+              console.log(`[Translator] Tradotto: '${textToTranslate.substring(0, 40)}' \u2192 '${translated.substring(0, 40)}'`);
+            }
+          }
+        }
+      } catch (e) {
+        console.error("[Translator] Error:", e);
+      }
+    }
     const timestamp = new Date(momment * 1e3).toISOString();
     const now = (/* @__PURE__ */ new Date()).toISOString();
     db_default.prepare(`
       INSERT OR IGNORE INTO live_messages 
-        (message_id, phone, contact_name, content, direction, timestamp, is_read, is_audio, audio_url, is_image, image_url, caption, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(messageId, phone, senderName || phone, content, direction, timestamp, fromMe ? 1 : 0, isAudio ? 1 : 0, audioUrl, isImage ? 1 : 0, imageUrl, caption || null, now);
+        (message_id, phone, contact_name, content, direction, timestamp, is_read, is_audio, audio_url, is_image, image_url, caption, original_content, detected_language, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(messageId, phone, senderName || phone, content, direction, timestamp, fromMe ? 1 : 0, isAudio ? 1 : 0, audioUrl, isImage ? 1 : 0, imageUrl, caption || null, originalContent, detectedLanguage, now);
     db_default.prepare(`
       INSERT INTO conversations (phone, contact_name, last_message, last_message_at, unread_count, total_received, total_sent)
       VALUES (?, ?, ?, ?, ?, ?, ?)

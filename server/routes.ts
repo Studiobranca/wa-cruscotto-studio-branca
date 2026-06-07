@@ -8,7 +8,7 @@ const router = Router();
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.4.0', built: new Date().toISOString() });
+  res.json({ version: '2.5.0', built: new Date().toISOString() });
 });
 
 // ─── Debug ───────────────────────────────────────────────────────────────────
@@ -166,6 +166,7 @@ router.get('/conversations/:phone/messages', (req: Request, res: Response) => {
         content, direction, timestamp, is_read as isRead,
         is_audio as isAudio, audio_url as audioUrl,
         is_image as isImage, image_url as imageUrl, caption,
+        original_content as originalContent, detected_language as detectedLanguage,
         created_at as createdAt
       FROM live_messages
       WHERE phone = ?
@@ -347,15 +348,43 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
       }
     }
 
+    // Traduzione automatica in italiano (solo messaggi ricevuti con testo)
+    let originalContent: string | null = null;
+    let detectedLanguage: string | null = null;
+    const textToTranslate = !isImage && !isAudio && content && content.trim().length > 2 && !fromMe ? content : null;
+    if (textToTranslate) {
+      try {
+        const tmUrl = `https://api.mymemory.translated.net/get?q=${encodeURIComponent(textToTranslate)}&langpair=autodetect|it&de=studiobranca.mariano@gmail.com`;
+        const tmResp = await fetch(tmUrl);
+        if (tmResp.ok) {
+          const tmData = await tmResp.json() as any;
+          const translated = tmData?.responseData?.translatedText?.trim();
+          const status = tmData?.responseStatus;
+          // 403 o 'PLEASE SELECT TWO DISTINCT LANGUAGES' = già italiano
+          if (status === 200 && translated && !translated.includes('PLEASE SELECT')) {
+            // Verifica che la traduzione sia diversa dall'originale
+            if (translated.toLowerCase() !== textToTranslate.toLowerCase()) {
+              originalContent = textToTranslate;
+              detectedLanguage = 'auto';
+              content = `${translated}\n\n_(Originale: ${textToTranslate})_`;
+              console.log(`[Translator] Tradotto: '${textToTranslate.substring(0,40)}' → '${translated.substring(0,40)}'`);
+            }
+          }
+        }
+      } catch (e) {
+        console.error('[Translator] Error:', e);
+      }
+    }
+
     const timestamp = new Date(momment * 1000).toISOString();
     const now = new Date().toISOString();
 
     // Save message
     db.prepare(`
       INSERT OR IGNORE INTO live_messages 
-        (message_id, phone, contact_name, content, direction, timestamp, is_read, is_audio, audio_url, is_image, image_url, caption, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(messageId, phone, senderName || phone, content, direction, timestamp, fromMe ? 1 : 0, isAudio ? 1 : 0, audioUrl, isImage ? 1 : 0, imageUrl, caption || null, now);
+        (message_id, phone, contact_name, content, direction, timestamp, is_read, is_audio, audio_url, is_image, image_url, caption, original_content, detected_language, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(messageId, phone, senderName || phone, content, direction, timestamp, fromMe ? 1 : 0, isAudio ? 1 : 0, audioUrl, isImage ? 1 : 0, imageUrl, caption || null, originalContent, detectedLanguage, now);
 
     // Upsert conversation
     db.prepare(`
