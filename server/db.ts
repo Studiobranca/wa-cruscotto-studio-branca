@@ -1,9 +1,17 @@
 import Database from 'better-sqlite3';
 import path from 'path';
+import fs from 'fs';
 
 const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), 'data.db');
 
 console.log(`[DB] Using database at: ${DB_PATH}`);
+
+// Crea la directory se non esiste (necessario per Railway con volume /data)
+const dbDir = path.dirname(DB_PATH);
+if (!fs.existsSync(dbDir)) {
+  fs.mkdirSync(dbDir, { recursive: true });
+  console.log(`[DB] Created directory: ${dbDir}`);
+}
 
 export const db = new Database(DB_PATH);
 
