@@ -24212,16 +24212,18 @@ router.get("/conversations", (req, res) => {
     let query = `
       SELECT 
         id, phone, contact_name as contactName,
-        COALESCE(
-          (SELECT content FROM live_messages WHERE phone = conversations.phone ORDER BY created_at DESC LIMIT 1),
-          last_message
-        ) as lastMessage,
-        COALESCE(
-          (SELECT created_at FROM live_messages WHERE phone = conversations.phone ORDER BY created_at DESC LIMIT 1),
-          last_message_at
-        ) as lastMessageAt,
-        COALESCE((SELECT COUNT(*) FROM live_messages WHERE phone = conversations.phone AND is_read = 0 AND direction = 'received'), unread_count) as unreadCount,
-        COALESCE((SELECT COUNT(*) FROM live_messages WHERE phone = conversations.phone AND direction = 'received'), total_received) as totalReceived,
+        CASE 
+          WHEN (SELECT COUNT(*) FROM live_messages WHERE phone = conversations.phone) > 0
+          THEN (SELECT content FROM live_messages WHERE phone = conversations.phone ORDER BY created_at DESC LIMIT 1)
+          ELSE NULLIF(last_message, '')
+        END as lastMessage,
+        CASE 
+          WHEN (SELECT COUNT(*) FROM live_messages WHERE phone = conversations.phone) > 0
+          THEN (SELECT created_at FROM live_messages WHERE phone = conversations.phone ORDER BY created_at DESC LIMIT 1)
+          ELSE last_message_at
+        END as lastMessageAt,
+        (SELECT COUNT(*) FROM live_messages WHERE phone = conversations.phone AND is_read = 0 AND direction = 'received') + unread_count as unreadCount,
+        (SELECT COUNT(*) FROM live_messages WHERE phone = conversations.phone AND direction = 'received') + total_received as totalReceived,
         total_sent as totalSent,
         auto_reply_enabled as autoReplyEnabled, auto_reply_message as autoReplyMessage,
         is_archived as isArchived, priority, priority_label as priorityLabel, created_at as createdAt
