@@ -24167,7 +24167,7 @@ function isPollingRunning() {
 // server/routes.ts
 var router = (0, import_express.Router)();
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.6.2", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.7.0", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/debug/laura", (_req, res) => {
   try {
@@ -24205,11 +24205,64 @@ router.get("/analytics/today-report", (req, res) => {
         MAX(created_at) as last_activity
       FROM live_messages
       WHERE DATE(created_at) = ?
+        AND phone NOT LIKE '%@newsletter%'
+        AND phone NOT LIKE '%@g.us%'
+        AND phone NOT LIKE '%120363%'
+        AND length(phone) >= 10
       GROUP BY phone
       ORDER BY last_activity DESC
       LIMIT 50
     `).all(today);
     res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.get("/analytics/daily-email-report", (req, res) => {
+  try {
+    const today = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
+    const contacts = db_default.prepare(`
+      SELECT 
+        lm.phone,
+        lm.contact_name,
+        COUNT(CASE WHEN lm.direction='received' THEN 1 END) as received,
+        COUNT(CASE WHEN lm.direction='sent' THEN 1 END) as sent,
+        MAX(lm.created_at) as last_activity
+      FROM live_messages lm
+      WHERE DATE(lm.created_at) = ?
+        AND lm.phone NOT LIKE '%@newsletter%'
+        AND lm.phone NOT LIKE '%@g.us%'
+        AND lm.phone NOT LIKE '%120363%'
+        AND length(lm.phone) >= 10
+      GROUP BY lm.phone
+      ORDER BY last_activity DESC
+    `).all(today);
+    const result = contacts.map((c) => {
+      const messages = db_default.prepare(`
+        SELECT content, direction, created_at, is_audio, is_image, original_content
+        FROM live_messages
+        WHERE phone = ? AND DATE(created_at) = ?
+        ORDER BY created_at ASC
+      `).all(c.phone, today);
+      const received = messages.filter((m) => m.direction === "received");
+      const replied = messages.some((m) => m.direction === "sent");
+      return {
+        phone: c.phone,
+        contactName: c.contact_name || c.phone,
+        received: c.received,
+        sent: c.sent,
+        lastActivity: c.last_activity,
+        replied,
+        messages: received.map((m) => ({
+          content: m.content,
+          time: m.created_at,
+          isAudio: m.is_audio === 1,
+          isImage: m.is_image === 1,
+          originalContent: m.original_content
+        }))
+      };
+    });
+    res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -24276,6 +24329,9 @@ router.get("/conversations", (req, res) => {
       FROM conversations
       WHERE is_archived = ?
       AND phone NOT LIKE '%@newsletter%'
+      AND phone NOT LIKE '%120363%'
+      AND phone NOT LIKE '%@g.us%'
+      AND length(phone) >= 8
     `;
     const params = [archived === "1" ? 1 : 0];
     if (search) {
@@ -24691,6 +24747,23 @@ router.get("/conversations/:phone/requests", (req, res) => {
 });
 router.get("/health", (req, res) => {
   res.json({ status: "ok", timestamp: (/* @__PURE__ */ new Date()).toISOString() });
+});
+router.post("/admin/cleanup-test-data", (req, res) => {
+  try {
+    const testPhones = ["393001234567", "393001234568", "393001234569"];
+    let deleted = 0;
+    for (const phone of testPhones) {
+      const r1 = db_default.prepare(`DELETE FROM live_messages WHERE phone = ?`).run(phone);
+      const r2 = db_default.prepare(`DELETE FROM conversations WHERE phone = ?`).run(phone);
+      deleted += r1.changes + r2.changes;
+    }
+    const r3 = db_default.prepare(`DELETE FROM conversations WHERE phone LIKE '%120363%'`).run();
+    const r4 = db_default.prepare(`DELETE FROM live_messages WHERE phone LIKE '%120363%'`).run();
+    deleted += r3.changes + r4.changes;
+    res.json({ success: true, deleted });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 var routes_default = router;
 

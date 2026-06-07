@@ -8,7 +8,7 @@ const router = Router();
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.6.2', built: new Date().toISOString() });
+  res.json({ version: '2.7.0', built: new Date().toISOString() });
 });
 
 // ─── Debug ───────────────────────────────────────────────────────────────────
@@ -52,11 +52,72 @@ router.get('/analytics/today-report', (req: Request, res: Response) => {
         MAX(created_at) as last_activity
       FROM live_messages
       WHERE DATE(created_at) = ?
+        AND phone NOT LIKE '%@newsletter%'
+        AND phone NOT LIKE '%@g.us%'
+        AND phone NOT LIKE '%120363%'
+        AND length(phone) >= 10
       GROUP BY phone
       ORDER BY last_activity DESC
       LIMIT 50
     `).all(today);
     res.json(rows);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Daily Email Report ───────────────────────────────────────────────────────
+router.get('/analytics/daily-email-report', (req: Request, res: Response) => {
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    // Messaggi di oggi con dettaglio per ogni contatto
+    const contacts = db.prepare(`
+      SELECT 
+        lm.phone,
+        lm.contact_name,
+        COUNT(CASE WHEN lm.direction='received' THEN 1 END) as received,
+        COUNT(CASE WHEN lm.direction='sent' THEN 1 END) as sent,
+        MAX(lm.created_at) as last_activity
+      FROM live_messages lm
+      WHERE DATE(lm.created_at) = ?
+        AND lm.phone NOT LIKE '%@newsletter%'
+        AND lm.phone NOT LIKE '%@g.us%'
+        AND lm.phone NOT LIKE '%120363%'
+        AND length(lm.phone) >= 10
+      GROUP BY lm.phone
+      ORDER BY last_activity DESC
+    `).all(today) as any[];
+
+    // Per ogni contatto, recupera i messaggi completi di oggi
+    const result = contacts.map((c: any) => {
+      const messages = db.prepare(`
+        SELECT content, direction, created_at, is_audio, is_image, original_content
+        FROM live_messages
+        WHERE phone = ? AND DATE(created_at) = ?
+        ORDER BY created_at ASC
+      `).all(c.phone, today) as any[];
+
+      const received = messages.filter((m: any) => m.direction === 'received');
+      const replied = messages.some((m: any) => m.direction === 'sent');
+
+      return {
+        phone: c.phone,
+        contactName: c.contact_name || c.phone,
+        received: c.received,
+        sent: c.sent,
+        lastActivity: c.last_activity,
+        replied,
+        messages: received.map((m: any) => ({
+          content: m.content,
+          time: m.created_at,
+          isAudio: m.is_audio === 1,
+          isImage: m.is_image === 1,
+          originalContent: m.original_content,
+        })),
+      };
+    });
+
+    res.json(result);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -129,6 +190,9 @@ router.get('/conversations', (req: Request, res: Response) => {
       FROM conversations
       WHERE is_archived = ?
       AND phone NOT LIKE '%@newsletter%'
+      AND phone NOT LIKE '%120363%'
+      AND phone NOT LIKE '%@g.us%'
+      AND length(phone) >= 8
     `;
     const params: any[] = [archived === '1' ? 1 : 0];
 
@@ -637,6 +701,27 @@ router.get('/conversations/:phone/requests', (req: Request, res: Response) => {
 
 router.get('/health', (req: Request, res: Response) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// ─── Admin: pulizia contatti test/fittizi ────────────────────────────────────────────
+router.post('/admin/cleanup-test-data', (req: Request, res: Response) => {
+  try {
+    // Rimuovi messaggi e conversazioni da numeri fittizi usati nei test
+    const testPhones = ['393001234567', '393001234568', '393001234569'];
+    let deleted = 0;
+    for (const phone of testPhones) {
+      const r1 = db.prepare(`DELETE FROM live_messages WHERE phone = ?`).run(phone);
+      const r2 = db.prepare(`DELETE FROM conversations WHERE phone = ?`).run(phone);
+      deleted += r1.changes + r2.changes;
+    }
+    // Rimuovi anche conversazioni newsletter rimaste
+    const r3 = db.prepare(`DELETE FROM conversations WHERE phone LIKE '%120363%'`).run();
+    const r4 = db.prepare(`DELETE FROM live_messages WHERE phone LIKE '%120363%'`).run();
+    deleted += r3.changes + r4.changes;
+    res.json({ success: true, deleted });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 export default router;

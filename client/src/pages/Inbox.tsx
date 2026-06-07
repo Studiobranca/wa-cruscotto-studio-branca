@@ -86,7 +86,9 @@ export default function Inbox() {
   const formatTime = (ts: string) => {
     if (!ts) return '';
     try {
-      const d = new Date(ts);
+      // Aggiunge Z se mancante per trattare correttamente come UTC
+      const normalized = ts.endsWith('Z') || ts.includes('+') ? ts : ts + 'Z';
+      const d = new Date(normalized);
       const today = new Date();
       if (d.toDateString() === today.toDateString()) {
         return d.toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' });

@@ -11,15 +11,19 @@ export default function Report() {
   const formatTime = (ts: string) => {
     if (!ts) return '';
     try {
-      return new Date(ts).toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' });
+      const normalized = ts.endsWith('Z') || ts.includes('+') ? ts : ts + 'Z';
+      return new Date(normalized).toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' });
     } catch { return ''; }
   };
 
-  const chartData = report.slice(0, 15).map(r => ({
-    name: (r.contact_name || r.phone).substring(0, 12),
-    received: r.received,
-    sent: r.sent,
-  }));
+  const chartData = report
+    .filter(r => !r.phone?.includes('120363') && r.phone?.length >= 10)
+    .slice(0, 12)
+    .map(r => ({
+      name: (r.contact_name || r.phone).substring(0, 18),
+      received: r.received,
+      sent: r.sent,
+    }));
 
   if (isLoading) return <Loader text="Caricamento report..." />;
 
@@ -54,7 +58,7 @@ export default function Report() {
             <BarChart data={chartData} layout="vertical" margin={{ top: 5, right: 20, left: 10, bottom: 5 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
               <XAxis type="number" tick={{ fontSize: 11, fill: '#9ca3af' }} />
-              <YAxis type="category" dataKey="name" tick={{ fontSize: 11, fill: '#9ca3af' }} width={80} />
+              <YAxis type="category" dataKey="name" tick={{ fontSize: 11, fill: '#9ca3af' }} width={130} />
               <Tooltip
                 contentStyle={{ background: '#1f2937', border: 'none', borderRadius: 8, fontSize: 12 }}
               />
