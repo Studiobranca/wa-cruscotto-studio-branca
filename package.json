@@ -4,10 +4,10 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server/index.ts",
-    "build": "npm run build:client && npm run build:server",
     "build:client": "vite build",
     "build:server": "esbuild server/index.ts --bundle --platform=node --format=cjs --outfile=dist/index.cjs --external:better-sqlite3 --external:fsevents",
-    "start": "NODE_ENV=production node dist/index.cjs"
+    "start": "NODE_ENV=production node dist/index.cjs",
+    "build:local": "npm run build:client && npm run build:server"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.0.0",
