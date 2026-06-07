@@ -1,0 +1,5 @@
+[phases.build]
+cmds = []
+
+[phases.install]
+cmds = ["npm ci --omit=dev"]
