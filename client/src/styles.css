@@ -1018,3 +1018,210 @@ input, textarea, select {
   75%  { opacity: 0.45; }
   100% { opacity: 0; }
 }
+
+/* ─── Pannello Richieste ─────────────────────────────────────────────────────── */
+.requests-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  height: 100%;
+  overflow-y: auto;
+  padding: 12px;
+}
+
+.requests-kpi {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+.kpi-box {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  font-size: 12px;
+  font-weight: 600;
+  flex: 1;
+  min-width: 70px;
+}
+.kpi-box .kpi-n { font-size: 20px; font-weight: 700; line-height: 1; }
+.kpi-box .kpi-l { font-size: 11px; font-weight: 400; opacity: 0.75; }
+.kpi-total  { background: #f0f4ff; color: #3b5bdb; flex-direction: column; align-items: flex-start; }
+.kpi-evaded { background: #f0fdf4; color: #16a34a; flex-direction: column; align-items: flex-start; }
+.kpi-pending{ background: #fff7ed; color: #d97706; flex-direction: column; align-items: flex-start; }
+.kpi-repeated{background: #fdf4ff; color: #9333ea; flex-direction: column; align-items: flex-start; }
+
+/* Argomenti */
+.requests-topics {
+  background: #f8fafc;
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  border: 1px solid #e2e8f0;
+}
+.topics-title { font-size: 11px; font-weight: 700; color: #64748b; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 8px; }
+.topic-row {
+  cursor: pointer;
+  margin-bottom: 8px;
+}
+.topic-info { display: flex; justify-content: space-between; align-items: center; margin-bottom: 3px; }
+.topic-name { font-size: 12px; font-weight: 600; color: #334155; text-transform: capitalize; }
+.topic-counts { display: flex; gap: 6px; }
+.badge-evaded-sm { font-size: 10px; color: #16a34a; }
+.badge-pending-sm { font-size: 10px; color: #d97706; }
+.topic-bar { display: flex; height: 5px; border-radius: 3px; overflow: hidden; background: #e2e8f0; }
+.topic-bar-evaded { background: #22c55e; transition: width .3s; }
+.topic-bar-pending { background: #f59e0b; transition: width .3s; }
+
+/* Tabs filtro */
+.requests-tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 10px;
+  border-bottom: 1px solid #e2e8f0;
+  padding-bottom: 8px;
+}
+.req-tab {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 10px;
+  border-radius: 20px;
+  border: 1px solid #e2e8f0;
+  background: #f8fafc;
+  font-size: 12px;
+  font-weight: 500;
+  color: #64748b;
+  cursor: pointer;
+  transition: all .15s;
+}
+.req-tab:hover { background: #f0f4ff; border-color: #c7d2fe; }
+.req-tab.active { background: #3b5bdb; color: #fff; border-color: #3b5bdb; }
+
+/* Lista */
+.requests-list { display: flex; flex-direction: column; gap: 8px; }
+.requests-empty, .requests-empty-tab, .requests-loading, .requests-error {
+  text-align: center;
+  padding: 32px 16px;
+  color: #94a3b8;
+  font-size: 13px;
+}
+
+/* Card singola richiesta */
+.request-card {
+  border-radius: 10px;
+  border: 1px solid #e2e8f0;
+  background: #fff;
+  overflow: hidden;
+  transition: box-shadow .15s;
+}
+.request-card:hover { box-shadow: 0 2px 8px rgba(0,0,0,.08); }
+.request-card.pending  { border-left: 3px solid #f59e0b; }
+.request-card.evaded   { border-left: 3px solid #22c55e; }
+.request-card.repeated { background: #fefce8; }
+
+.request-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 10px 4px;
+  cursor: pointer;
+  gap: 8px;
+}
+.request-meta { display: flex; align-items: center; gap: 6px; }
+.request-date { font-size: 10px; color: #94a3b8; }
+.request-status { display: flex; align-items: center; gap: 5px; }
+
+.request-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 20px;
+}
+.badge-evaded  { background: #f0fdf4; color: #16a34a; }
+.badge-pending { background: #fff7ed; color: #d97706; }
+.badge-repeated{ background: #fdf4ff; color: #9333ea; }
+
+.request-text {
+  padding: 4px 10px 8px;
+  font-size: 13px;
+  color: #334155;
+  line-height: 1.45;
+  margin: 0;
+}
+
+/* Dettaglio espanso */
+.request-detail {
+  border-top: 1px solid #f1f5f9;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.request-keywords { display: flex; flex-wrap: wrap; gap: 4px; }
+.kw-chip {
+  font-size: 10px;
+  background: #f0f4ff;
+  color: #3b5bdb;
+  padding: 2px 7px;
+  border-radius: 20px;
+  font-weight: 500;
+}
+
+.request-reply, .request-history {
+  background: #f8fafc;
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.reply-label {
+  font-size: 10px;
+  font-weight: 700;
+  color: #64748b;
+  text-transform: uppercase;
+  display: block;
+  margin-bottom: 4px;
+}
+.reply-text {
+  font-size: 12px;
+  color: #475569;
+  margin: 0;
+  line-height: 1.4;
+}
+.occ-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 11px;
+  color: #64748b;
+  padding: 3px 0;
+  border-bottom: 1px solid #f1f5f9;
+}
+.occ-row:last-child { border-bottom: none; }
+
+/* ─── Tab chat (Messaggi / Richieste) ───────────────────────────────────────── */
+.chat-tabs {
+  display: flex;
+  border-bottom: 2px solid #e2e8f0;
+  background: #fff;
+  flex-shrink: 0;
+}
+.chat-tab {
+  flex: 1;
+  padding: 10px 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: #94a3b8;
+  background: none;
+  border: none;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -2px;
+  transition: color .15s, border-color .15s;
+}
+.chat-tab:hover { color: #334155; }
+.chat-tab.active { color: #3b5bdb; border-bottom-color: #3b5bdb; }

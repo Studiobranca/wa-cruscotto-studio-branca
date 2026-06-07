@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { useConversations, useMessages, useSendMessage, useSetPriority, useAutoReply, useSSE } from '../lib/hooks';
 import { flashScreen } from '../lib/useFlash';
+import RequestsPanel from '../components/RequestsPanel';
 import PriorityBadge from '../components/PriorityBadge';
 import Loader from '../components/Loader';
 import type { Conversation } from '../lib/types';
@@ -12,6 +13,7 @@ export default function Inbox() {
   const [messageInput, setMessageInput] = useState('');
   const [showPriorityMenu, setShowPriorityMenu] = useState(false);
   const [showAutoReplyPanel, setShowAutoReplyPanel] = useState(false);
+  const [chatTab, setChatTab] = useState<'messages' | 'requests'>('messages');
   const [autoReplyText, setAutoReplyText] = useState('');
   const [isMobile, setIsMobile] = useState(window.innerWidth <= 600);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -240,8 +242,31 @@ export default function Inbox() {
                 </div>
               </div>
 
+              {/* Tab switcher: Messaggi / Richieste */}
+              <div className="chat-tabs">
+                <button
+                  className={`chat-tab ${chatTab === 'messages' ? 'active' : ''}`}
+                  onClick={() => setChatTab('messages')}
+                >
+                  Messaggi
+                </button>
+                <button
+                  className={`chat-tab ${chatTab === 'requests' ? 'active' : ''}`}
+                  onClick={() => setChatTab('requests')}
+                >
+                  Richieste
+                </button>
+              </div>
+
+              {/* Pannello Richieste */}
+              {chatTab === 'requests' && selectedPhone && (
+                <div className="messages-area" style={{ padding: 0 }}>
+                  <RequestsPanel phone={selectedPhone} />
+                </div>
+              )}
+
               {/* Messages */}
-              <div className="messages-area">
+              {chatTab === 'messages' && <div className="messages-area">
                 {messages.length === 0 ? (
                   <div className="messages-empty">Nessun messaggio ancora</div>
                 ) : (
@@ -295,7 +320,7 @@ export default function Inbox() {
                   ))
                 )}
                 <div ref={messagesEndRef} />
-              </div>
+              </div>}
 
               {/* Pannello Auto-reply */}
               {showAutoReplyPanel && (

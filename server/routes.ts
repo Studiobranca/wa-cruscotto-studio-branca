@@ -8,7 +8,7 @@ const router = Router();
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.5.2', built: new Date().toISOString() });
+  res.json({ version: '2.6.0', built: new Date().toISOString() });
 });
 
 // ─── Debug ───────────────────────────────────────────────────────────────────
@@ -513,6 +513,122 @@ router.post('/settings', (req: Request, res: Response) => {
     if (!key) return res.status(400).json({ error: 'key is required' });
     db.prepare(`INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)`).run(key, value);
     res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── Riepilogo Richieste ─────────────────────────────────────────────────────
+// Identifica messaggi-richiesta ricevuti e verifica se sono stati evasi
+router.get('/conversations/:phone/requests', (req: Request, res: Response) => {
+  try {
+    const { phone } = req.params;
+
+    // Recupera tutti i messaggi del contatto in ordine cronologico
+    const messages = db.prepare(`
+      SELECT id, content, direction, timestamp, created_at, is_audio, is_image
+      FROM live_messages
+      WHERE phone = ?
+      ORDER BY COALESCE(timestamp, created_at) ASC
+    `).all(phone) as any[];
+
+    // Pattern per rilevare richieste in italiano e non
+    const requestPatterns = [
+      /\?/,                                                              // qualsiasi domanda
+      /\b(puoi|potresti|potete|potreste|riesci|riesce)\b/i,
+      /\b(ho bisogno|avrei bisogno|mi serve|mi servirebbe|mi servono)\b/i,
+      /\b(vorrei|voglio|desidero|avrei|avere|avrei)\b/i,
+      /\b(quando|dove|come|quanto|quante|quanti|quale|quali|chi|perché|perche)\b/i,
+      /\b(appuntamento|prenotare|prenotazione|disponibil|orario|info|informazioni|preventivo|preventivo|offerta|sconto)\b/i,
+      /\b(mandami|mandatemi|inviatemi|spedisci|spedite|inviami|invia)\b/i,
+      /\b(can you|could you|please|i need|do you|is it|are you|when|how much|how many|available)\b/i,
+    ];
+
+    const isRequest = (content: string): boolean => {
+      if (!content || content.startsWith('[') || content.startsWith('🎤')) return false;
+      return requestPatterns.some(p => p.test(content));
+    };
+
+    // Estrai parole chiave rilevanti dal testo (escludi stopwords)
+    const stopwords = new Set(['il','lo','la','i','gli','le','un','una','uno','di','da','in','con','su','per','tra','fra','e','o','ma','se','che','non','ho','ha','hai','mi','ti','si','ci','vi','a','è','ai','al','del','della','dei','degli','delle','nel','nella','nei','negli','nelle','sul','sulla','sui','sugli','sulle','col','coi','qual','quale','quali','come','when','the','and','for','you','are','can','not','with','this','that','have','has']);
+    const extractKeywords = (content: string): string[] => {
+      return content
+        .toLowerCase()
+        .replace(/[^a-zà-ùA-ZÀ-Ù0-9 ]/g, ' ')
+        .split(/\s+/)
+        .filter(w => w.length > 3 && !stopwords.has(w))
+        .slice(0, 6);
+    };
+
+    // Costruisci lista richieste con evasione
+    const requests: any[] = [];
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      if (msg.direction !== 'received') continue;
+      if (!isRequest(msg.content)) continue;
+
+      // Cerca la prima risposta inviata DOPO questo messaggio (entro 72h)
+      const msgTime = new Date(msg.timestamp || msg.created_at).getTime();
+      const deadline = msgTime + 72 * 60 * 60 * 1000;
+      const reply = messages.find((m, j) =>
+        j > i &&
+        m.direction === 'sent' &&
+        new Date(m.timestamp || m.created_at).getTime() <= deadline
+      );
+
+      // Cerca richieste identiche/simili in precedenza (stesso contatto)
+      const keywords = extractKeywords(msg.content);
+      const previousSimilar = requests.filter(r => {
+        const overlap = r.keywords.filter((k: string) => keywords.includes(k)).length;
+        return overlap >= 2;
+      });
+
+      requests.push({
+        id: msg.id,
+        content: msg.content,
+        timestamp: msg.timestamp || msg.created_at,
+        keywords,
+        evaded: !!reply,
+        reply: reply ? {
+          content: reply.content,
+          timestamp: reply.timestamp || reply.created_at,
+          delayMinutes: Math.round((new Date(reply.timestamp || reply.created_at).getTime() - msgTime) / 60000),
+        } : null,
+        repeated: previousSimilar.length > 0,
+        repeatCount: previousSimilar.length,
+        previousOccurrences: previousSimilar.map((r: any) => ({
+          timestamp: r.timestamp,
+          evaded: r.evaded,
+          replyTimestamp: r.reply?.timestamp || null,
+        })),
+      });
+    }
+
+    // Raggruppa per argomento (cluster di keyword)
+    const topics: Record<string, any[]> = {};
+    for (const r of requests) {
+      const topicKey = r.keywords.slice(0, 2).join('-') || 'varie';
+      if (!topics[topicKey]) topics[topicKey] = [];
+      topics[topicKey].push(r);
+    }
+
+    const topicsList = Object.entries(topics).map(([key, items]) => ({
+      topic: key.replace(/-/g, ' '),
+      count: items.length,
+      evadedCount: items.filter(r => r.evaded).length,
+      pendingCount: items.filter(r => !r.evaded).length,
+      requests: items,
+    })).sort((a, b) => b.count - a.count);
+
+    res.json({
+      phone,
+      totalRequests: requests.length,
+      evaded: requests.filter(r => r.evaded).length,
+      pending: requests.filter(r => !r.evaded).length,
+      repeated: requests.filter(r => r.repeated).length,
+      topics: topicsList,
+      requests,
+    });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
