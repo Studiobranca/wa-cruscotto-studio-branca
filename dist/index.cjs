@@ -24167,7 +24167,7 @@ function isPollingRunning() {
 // server/routes.ts
 var router = (0, import_express.Router)();
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.5.0", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.5.1", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/debug/laura", (_req, res) => {
   try {
@@ -24289,8 +24289,11 @@ router.get("/conversations", (req, res) => {
         WHEN 'normal' THEN 3 
         ELSE 4 
       END,
-      CASE WHEN (SELECT COUNT(*) FROM live_messages lm WHERE lm.phone = conversations.phone) > 0 THEN 0 ELSE 1 END,
-      COALESCE(last_message_at, created_at) DESC
+      COALESCE(
+        (SELECT created_at FROM live_messages WHERE phone = conversations.phone ORDER BY created_at DESC LIMIT 1),
+        last_message_at,
+        created_at
+      ) DESC
     `;
     const rows = db_default.prepare(query).all(...params);
     res.json(rows);
