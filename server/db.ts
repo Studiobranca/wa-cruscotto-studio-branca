@@ -66,6 +66,11 @@ try { db.exec(`ALTER TABLE live_messages ADD COLUMN is_image INTEGER DEFAULT 0`)
 try { db.exec(`ALTER TABLE live_messages ADD COLUMN image_url TEXT`); } catch {}
 try { db.exec(`ALTER TABLE live_messages ADD COLUMN caption TEXT`); } catch {}
 
+// Migration: correggi messaggi con audioUrl ma isAudio=0 (dati pre-fix)
+try { db.exec(`UPDATE live_messages SET is_audio = 1 WHERE audio_url IS NOT NULL AND audio_url != '' AND is_audio = 0`); } catch {}
+// Migration: correggi messaggi con imageUrl ma isImage=0
+try { db.exec(`UPDATE live_messages SET is_image = 1 WHERE image_url IS NOT NULL AND image_url != '' AND is_image = 0`); } catch {}
+
 console.log('[DB] Tables created/verified');
 
 export default db;

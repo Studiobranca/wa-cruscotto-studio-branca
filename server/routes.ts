@@ -8,7 +8,7 @@ const router = Router();
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.2.0', built: new Date().toISOString() });
+  res.json({ version: '2.3.0', built: new Date().toISOString() });
 });
 
 // ─── Debug ───────────────────────────────────────────────────────────────────
@@ -284,12 +284,15 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
     const messageId = body.messageId || body.id || `wh_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const isGroup = body.isGroup === true || (phone && phone.includes('@g.us'));
     const fromMe = body.fromMe === true;
-    const msgType = body.type || 'text';
-    const isAudio = msgType === 'audio' || msgType === 'ptt';
-    const audioUrl = body.audio?.audioUrl || body.audio?.url || null;
-    const isImage = msgType === 'image';
-    const imageUrl = body.image?.imageUrl || body.image?.url || body.imageUrl || null;
+    const msgType = (body.type || '').toLowerCase();
+    // Riconoscimento audio: tipo OPPURE presenza del campo body.audio
+    const audioUrl = body.audio?.audioUrl || body.audio?.url || body.audio?.mediaUrl || null;
+    const isAudio = msgType === 'audio' || msgType === 'ptt' || msgType === 'audiomessage' || !!audioUrl;
+    // Riconoscimento immagine: tipo OPPURE presenza del campo body.image
+    const imageUrl = body.image?.imageUrl || body.image?.url || body.image?.mediaUrl || body.imageUrl || null;
+    const isImage = msgType === 'image' || msgType === 'imagemessage' || !!imageUrl;
     const caption = body.image?.caption || body.caption || '';
+    console.log(`[Webhook] type=${msgType} isAudio=${isAudio} isImage=${isImage} audioUrl=${audioUrl?.substring(0,60)} imageUrl=${imageUrl?.substring(0,60)} body.keys=${Object.keys(body).join(',')}`);
 
     // Ignore groups
     if (isGroup || (phone && phone.includes('-')) || (phone && phone.includes('@newsletter'))) {

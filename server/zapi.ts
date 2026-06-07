@@ -47,13 +47,15 @@ export async function syncContacts(): Promise<number> {
   let totalSynced = 0;
 
   const insertConv = db.prepare(`
-    INSERT OR REPLACE INTO conversations 
+    INSERT INTO conversations 
       (phone, contact_name, last_message, last_message_at, unread_count, created_at)
     VALUES 
-      (@phone, @contact_name, @last_message, @last_message_at, @unread_count, COALESCE(
-        (SELECT created_at FROM conversations WHERE phone = @phone),
-        datetime('now')
-      ))
+      (@phone, @contact_name, @last_message, @last_message_at, @unread_count, datetime('now'))
+    ON CONFLICT(phone) DO UPDATE SET
+      contact_name = excluded.contact_name,
+      last_message = excluded.last_message,
+      last_message_at = excluded.last_message_at,
+      unread_count = excluded.unread_count
   `);
 
   while (true) {

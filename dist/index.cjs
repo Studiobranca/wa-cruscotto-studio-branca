@@ -23950,6 +23950,14 @@ var init_db = __esm({
       db.exec(`ALTER TABLE live_messages ADD COLUMN caption TEXT`);
     } catch {
     }
+    try {
+      db.exec(`UPDATE live_messages SET is_audio = 1 WHERE audio_url IS NOT NULL AND audio_url != '' AND is_audio = 0`);
+    } catch {
+    }
+    try {
+      db.exec(`UPDATE live_messages SET is_image = 1 WHERE image_url IS NOT NULL AND image_url != '' AND is_image = 0`);
+    } catch {
+    }
     console.log("[DB] Tables created/verified");
     db_default = db;
   }
@@ -24012,13 +24020,15 @@ async function syncContacts() {
   const pageSize = 100;
   let totalSynced = 0;
   const insertConv = db2.prepare(`
-    INSERT OR REPLACE INTO conversations 
+    INSERT INTO conversations 
       (phone, contact_name, last_message, last_message_at, unread_count, created_at)
     VALUES 
-      (@phone, @contact_name, @last_message, @last_message_at, @unread_count, COALESCE(
-        (SELECT created_at FROM conversations WHERE phone = @phone),
-        datetime('now')
-      ))
+      (@phone, @contact_name, @last_message, @last_message_at, @unread_count, datetime('now'))
+    ON CONFLICT(phone) DO UPDATE SET
+      contact_name = excluded.contact_name,
+      last_message = excluded.last_message,
+      last_message_at = excluded.last_message_at,
+      unread_count = excluded.unread_count
   `);
   while (true) {
     try {
@@ -24149,7 +24159,7 @@ function isPollingRunning() {
 // server/routes.ts
 var router = (0, import_express.Router)();
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.2.0", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.3.0", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/debug/laura", (_req, res) => {
   try {
@@ -24382,12 +24392,13 @@ router.post("/webhook/message", async (req, res) => {
     const messageId = body.messageId || body.id || `wh_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const isGroup = body.isGroup === true || phone && phone.includes("@g.us");
     const fromMe = body.fromMe === true;
-    const msgType = body.type || "text";
-    const isAudio = msgType === "audio" || msgType === "ptt";
-    const audioUrl = body.audio?.audioUrl || body.audio?.url || null;
-    const isImage = msgType === "image";
-    const imageUrl = body.image?.imageUrl || body.image?.url || body.imageUrl || null;
+    const msgType = (body.type || "").toLowerCase();
+    const audioUrl = body.audio?.audioUrl || body.audio?.url || body.audio?.mediaUrl || null;
+    const isAudio = msgType === "audio" || msgType === "ptt" || msgType === "audiomessage" || !!audioUrl;
+    const imageUrl = body.image?.imageUrl || body.image?.url || body.image?.mediaUrl || body.imageUrl || null;
+    const isImage = msgType === "image" || msgType === "imagemessage" || !!imageUrl;
     const caption = body.image?.caption || body.caption || "";
+    console.log(`[Webhook] type=${msgType} isAudio=${isAudio} isImage=${isImage} audioUrl=${audioUrl?.substring(0, 60)} imageUrl=${imageUrl?.substring(0, 60)} body.keys=${Object.keys(body).join(",")}`);
     if (isGroup || phone && phone.includes("-") || phone && phone.includes("@newsletter")) {
       return res.json({ ignored: true, reason: "group" });
     }
