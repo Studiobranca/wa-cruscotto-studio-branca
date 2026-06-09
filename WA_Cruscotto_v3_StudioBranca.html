@@ -1263,11 +1263,15 @@ async function loadMessages(convId,name,phone){
   const msgArea=document.getElementById('msgArea');
   if(!msgArea)return;
   try{
-    const msgs=await fetchJSON(RAILWAY_BASE+'/api/conversations/'+convId+'/messages');
+    // L'API è indicizzata per TELEFONO, non per id conversazione
+    const msgs=await fetchJSON(RAILWAY_BASE+'/api/conversations/'+encodeURIComponent(phone)+'/messages');
     renderMessages(msgs,name,phone);
+    // Il server marca i messaggi come letti: azzera il contatore locale
+    const conv=_convList.find(c=>String(c.id)===String(convId));
+    if(conv&&conv.unreadCount){conv.unreadCount=0;renderConvList();}
   }catch(e){
-    // Fallback: il DB non archivia i messaggi storici — mostra last message dalla lista
-    const conv=_convList.find(c=>c.id===convId);
+    // Fallback: mostra last message dalla lista
+    const conv=_convList.find(c=>String(c.id)===String(convId));
     renderMessages([],name,phone,conv);
   }
 }
@@ -1278,9 +1282,22 @@ function renderMessages(msgs,name,phone,conv){
   if(msgs&&msgs.length>0){
     msgArea.innerHTML=msgs.map(m=>{
       const isSent=m.direction==='sent'||m.fromMe;
+      // Il server restituisce il testo nel campo "content"
+      let inner='';
+      if(m.isImage&&m.imageUrl){
+        inner+='<img src="'+escHtml(m.imageUrl)+'" alt="immagine" style="max-width:100%;border-radius:8px;display:block;margin-bottom:4px" loading="lazy"/>';
+        if(m.caption)inner+=escHtml(m.caption);
+      }else if(m.isAudio&&m.audioUrl){
+        inner+='<audio controls src="'+escHtml(m.audioUrl)+'" style="max-width:230px;display:block;margin-bottom:4px"></audio>';
+        if(m.content)inner+='<div style="font-size:11px;opacity:.8">&#127908; '+escHtml(m.content)+'</div>';
+      }else{
+        inner+=escHtml(m.content||m.body||m.message||m.text||'');
+      }
+      // Traduzione automatica: mostra l'originale se presente
+      if(m.originalContent&&m.originalContent!==m.content)inner+='<div style="font-size:10px;opacity:.6;margin-top:3px;font-style:italic">orig: '+escHtml(m.originalContent)+'</div>';
       return `<div style="display:flex;justify-content:${isSent?'flex-end':'flex-start'}">
         <div class="wa-msg-bubble ${isSent?'sent':'recv'}">
-          ${escHtml(m.body||m.message||m.text||'')}
+          ${inner}
           <div class="msg-time">${fmtTime(m.createdAt||m.timestamp)}</div>
         </div>
       </div>`;
@@ -1311,7 +1328,7 @@ function renderMessages(msgs,name,phone,conv){
 }
 
 async function refreshThread(convId,name,phone){
-  const msgs=await fetchJSON(RAILWAY_BASE+'/api/conversations/'+convId+'/messages').catch(()=>[]);
+  const msgs=await fetchJSON(RAILWAY_BASE+'/api/conversations/'+encodeURIComponent(phone)+'/messages').catch(()=>[]);
   const conv=_convList.find(c=>String(c.id)===String(convId));
   renderMessages(msgs,name,phone,conv);
 }
@@ -1337,7 +1354,8 @@ async function sendMessage(convId,phone){
     msgArea.scrollTop=msgArea.scrollHeight;
   }
   try{
-    const res=await fetch(RAILWAY_BASE+'/api/conversations/'+convId+'/send',{
+    // L'API di invio è indicizzata per TELEFONO: usare l'id manda al destinatario sbagliato
+    const res=await fetch(RAILWAY_BASE+'/api/conversations/'+encodeURIComponent(phone)+'/send',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({message:msg})
@@ -1927,10 +1945,17 @@ function saveLocalEvent(){
   if(!title){showToast('\u26A0 Inserisci il titolo');return;}
   var allDay=document.getElementById('evtAllDay').checked;
   var evt={id:_editingEvtId||('loc_'+Date.now()),title:title,date:document.getElementById('evtDate').value,start:allDay?null:document.getElementById('evtStart').value,end:allDay?null:document.getElementById('evtEnd').value,allDay:allDay,color:_evtSelectedColor,location:document.getElementById('evtLocation').value.trim(),notes:document.getElementById('evtNotes').value.trim(),source:'local'};
-  if(_editingEvtId){var idx=_localEvents.findIndex(function(e){return e.id===_editingEvtId;});if(idx>=0)_localEvents[idx]=evt;else _localEvents.push(evt);}else _localEvents.push(evt);
+  if(_editingEvtId){var idx=_localEvents.findIndex(function(e){return e.id===_editingEvtId;});if(idx>=0){evt._gcalId=_localEvents[idx]._gcalId;_localEvents[idx]=evt;}else _localEvents.push(evt);}else _localEvents.push(evt);
   saveLocalEvents();document.getElementById('modalEvento').classList.remove('open');renderAgenda();
-  // Invia evento a Google Calendar tramite cron server-side
-  sendEventToGCalViaCron(evt);
+  // Sync Google Calendar: scrittura diretta se OAuth connesso, altrimenti coda per il cron
+  if(isGCalConnected()){
+    saveEventToGCal(evt).then(function(gid){
+      if(gid){evt._gcalId=gid;saveLocalEvents();showToast('\u{1F4C5} Evento salvato su Google Calendar');}
+      else sendEventToGCalViaCron(evt);
+    });
+  }else{
+    sendEventToGCalViaCron(evt);
+  }
 }
 
 function deleteLocalEvent(){
