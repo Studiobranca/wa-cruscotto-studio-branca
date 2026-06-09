@@ -992,7 +992,9 @@ function showTab(name,btn){
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(b=>b.classList.remove('active'));
   document.getElementById('tab-'+name).classList.add('active');
-  btn.classList.add('active');
+  // btn può mancare (es. click su notifica browser): risali al bottone nav
+  if(!btn)btn=document.querySelector('#sidebar .nav-item[onclick*="\''+name+'\'"]');
+  if(btn)btn.classList.add('active');
   if(name==='messaggi')refreshWAInbox();
   if(name==='agenda'){
     // Carica gli eventi GCal precaricati e ridisegna subito,
@@ -1070,9 +1072,9 @@ function showBrowserNotif(name, text, time){
 }
 
 function updateWANavBadge(){
-  // Conta messaggi non letti nell'archivio di oggi
+  // Conta messaggi non letti nell'archivio di oggi (data locale, come le chiavi archivio)
   var arch = loadWAArchive();
-  var today = new Date().toISOString().substring(0,10);
+  var today = dateStr(new Date());
   var msgs = arch[today] || [];
   var unread = msgs.filter(function(m){return m.unread;}).length;
   var btn = document.querySelector('button.nav-item[onclick*="messaggi"]');
@@ -2097,7 +2099,7 @@ function processWADiff(convList){
     // Mostra notifiche browser native per ogni nuovo messaggio
     var newOnes = [];
     var archNow = loadWAArchive();
-    var todayKey2 = new Date().toISOString().substring(0,10);
+    var todayKey2 = dateStr(new Date());
     if(archNow[todayKey2]){
       // Prendi gli ultimi newMsgs messaggi aggiunti
       newOnes = archNow[todayKey2].slice(-newMsgs);
@@ -2159,9 +2161,8 @@ function hnInit(){
     var raw=localStorage.getItem(HN_KEY);
     _hnNotes=raw?JSON.parse(raw):[];
   }catch(e){_hnNotes=[];}
-  // Imposta data odierna come default
-  var d=new Date();
-  var ds=d.toISOString().slice(0,10);
+  // Imposta data odierna come default (data locale)
+  var ds=dateStr(new Date());
   var dateEl=document.getElementById('hn-date');
   if(dateEl)dateEl.value=ds;
 }
@@ -2172,7 +2173,7 @@ function hnSave(){
 
 function hnSaveNote(){
   var title=(document.getElementById('hn-title')||{}).value||'';
-  var date=(document.getElementById('hn-date')||{}).value||new Date().toISOString().slice(0,10);
+  var date=(document.getElementById('hn-date')||{}).value||dateStr(new Date());
   var body=(document.getElementById('hn-body')||{}).value||'';
   var tag=(document.getElementById('hn-tag')||{}).value||'';
   if(!body.trim()){showToast('&#9888; Inserisci almeno il testo della trascrizione');return;}
@@ -2254,7 +2255,7 @@ function hnExportAll(){
   var blob=new Blob([data],{type:'application/json'});
   var a=document.createElement('a');
   a.href=URL.createObjectURL(blob);
-  a.download='HiNoter_StudioBranca_'+new Date().toISOString().slice(0,10)+'.json';
+  a.download='HiNoter_StudioBranca_'+dateStr(new Date())+'.json';
   a.click();
   showToast('&#8659; Esportazione JSON avviata ('+_hnNotes.length+' note)');
 }
