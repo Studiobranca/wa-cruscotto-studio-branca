@@ -23978,6 +23978,39 @@ var init_db = __esm({
       db.exec(`ALTER TABLE live_messages ADD COLUMN sender_name TEXT`);
     } catch {
     }
+    db.exec(`
+  CREATE TABLE IF NOT EXISTS auto_reply_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    keyword TEXT NOT NULL,
+    reply_text TEXT NOT NULL,
+    is_global INTEGER DEFAULT 1,
+    specific_phone TEXT,
+    enabled INTEGER DEFAULT 1,
+    trigger_count INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS quick_replies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    label TEXT NOT NULL,
+    text TEXT NOT NULL,
+    shortcut TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+`);
+    try {
+      const qrCount = db.prepare(`SELECT COUNT(*) as c FROM quick_replies`).get();
+      if (qrCount.c === 0) {
+        const ins = db.prepare(`INSERT INTO quick_replies (label, text, shortcut) VALUES (?, ?, ?)`);
+        ins.run("Orari", "Ciao! Il nostro orario di apertura \xE8: Lun-Ven 9:00-18:00, Sab 9:00-13:00.", "/orari");
+        ins.run("Info contatto", "Per maggiori informazioni puoi contattarci a: info@studiobranca.it o chiamarci.", "/info");
+        ins.run("Appuntamento", "Posso fissare un appuntamento per te! Dimmi quale giorno preferisci e ti confermer\xF2 la disponibilit\xE0.", "/app");
+        console.log("[DB] Seed risposte rapide originali inserito");
+      }
+    } catch (e) {
+      console.error("[DB] Seed quick_replies:", e);
+    }
     console.log("[DB] Tables created/verified");
     db_default = db;
   }
@@ -24787,6 +24820,75 @@ router.get("/messages/log", (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+router.get("/rules", (_req, res) => {
+  try {
+    res.json(db_default.prepare(`
+      SELECT id, name, keyword, reply_text as replyText, is_global as isGlobal,
+             specific_phone as specificPhone, enabled, trigger_count as triggerCount
+      FROM auto_reply_rules ORDER BY id
+    `).all());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.post("/rules", (req, res) => {
+  try {
+    const { name, keyword, replyText, isGlobal = true, specificPhone = null, enabled = true } = req.body;
+    if (!name || !keyword || !replyText) return res.status(400).json({ error: "name, keyword e replyText obbligatori" });
+    const r = db_default.prepare(`
+      INSERT INTO auto_reply_rules (name, keyword, reply_text, is_global, specific_phone, enabled)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(name, keyword, replyText, isGlobal ? 1 : 0, specificPhone || null, enabled ? 1 : 0);
+    res.json({ success: true, id: r.lastInsertRowid });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.put("/rules/:id", (req, res) => {
+  try {
+    const { name, keyword, replyText, isGlobal, specificPhone, enabled } = req.body;
+    db_default.prepare(`
+      UPDATE auto_reply_rules SET name = ?, keyword = ?, reply_text = ?, is_global = ?, specific_phone = ?, enabled = ?
+      WHERE id = ?
+    `).run(name, keyword, replyText, isGlobal ? 1 : 0, specificPhone || null, enabled ? 1 : 0, req.params.id);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.delete("/rules/:id", (req, res) => {
+  try {
+    db_default.prepare(`DELETE FROM auto_reply_rules WHERE id = ?`).run(req.params.id);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.get("/quick-replies", (_req, res) => {
+  try {
+    res.json(db_default.prepare(`SELECT id, label, text, shortcut FROM quick_replies ORDER BY id`).all());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.post("/quick-replies", (req, res) => {
+  try {
+    const { label, text, shortcut = null } = req.body;
+    if (!label || !text) return res.status(400).json({ error: "label e text obbligatori" });
+    const r = db_default.prepare(`INSERT INTO quick_replies (label, text, shortcut) VALUES (?, ?, ?)`).run(label, text, shortcut || null);
+    res.json({ success: true, id: r.lastInsertRowid });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.delete("/quick-replies/:id", (req, res) => {
+  try {
+    db_default.prepare(`DELETE FROM quick_replies WHERE id = ?`).run(req.params.id);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 router.post("/conversations/:phone/send", async (req, res) => {
   try {
     const { phone } = req.params;
@@ -24981,18 +25083,39 @@ _(Originale: ${textToTranslate})_`;
     );
     if (!fromMe) {
       const conv = db_default.prepare(`SELECT auto_reply_enabled, auto_reply_message FROM conversations WHERE phone = ?`).get(phone);
-      if (conv?.auto_reply_enabled && conv?.auto_reply_message) {
+      if (conv?.auto_reply_enabled) {
+        let replyText = null;
+        let ruleName = null;
         try {
-          await sendTextMessage(phone, conv.auto_reply_message);
-          const arId = `ar_${Date.now()}`;
-          const arNow = (/* @__PURE__ */ new Date()).toISOString();
-          db_default.prepare(`
-            INSERT OR IGNORE INTO live_messages 
-              (message_id, phone, contact_name, content, direction, timestamp, is_read, created_at)
-            VALUES (?, ?, ?, ?, 'sent', ?, 1, ?)
-          `).run(arId, phone, senderName || phone, conv.auto_reply_message, arNow, arNow);
+          const rules = db_default.prepare(`SELECT * FROM auto_reply_rules WHERE enabled = 1`).all();
+          const lower = (content || "").toLowerCase();
+          for (const rule of rules) {
+            if (!rule.is_global && rule.specific_phone !== phone) continue;
+            if (rule.keyword && lower.includes(rule.keyword.toLowerCase())) {
+              replyText = rule.reply_text;
+              ruleName = rule.name;
+              db_default.prepare(`UPDATE auto_reply_rules SET trigger_count = trigger_count + 1 WHERE id = ?`).run(rule.id);
+              break;
+            }
+          }
         } catch (e) {
-          console.error("[Auto-reply] Error:", e);
+          console.error("[Auto-reply] Errore regole:", e);
+        }
+        if (!replyText && conv.auto_reply_message) replyText = conv.auto_reply_message;
+        if (replyText) {
+          try {
+            await sendTextMessage(phone, replyText);
+            const arId = `ar_${Date.now()}`;
+            const arNow = (/* @__PURE__ */ new Date()).toISOString();
+            db_default.prepare(`
+              INSERT OR IGNORE INTO live_messages
+                (message_id, phone, contact_name, content, direction, timestamp, is_read, created_at)
+              VALUES (?, ?, ?, ?, 'sent', ?, 1, ?)
+            `).run(arId, phone, senderName || phone, replyText, arNow, arNow);
+            if (ruleName) console.log(`[Auto-reply] Regola "${ruleName}" \u2192 ${phone}`);
+          } catch (e) {
+            console.error("[Auto-reply] Error:", e);
+          }
         }
       }
     }

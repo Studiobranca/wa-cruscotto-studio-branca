@@ -78,6 +78,41 @@ try { db.exec(`ALTER TABLE conversations ADD COLUMN is_group INTEGER DEFAULT 0`)
 try { db.exec(`ALTER TABLE live_messages ADD COLUMN is_group INTEGER DEFAULT 0`); } catch {}
 try { db.exec(`ALTER TABLE live_messages ADD COLUMN sender_name TEXT`); } catch {}
 
+// ─── Automazioni (ripristino dal progetto iniziale wa-cruscotto) ─────────────
+db.exec(`
+  CREATE TABLE IF NOT EXISTS auto_reply_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    keyword TEXT NOT NULL,
+    reply_text TEXT NOT NULL,
+    is_global INTEGER DEFAULT 1,
+    specific_phone TEXT,
+    enabled INTEGER DEFAULT 1,
+    trigger_count INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS quick_replies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    label TEXT NOT NULL,
+    text TEXT NOT NULL,
+    shortcut TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+`);
+
+// Seed risposte rapide originali (solo se la tabella è vuota)
+try {
+  const qrCount = db.prepare(`SELECT COUNT(*) as c FROM quick_replies`).get() as { c: number };
+  if (qrCount.c === 0) {
+    const ins = db.prepare(`INSERT INTO quick_replies (label, text, shortcut) VALUES (?, ?, ?)`);
+    ins.run('Orari', 'Ciao! Il nostro orario di apertura è: Lun-Ven 9:00-18:00, Sab 9:00-13:00.', '/orari');
+    ins.run('Info contatto', 'Per maggiori informazioni puoi contattarci a: info@studiobranca.it o chiamarci.', '/info');
+    ins.run('Appuntamento', 'Posso fissare un appuntamento per te! Dimmi quale giorno preferisci e ti confermerò la disponibilità.', '/app');
+    console.log('[DB] Seed risposte rapide originali inserito');
+  }
+} catch (e) { console.error('[DB] Seed quick_replies:', e); }
+
 console.log('[DB] Tables created/verified');
 
 export default db;

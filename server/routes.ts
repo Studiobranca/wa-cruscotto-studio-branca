@@ -306,6 +306,70 @@ router.get('/messages/log', (req: Request, res: Response) => {
   }
 });
 
+// ─── Automazioni: regole keyword ─────────────────────────────────────────────
+router.get('/rules', (_req: Request, res: Response) => {
+  try {
+    res.json(db.prepare(`
+      SELECT id, name, keyword, reply_text as replyText, is_global as isGlobal,
+             specific_phone as specificPhone, enabled, trigger_count as triggerCount
+      FROM auto_reply_rules ORDER BY id
+    `).all());
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+router.post('/rules', (req: Request, res: Response) => {
+  try {
+    const { name, keyword, replyText, isGlobal = true, specificPhone = null, enabled = true } = req.body;
+    if (!name || !keyword || !replyText) return res.status(400).json({ error: 'name, keyword e replyText obbligatori' });
+    const r = db.prepare(`
+      INSERT INTO auto_reply_rules (name, keyword, reply_text, is_global, specific_phone, enabled)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(name, keyword, replyText, isGlobal ? 1 : 0, specificPhone || null, enabled ? 1 : 0);
+    res.json({ success: true, id: r.lastInsertRowid });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+router.put('/rules/:id', (req: Request, res: Response) => {
+  try {
+    const { name, keyword, replyText, isGlobal, specificPhone, enabled } = req.body;
+    db.prepare(`
+      UPDATE auto_reply_rules SET name = ?, keyword = ?, reply_text = ?, is_global = ?, specific_phone = ?, enabled = ?
+      WHERE id = ?
+    `).run(name, keyword, replyText, isGlobal ? 1 : 0, specificPhone || null, enabled ? 1 : 0, req.params.id);
+    res.json({ success: true });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+router.delete('/rules/:id', (req: Request, res: Response) => {
+  try {
+    db.prepare(`DELETE FROM auto_reply_rules WHERE id = ?`).run(req.params.id);
+    res.json({ success: true });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── Automazioni: risposte rapide (template) ─────────────────────────────────
+router.get('/quick-replies', (_req: Request, res: Response) => {
+  try {
+    res.json(db.prepare(`SELECT id, label, text, shortcut FROM quick_replies ORDER BY id`).all());
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+router.post('/quick-replies', (req: Request, res: Response) => {
+  try {
+    const { label, text, shortcut = null } = req.body;
+    if (!label || !text) return res.status(400).json({ error: 'label e text obbligatori' });
+    const r = db.prepare(`INSERT INTO quick_replies (label, text, shortcut) VALUES (?, ?, ?)`).run(label, text, shortcut || null);
+    res.json({ success: true, id: r.lastInsertRowid });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+router.delete('/quick-replies/:id', (req: Request, res: Response) => {
+  try {
+    db.prepare(`DELETE FROM quick_replies WHERE id = ?`).run(req.params.id);
+    res.json({ success: true });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
 router.post('/conversations/:phone/send', async (req: Request, res: Response) => {
   try {
     const { phone } = req.params;
@@ -535,21 +599,42 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
       direction, direction, direction
     );
 
-    // Auto-reply
+    // Auto-reply: prima le regole keyword (progetto iniziale), poi il messaggio
+    // fisso per conversazione come fallback. Entrambe scattano SOLO se il
+    // contatto ha l'auto-risposta attiva (auto_reply_enabled).
     if (!fromMe) {
       const conv = db.prepare(`SELECT auto_reply_enabled, auto_reply_message FROM conversations WHERE phone = ?`).get(phone) as any;
-      if (conv?.auto_reply_enabled && conv?.auto_reply_message) {
+      if (conv?.auto_reply_enabled) {
+        let replyText: string | null = null;
+        let ruleName: string | null = null;
         try {
-          await sendTextMessage(phone, conv.auto_reply_message);
-          const arId = `ar_${Date.now()}`;
-          const arNow = new Date().toISOString();
-          db.prepare(`
-            INSERT OR IGNORE INTO live_messages 
-              (message_id, phone, contact_name, content, direction, timestamp, is_read, created_at)
-            VALUES (?, ?, ?, ?, 'sent', ?, 1, ?)
-          `).run(arId, phone, senderName || phone, conv.auto_reply_message, arNow, arNow);
-        } catch (e) {
-          console.error('[Auto-reply] Error:', e);
+          const rules = db.prepare(`SELECT * FROM auto_reply_rules WHERE enabled = 1`).all() as any[];
+          const lower = (content || '').toLowerCase();
+          for (const rule of rules) {
+            if (!rule.is_global && rule.specific_phone !== phone) continue;
+            if (rule.keyword && lower.includes(rule.keyword.toLowerCase())) {
+              replyText = rule.reply_text;
+              ruleName = rule.name;
+              db.prepare(`UPDATE auto_reply_rules SET trigger_count = trigger_count + 1 WHERE id = ?`).run(rule.id);
+              break;
+            }
+          }
+        } catch (e) { console.error('[Auto-reply] Errore regole:', e); }
+        if (!replyText && conv.auto_reply_message) replyText = conv.auto_reply_message;
+        if (replyText) {
+          try {
+            await sendTextMessage(phone, replyText);
+            const arId = `ar_${Date.now()}`;
+            const arNow = new Date().toISOString();
+            db.prepare(`
+              INSERT OR IGNORE INTO live_messages
+                (message_id, phone, contact_name, content, direction, timestamp, is_read, created_at)
+              VALUES (?, ?, ?, ?, 'sent', ?, 1, ?)
+            `).run(arId, phone, senderName || phone, replyText, arNow, arNow);
+            if (ruleName) console.log(`[Auto-reply] Regola "${ruleName}" → ${phone}`);
+          } catch (e) {
+            console.error('[Auto-reply] Error:', e);
+          }
         }
       }
     }
