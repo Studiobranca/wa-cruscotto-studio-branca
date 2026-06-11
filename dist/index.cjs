@@ -24856,7 +24856,7 @@ router.post("/webhook/message", async (req, res) => {
         const audioResp = await fetch(audioUrl);
         const audioBuffer = await audioResp.arrayBuffer();
         const dgResp = await fetch(
-          "https://api.deepgram.com/v1/listen?model=nova-2&detect_language=true&punctuate=true&smart_format=true",
+          "https://api.deepgram.com/v1/listen?model=nova-2&language=it&punctuate=true&smart_format=true",
           {
             method: "POST",
             headers: {

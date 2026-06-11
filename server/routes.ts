@@ -399,9 +399,10 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
         // Scarica audio
         const audioResp = await fetch(audioUrl);
         const audioBuffer = await audioResp.arrayBuffer();
-        // Invia a Deepgram nova-2 con rilevamento lingua automatico
+        // Invia a Deepgram nova-2 forzando l'italiano: detect_language sbagliava
+        // sui vocali brevi/rumorosi e produceva trascrizioni in inglese
         const dgResp = await fetch(
-          'https://api.deepgram.com/v1/listen?model=nova-2&detect_language=true&punctuate=true&smart_format=true',
+          'https://api.deepgram.com/v1/listen?model=nova-2&language=it&punctuate=true&smart_format=true',
           {
             method: 'POST',
             headers: {
