@@ -263,6 +263,31 @@ router.get('/conversations/:phone/messages', (req: Request, res: Response) => {
   }
 });
 
+// Log globale messaggi (ricevuti + inviati) per l'agenda del cruscotto.
+// GET /api/messages/log?from=YYYY-MM-DD&to=YYYY-MM-DD (date locali Europe/Rome non gestite
+// qui: il client converte i timestamp UTC; il filtro server usa un margine di 1 giorno).
+router.get('/messages/log', (req: Request, res: Response) => {
+  try {
+    const from = String(req.query.from || '').slice(0, 10);
+    const to = String(req.query.to || '').slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+      return res.status(400).json({ error: 'from/to richiesti in formato YYYY-MM-DD' });
+    }
+    const rows = db.prepare(`
+      SELECT phone, contact_name as contactName, content, direction,
+             COALESCE(timestamp, created_at) as timestamp,
+             is_audio as isAudio
+      FROM live_messages
+      WHERE date(COALESCE(timestamp, created_at)) BETWEEN date(?, '-1 day') AND date(?, '+1 day')
+      ORDER BY COALESCE(timestamp, created_at)
+      LIMIT 5000
+    `).all(from, to);
+    res.json(rows);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.post('/conversations/:phone/send', async (req: Request, res: Response) => {
   try {
     const { phone } = req.params;

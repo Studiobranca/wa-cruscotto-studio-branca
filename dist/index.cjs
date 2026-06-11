@@ -24752,6 +24752,27 @@ router.get("/conversations/:phone/messages", (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+router.get("/messages/log", (req, res) => {
+  try {
+    const from = String(req.query.from || "").slice(0, 10);
+    const to = String(req.query.to || "").slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+      return res.status(400).json({ error: "from/to richiesti in formato YYYY-MM-DD" });
+    }
+    const rows = db_default.prepare(`
+      SELECT phone, contact_name as contactName, content, direction,
+             COALESCE(timestamp, created_at) as timestamp,
+             is_audio as isAudio
+      FROM live_messages
+      WHERE date(COALESCE(timestamp, created_at)) BETWEEN date(?, '-1 day') AND date(?, '+1 day')
+      ORDER BY COALESCE(timestamp, created_at)
+      LIMIT 5000
+    `).all(from, to);
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 router.post("/conversations/:phone/send", async (req, res) => {
   try {
     const { phone } = req.params;
