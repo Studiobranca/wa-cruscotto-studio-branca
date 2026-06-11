@@ -19,6 +19,24 @@ import {
 
 const router = Router();
 
+// ─── Riparazione one-shot timestamp corrotti ─────────────────────────────────
+// Il vecchio webhook moltiplicava per 1000 un momment già in ms → anni a 6 cifre
+// (es. "+058413-06-24..."). Ricalcola il valore originale dividendo per 1000.
+try {
+  const bad = db.prepare(`SELECT id, timestamp FROM live_messages WHERE timestamp LIKE '+%'`).all() as any[];
+  let fixed = 0;
+  for (const r of bad) {
+    const ms = Date.parse(r.timestamp);
+    if (!isNaN(ms) && ms > 1e15) {
+      db.prepare(`UPDATE live_messages SET timestamp = ? WHERE id = ?`).run(new Date(ms / 1000).toISOString(), r.id);
+      fixed++;
+    }
+  }
+  if (fixed) console.log(`[Repair] Corretti ${fixed} timestamp corrotti in live_messages`);
+} catch (e) {
+  console.error('[Repair] Errore riparazione timestamp:', e);
+}
+
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
   res.json({ version: '2.9.1', built: new Date().toISOString() });
@@ -385,7 +403,10 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
     const phone = body.phone || body.sender || '';
     const senderName = body.senderName || body.pushName || '';
     const text = body.text?.message || body.body || body.text || '';
-    const momment = body.momment || body.timestamp || Date.now() / 1000;
+    // Z-API manda `momment` in MILLISECONDI; vecchi payload/fallback in secondi.
+    // Normalizza a ms: valori > 1e12 sono già ms, altrimenti secondi.
+    const mommentRaw = body.momment || body.timestamp || Date.now();
+    const momment = mommentRaw > 1e12 ? mommentRaw : mommentRaw * 1000;
     const messageId = body.messageId || body.id || `wh_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const isGroup = body.isGroup === true || (phone && phone.includes('@g.us'));
     const fromMe = body.fromMe === true;
@@ -483,7 +504,7 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
       }
     }
 
-    const timestamp = new Date(momment * 1000).toISOString();
+    const timestamp = new Date(momment).toISOString();
     const now = new Date().toISOString();
 
     // Save message

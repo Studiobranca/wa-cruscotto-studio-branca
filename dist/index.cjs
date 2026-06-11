@@ -24538,6 +24538,20 @@ function getQueueStats() {
 
 // server/routes.ts
 var router = (0, import_express.Router)();
+try {
+  const bad = db_default.prepare(`SELECT id, timestamp FROM live_messages WHERE timestamp LIKE '+%'`).all();
+  let fixed = 0;
+  for (const r of bad) {
+    const ms = Date.parse(r.timestamp);
+    if (!isNaN(ms) && ms > 1e15) {
+      db_default.prepare(`UPDATE live_messages SET timestamp = ? WHERE id = ?`).run(new Date(ms / 1e3).toISOString(), r.id);
+      fixed++;
+    }
+  }
+  if (fixed) console.log(`[Repair] Corretti ${fixed} timestamp corrotti in live_messages`);
+} catch (e) {
+  console.error("[Repair] Errore riparazione timestamp:", e);
+}
 router.get("/version", (_req, res) => {
   res.json({ version: "2.9.1", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
@@ -24848,7 +24862,8 @@ router.post("/webhook/message", async (req, res) => {
     const phone = body.phone || body.sender || "";
     const senderName = body.senderName || body.pushName || "";
     const text = body.text?.message || body.body || body.text || "";
-    const momment = body.momment || body.timestamp || Date.now() / 1e3;
+    const mommentRaw = body.momment || body.timestamp || Date.now();
+    const momment = mommentRaw > 1e12 ? mommentRaw : mommentRaw * 1e3;
     const messageId = body.messageId || body.id || `wh_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const isGroup = body.isGroup === true || phone && phone.includes("@g.us");
     const fromMe = body.fromMe === true;
@@ -24930,7 +24945,7 @@ _(Originale: ${textToTranslate})_`;
         console.error("[Translator] Error:", e);
       }
     }
-    const timestamp = new Date(momment * 1e3).toISOString();
+    const timestamp = new Date(momment).toISOString();
     const now = (/* @__PURE__ */ new Date()).toISOString();
     const groupName = isGroup ? body.groupName || body.name || phone : null;
     const effectiveSenderName = isGroup ? senderName || body.participantPhone || phone : senderName || phone;
