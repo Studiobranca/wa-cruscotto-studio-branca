@@ -107,7 +107,7 @@ try {
   if (qrCount.c === 0) {
     const ins = db.prepare(`INSERT INTO quick_replies (label, text, shortcut) VALUES (?, ?, ?)`);
     ins.run('Orari', 'Ciao! Il nostro orario di apertura è: Lun-Ven 9:00-18:00, Sab 9:00-13:00.', '/orari');
-    ins.run('Info contatto', 'Per maggiori informazioni puoi contattarci a: info@studiobranca.it o chiamarci.', '/info');
+    ins.run('Info contatto', 'Per maggiori informazioni puoi contattarci a: studiobranca@icloud.com o chiamarci.', '/info');
     ins.run('Appuntamento', 'Posso fissare un appuntamento per te! Dimmi quale giorno preferisci e ti confermerò la disponibilità.', '/app');
     console.log('[DB] Seed risposte rapide originali inserito');
   }
