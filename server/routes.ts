@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import db from './db.js';
+import { getAvailability, formatAvailabilityIT } from './appointments.js';
 import { sendTextMessage, syncContacts } from './zapi.js';
 import { addSSEClient, broadcastEvent, getClientCount } from './sse.js';
 import { startPolling, stopPolling, isPollingRunning } from './polling.js';
@@ -304,6 +305,21 @@ router.get('/messages/log', (req: Request, res: Response) => {
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// ─── Appuntamenti: disponibilità da Google Calendar + regole studio ──────────
+// Regole: lun–ven 9–13; pomeriggio 15–18 solo lun/mar/gio (NO mer e ven pom.);
+// esclusi sabato, domenica, feste comandate e chiusura 10/07–20/08.
+router.get('/appointments/availability', async (req: Request, res: Response) => {
+  try {
+    const days = Math.min(parseInt(String(req.query.days || '14')) || 14, 60);
+    const { slots, calendarChecked } = await getAvailability(days);
+    if (String(req.query.format) === 'text') {
+      res.json({ text: formatAvailabilityIT(slots), calendarChecked, count: slots.length });
+    } else {
+      res.json({ slots, calendarChecked, count: slots.length });
+    }
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
 // ─── Automazioni: regole keyword ─────────────────────────────────────────────
@@ -623,6 +639,16 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
         if (!replyText && conv.auto_reply_message) replyText = conv.auto_reply_message;
         if (replyText) {
           try {
+            // Segnaposto {DISPONIBILITA}: sostituito con i prossimi slot liberi
+            // calcolati da Google Calendar + regole orario studio
+            if (replyText.includes('{DISPONIBILITA}')) {
+              try {
+                const { slots } = await getAvailability(14);
+                replyText = replyText.replace(/\{DISPONIBILITA\}/g, formatAvailabilityIT(slots));
+              } catch (e) {
+                replyText = replyText.replace(/\{DISPONIBILITA\}/g, 'la ricontatteremo a breve con le disponibilità');
+              }
+            }
             await sendTextMessage(phone, replyText);
             const arId = `ar_${Date.now()}`;
             const arNow = new Date().toISOString();

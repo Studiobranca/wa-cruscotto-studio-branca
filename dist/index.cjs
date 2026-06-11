@@ -24030,6 +24030,128 @@ init_db();
 var import_express = __toESM(require_express2(), 1);
 init_db();
 
+// server/appointments.ts
+var TZ = "Europe/Rome";
+async function getGoogleAccessToken() {
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  const refreshToken = process.env.GOOGLE_REFRESH_TOKEN;
+  if (!clientId || !clientSecret || !refreshToken) return null;
+  try {
+    const resp = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        refresh_token: refreshToken,
+        grant_type: "refresh_token"
+      })
+    });
+    const data = await resp.json();
+    return data.access_token ?? null;
+  } catch {
+    return null;
+  }
+}
+function easterMonday(year) {
+  const a = year % 19, b = Math.floor(year / 100), c = year % 100;
+  const d = Math.floor(b / 4), e = b % 4, f = Math.floor((b + 8) / 25);
+  const g = Math.floor((b - f + 1) / 3), h = (19 * a + b - d - g + 15) % 30;
+  const i = Math.floor(c / 4), k = c % 4, l = (32 + 2 * e + 2 * i - h - k) % 7;
+  const m = Math.floor((a + 11 * h + 22 * l) / 451);
+  const month = Math.floor((h + l - 7 * m + 114) / 31);
+  const day = (h + l - 7 * m + 114) % 31 + 1;
+  const easter = new Date(Date.UTC(year, month - 1, day));
+  easter.setUTCDate(easter.getUTCDate() + 1);
+  return easter.toISOString().slice(0, 10);
+}
+function isHoliday(ds) {
+  const [y, md] = [parseInt(ds.slice(0, 4)), ds.slice(5)];
+  const fixed = ["01-01", "01-06", "04-25", "05-01", "06-02", "08-15", "11-01", "12-08", "12-25", "12-26"];
+  if (fixed.includes(md)) return true;
+  if (ds === easterMonday(y)) return true;
+  return false;
+}
+function isSummerClosure(ds) {
+  const md = ds.slice(5);
+  return md >= "07-10" && md <= "08-20";
+}
+function daySlots(ds, dow) {
+  if (dow === 0 || dow === 6) return [];
+  if (isHoliday(ds) || isSummerClosure(ds)) return [];
+  const out = [];
+  for (let h = 9; h < 13; h++) out.push({ date: ds, start: `${String(h).padStart(2, "0")}:00`, end: `${String(h + 1).padStart(2, "0")}:00`, dow });
+  const afternoonOk = dow === 1 || dow === 2 || dow === 4;
+  if (afternoonOk) for (let h = 15; h < 18; h++) out.push({ date: ds, start: `${String(h).padStart(2, "0")}:00`, end: `${String(h + 1).padStart(2, "0")}:00`, dow });
+  return out;
+}
+function romeOffset(ds) {
+  const probe = /* @__PURE__ */ new Date(`${ds}T12:00:00Z`);
+  const rome = new Intl.DateTimeFormat("en-US", { timeZone: TZ, hour: "numeric", hour12: false }).format(probe);
+  return parseInt(rome) - 12 === 2 ? "+02:00" : "+01:00";
+}
+async function getAvailability(days = 14) {
+  const today = /* @__PURE__ */ new Date();
+  const all = [];
+  for (let i = 1; i <= days; i++) {
+    const d = new Date(today.getFullYear(), today.getMonth(), today.getDate() + i);
+    const ds = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    all.push(...daySlots(ds, d.getDay()));
+  }
+  if (!all.length) return { slots: [], calendarChecked: false };
+  let busy = [];
+  let calendarChecked = false;
+  const token = await getGoogleAccessToken();
+  if (token) {
+    try {
+      const first = all[0], last = all[all.length - 1];
+      const resp = await fetch("https://www.googleapis.com/calendar/v3/freeBusy", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          timeMin: `${first.date}T00:00:00${romeOffset(first.date)}`,
+          timeMax: `${last.date}T23:59:59${romeOffset(last.date)}`,
+          timeZone: TZ,
+          items: [{ id: process.env.GOOGLE_CALENDAR_ID || "primary" }]
+        })
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        const cal = data.calendars?.[Object.keys(data.calendars || {})[0]];
+        busy = (cal?.busy || []).map((b) => ({ start: Date.parse(b.start), end: Date.parse(b.end) }));
+        calendarChecked = true;
+      }
+    } catch (e) {
+      console.error("[Appuntamenti] freeBusy:", e);
+    }
+  }
+  const free = all.filter((s) => {
+    const off = romeOffset(s.date);
+    const st = Date.parse(`${s.date}T${s.start}:00${off}`);
+    const en = Date.parse(`${s.date}T${s.end}:00${off}`);
+    return !busy.some((b) => b.start < en && b.end > st);
+  });
+  return { slots: free, calendarChecked };
+}
+var DOW_IT = ["domenica", "luned\xEC", "marted\xEC", "mercoled\xEC", "gioved\xEC", "venerd\xEC", "sabato"];
+var MONTH_IT = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"];
+function formatAvailabilityIT(slots, maxDays = 4, maxPerDay = 3) {
+  if (!slots.length) return "al momento non ci sono disponibilit\xE0 nei prossimi giorni; la ricontatteremo appena possibile";
+  const byDay = {};
+  for (const s of slots) {
+    (byDay[s.date] = byDay[s.date] || []).push(s);
+  }
+  const lines = [];
+  for (const ds of Object.keys(byDay).sort().slice(0, maxDays)) {
+    const d = byDay[ds];
+    const day = parseInt(ds.slice(8, 10)), month = MONTH_IT[parseInt(ds.slice(5, 7)) - 1];
+    const hours = d.slice(0, maxPerDay).map((s) => s.start).join(", ");
+    lines.push(`\u2022 ${DOW_IT[d[0].dow]} ${day} ${month}: ore ${hours}`);
+  }
+  return lines.join("\n");
+}
+
 // server/zapi.ts
 var ZAPI_INSTANCE = process.env.ZAPI_INSTANCE || "3F439036DDF9C25F4C5C7AE31EDEB32B";
 var ZAPI_TOKEN = process.env.ZAPI_TOKEN || "0AB4EBF088FF1F7AADA158F3";
@@ -24253,7 +24375,7 @@ function logIntegration(entry) {
   } catch {
   }
 }
-async function getGoogleAccessToken() {
+async function getGoogleAccessToken2() {
   const clientId = process.env.GOOGLE_CLIENT_ID;
   const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
   const refreshToken = process.env.GOOGLE_REFRESH_TOKEN;
@@ -24276,7 +24398,7 @@ async function getGoogleAccessToken() {
   }
 }
 async function findGoogleContact(phone) {
-  const token = await getGoogleAccessToken();
+  const token = await getGoogleAccessToken2();
   if (!token) return null;
   try {
     const cleanPhone = phone.replace(/\D/g, "");
@@ -24303,7 +24425,7 @@ async function findGoogleContact(phone) {
   }
 }
 async function createGoogleContact(params) {
-  const token = await getGoogleAccessToken();
+  const token = await getGoogleAccessToken2();
   if (!token) {
     return { success: false, error: "Google OAuth non configurato" };
   }
@@ -24352,7 +24474,7 @@ async function createGoogleContact(params) {
   }
 }
 async function createCalendarEvent(params) {
-  const token = await getGoogleAccessToken();
+  const token = await getGoogleAccessToken2();
   if (!token) {
     return { success: false, error: "Google OAuth non configurato" };
   }
@@ -24820,6 +24942,19 @@ router.get("/messages/log", (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+router.get("/appointments/availability", async (req, res) => {
+  try {
+    const days = Math.min(parseInt(String(req.query.days || "14")) || 14, 60);
+    const { slots, calendarChecked } = await getAvailability(days);
+    if (String(req.query.format) === "text") {
+      res.json({ text: formatAvailabilityIT(slots), calendarChecked, count: slots.length });
+    } else {
+      res.json({ slots, calendarChecked, count: slots.length });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 router.get("/rules", (_req, res) => {
   try {
     res.json(db_default.prepare(`
@@ -25104,6 +25239,14 @@ _(Originale: ${textToTranslate})_`;
         if (!replyText && conv.auto_reply_message) replyText = conv.auto_reply_message;
         if (replyText) {
           try {
+            if (replyText.includes("{DISPONIBILITA}")) {
+              try {
+                const { slots } = await getAvailability(14);
+                replyText = replyText.replace(/\{DISPONIBILITA\}/g, formatAvailabilityIT(slots));
+              } catch (e) {
+                replyText = replyText.replace(/\{DISPONIBILITA\}/g, "la ricontatteremo a breve con le disponibilit\xE0");
+              }
+            }
             await sendTextMessage(phone, replyText);
             const arId = `ar_${Date.now()}`;
             const arNow = (/* @__PURE__ */ new Date()).toISOString();
