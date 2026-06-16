@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import db from './db.js';
-import { getAvailability, formatAvailabilityIT } from './appointments.js';
+import { getAvailability, formatAvailabilityIT, isSlotBusy } from './appointments.js';
 import { sendTextMessage, syncContacts } from './zapi.js';
 import { addSSEClient, broadcastEvent, getClientCount } from './sse.js';
 import { startPolling, stopPolling, isPollingRunning } from './polling.js';
@@ -28,6 +28,7 @@ import {
   getBotModel,
   setSetting as setBotSetting,
 } from './chatbot.js';
+import { runDailyDigest, getFlowHealth, repairWebhook } from './maintenance.js';
 
 const router = Router();
 
@@ -1172,6 +1173,21 @@ router.post('/bot/drafts/:id/approve', async (req: Request, res: Response) => {
     if (d.status !== 'pending') return res.status(400).json({ error: 'Bozza già gestita' });
 
     const text = (req.body?.text && String(req.body.text).trim()) || d.draft_text;
+    const force = req.body?.force === true;
+
+    // 0. Se c'è un appuntamento proposto, controlla l'agenda di Mariano PRIMA di
+    //    inviare: se è impegnato in quello slot, fermati e avvisa (salvo override).
+    if (d.proposed_event && !force) {
+      const ev = d.proposed_event;
+      const { busy, checked } = await isSlotBusy(ev.date, ev.start, ev.end);
+      if (busy && checked) {
+        return res.status(409).json({
+          conflict: true,
+          message: `Risulti impegnato ${ev.date} alle ${ev.start}. Confermare comunque l'appuntamento?`,
+          proposed_event: ev,
+        });
+      }
+    }
 
     // 1. Invia il messaggio al cliente via Z-API
     await sendTextMessage(d.phone, text);
@@ -1199,6 +1215,28 @@ router.post('/bot/drafts/:id/approve', async (req: Request, res: Response) => {
     res.json({ success: true, calendar });
   } catch (err: any) {
     console.error('[Bot approve] Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── MANUTENZIONE: digest giornaliero + watchdog flusso ──────────────────────
+router.post('/bot/daily-digest', async (req: Request, res: Response) => {
+  try {
+    const date = (req.query.date as string) || undefined;
+    res.json(await runDailyDigest(date));
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/bot/flow-health', (_req: Request, res: Response) => {
+  res.json(getFlowHealth());
+});
+
+router.post('/bot/repair-webhook', async (_req: Request, res: Response) => {
+  try {
+    res.json(await repairWebhook());
+  } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });

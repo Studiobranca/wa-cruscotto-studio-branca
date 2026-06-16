@@ -56,24 +56,35 @@ export function getBotModel(): string { return getSetting('bot_model', DEFAULT_M
 const SYSTEM_PROMPT = `Sei l'assistente virtuale di AB STUDIO SRL (Studio Tributario Branca),
 studio di commercialista/tributarista, consulente del lavoro e amministratore di condominio.
 Titolare: Dott. Mariano Branca — Via Operai 102, 98051 Barcellona P.G. (ME).
-Orari studio: Lun-Ven 9:00-13:00 e 15:30-19:00.
 
-Stai rispondendo a un cliente su WhatsApp. Obiettivo: dialogare in modo cordiale e
-professionale (dare del Lei), CAPIRE di cosa ha bisogno, RACCOGLIERE le informazioni
-utili e, se serve un incontro, PROPORRE un appuntamento gestendo l'agenda.
+Stai rispondendo a un cliente su WhatsApp. Dai del Lei, tono cordiale e professionale,
+messaggi brevi.
+
+COMPORTAMENTO BASE:
+- Per qualunque richiesta o documento inviato, conferma che lo studio LI VALUTERÀ
+  (es. "valuteremo la sua richiesta" / "valuteremo i documenti che ci ha inviato") e
+  NON entrare nel merito fiscale/legale via chat.
+- Invita SEMPRE il cliente a passare in studio e a fissare un appuntamento.
+- Per gli appuntamenti usa get_availability (proponi 2-3 opzioni) e, quando il cliente
+  sceglie, chiama propose_booking (l'appuntamento sarà poi confermato dallo studio).
+- ORARI STUDIO (get_availability li rispetta già, ma tienili presente nel dialogo):
+  Lun-Ven 9:00-13:00; pomeriggio SOLO lun/mar/gio 15:30-19:00 (NO mercoledì e venerdì
+  pomeriggio). MAI sabato, domenica, feste comandate; chiuso dal 20 luglio al 31 agosto.
+
+CONTROLLO DUPLICATI (obbligatorio): prima di rispondere a una richiesta o a un invio di
+documenti, chiama find_previous_requests per verificare se il cliente aveva GIÀ inviato lo
+stesso documento o fatto la stessa richiesta in passato. Se sì, faglielo presente con
+garbo citando la data (es. "risulta che ci aveva già inviato ... in data ...").
 
 REGOLE INDEROGABILI:
-1. Rispondi sempre in italiano, tono professionale ma cordiale, messaggi brevi da chat.
-2. NON dare MAI pareri o calcoli fiscali/legali precisi, importi, codici o scadenze via chat:
-   per la consulenza di merito raccogli i dati e proponi un appuntamento in studio.
-3. Per appuntamenti usa lo strumento get_availability per gli slot reali, poi proponi 2-3
-   opzioni; quando il cliente sceglie uno slot chiama propose_booking (l'appuntamento sarà
-   confermato dallo studio).
-4. Urgenze gravi (cartella esattoriale, accertamento, udienza, atto notificato con termini):
-   NON gestirle da sola → chiama need_human; rassicura il cliente che il Dott. Branca verrà
-   avvisato subito e chiedi di inviare copia dell'atto.
-5. Se il cliente invia documenti/foto, conferma la ricezione e indica che verranno esaminati.
-6. Firma sempre: "Assistente Virtuale — AB STUDIO SRL".
+1. Italiano, messaggi brevi da chat.
+2. NIENTE importi, calcoli, codici, scadenze o pareri precisi via chat → raccogli i dati e
+   rimanda all'appuntamento.
+3. Urgenze gravi (cartella esattoriale, accertamento, udienza, atto notificato con termini):
+   NON gestirle da sola → chiama need_human; rassicura che il Dott. Branca verrà avvisato
+   subito e chiedi copia dell'atto.
+4. Documenti/foto: conferma la ricezione e indica che verranno valutati.
+5. Firma sempre: "Assistente Virtuale — AB STUDIO SRL".
 
 Produci come messaggio finale SOLO il testo da inviare al cliente (niente preamboli).`;
 
@@ -108,6 +119,15 @@ const TOOLS = [
       required: ['reason'],
     },
   },
+  {
+    name: 'find_previous_requests',
+    description: 'Cerca nello storico dei messaggi del cliente se aveva già inviato lo stesso documento o fatto la stessa richiesta in passato. Usalo SEMPRE prima di rispondere a una richiesta/invio documenti.',
+    input_schema: {
+      type: 'object',
+      properties: { query: { type: 'string', description: 'Parole chiave della richiesta/documento (es. "dichiarazione redditi", "visura", "f24")' } },
+      required: ['query'],
+    },
+  },
 ];
 
 // ─── Cronologia conversazione → trascritto ───────────────────────────────────
@@ -140,7 +160,24 @@ function endTime(start: string): string {
   return `${String(eh).padStart(2, '0')}:${String(m || 0).padStart(2, '0')}`;
 }
 
-async function runTool(name: string, input: any, out: DraftResult): Promise<string> {
+async function runTool(name: string, input: any, out: DraftResult, phone: string): Promise<string> {
+  if (name === 'find_previous_requests') {
+    const kws = String(input?.query || '').toLowerCase().split(/\s+/).filter((w) => w.length > 3).slice(0, 6);
+    if (!kws.length) return 'Nessun termine utile per la ricerca.';
+    const rows = db.prepare(`
+      SELECT content, timestamp FROM live_messages
+      WHERE phone = ? AND direction = 'received' AND content IS NOT NULL
+      ORDER BY timestamp DESC LIMIT 300
+    `).all(phone) as any[];
+    const cutoff = Date.now() - 2 * 86400000; // ignora le ultime 48h (conversazione corrente)
+    const hits = rows.filter((r) => {
+      const t = Date.parse(r.timestamp);
+      return !isNaN(t) && t < cutoff && kws.some((k) => (r.content || '').toLowerCase().includes(k));
+    }).slice(0, 5);
+    if (!hits.length) return 'Nessuna richiesta o documento simile inviato in passato dal cliente.';
+    return 'Richieste/documenti SIMILI già inviati in passato (cita la data al cliente):\n' +
+      hits.map((h) => `- ${(h.timestamp || '').slice(0, 10)}: "${(h.content || '').replace(/\n+/g, ' ').slice(0, 90)}"`).join('\n');
+  }
   if (name === 'get_availability') {
     const days = Math.min(Math.max(parseInt(input?.days, 10) || 14, 1), 30);
     const { slots, calendarChecked } = await getAvailability(days);
@@ -227,7 +264,7 @@ export async function generateDraft(phone: string, contactName: string): Promise
       const toolResults: any[] = [];
       for (const b of blocks) {
         if (b.type === 'tool_use') {
-          const result = await runTool(b.name, b.input, out);
+          const result = await runTool(b.name, b.input, out, phone);
           toolResults.push({ type: 'tool_result', tool_use_id: b.id, content: result });
         }
       }

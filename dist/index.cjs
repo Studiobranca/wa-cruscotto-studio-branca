@@ -24075,7 +24075,7 @@ function isHoliday(ds) {
 }
 function isSummerClosure(ds) {
   const md = ds.slice(5);
-  return md >= "07-10" && md <= "08-20";
+  return md >= "07-20" && md <= "08-31";
 }
 function daySlots(ds, dow) {
   if (dow === 0 || dow === 6) return [];
@@ -24134,6 +24134,30 @@ async function getAvailability(days = 14) {
   });
   return { slots: free, calendarChecked };
 }
+async function isSlotBusy(date, start, end) {
+  const token = await getGoogleAccessToken();
+  if (!token) return { busy: false, checked: false };
+  const off = romeOffset(date);
+  try {
+    const resp = await fetch("https://www.googleapis.com/calendar/v3/freeBusy", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        timeMin: `${date}T${start}:00${off}`,
+        timeMax: `${date}T${end}:00${off}`,
+        timeZone: TZ,
+        items: [{ id: process.env.GOOGLE_CALENDAR_ID || "primary" }]
+      })
+    });
+    if (!resp.ok) return { busy: false, checked: false };
+    const data = await resp.json();
+    const cal = data.calendars?.[Object.keys(data.calendars || {})[0]];
+    const busy = (cal?.busy || []).length > 0;
+    return { busy, checked: true };
+  } catch {
+    return { busy: false, checked: false };
+  }
+}
 var DOW_IT = ["domenica", "luned\xEC", "marted\xEC", "mercoled\xEC", "gioved\xEC", "venerd\xEC", "sabato"];
 var MONTH_IT = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"];
 function formatAvailabilityIT(slots, maxDays = 4, maxPerDay = 3) {
@@ -24188,6 +24212,23 @@ async function zapiPost(endpoint, body) {
 }
 async function sendTextMessage(phone, message) {
   return zapiPost("send-text", { phone, message });
+}
+async function getReceivedWebhook() {
+  try {
+    const r = await zapiGet("webhooks");
+    return r?.value ?? r?.delivery ?? r?.received ?? null;
+  } catch {
+    return null;
+  }
+}
+async function setReceivedWebhook(url) {
+  try {
+    await zapiPost("update-webhook-received", { value: url });
+    return true;
+  } catch (e) {
+    console.error("[ZAPI] setReceivedWebhook fallito:", e.message);
+    return false;
+  }
 }
 async function syncContacts() {
   const { db: db2 } = await Promise.resolve().then(() => (init_db(), db_exports));
@@ -24533,6 +24574,44 @@ async function createCalendarEvent(params) {
     return { success: false, error: e.message };
   }
 }
+async function upsertAllDayEvent(params) {
+  const token = await getGoogleAccessToken2();
+  if (!token) return { success: false, error: "Google OAuth non configurato" };
+  const calId = params.calendarId || process.env.GOOGLE_CALENDAR_ID || "primary";
+  const next = /* @__PURE__ */ new Date(`${params.date}T00:00:00Z`);
+  next.setUTCDate(next.getUTCDate() + 1);
+  const endDate = next.toISOString().slice(0, 10);
+  const event = {
+    summary: params.title,
+    description: params.description,
+    start: { date: params.date },
+    end: { date: endDate },
+    transparency: "transparent"
+  };
+  const base = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calId)}/events`;
+  const url = params.eventId ? `${base}/${encodeURIComponent(params.eventId)}` : base;
+  const method = params.eventId ? "PATCH" : "POST";
+  try {
+    const resp = await fetch(url, {
+      method,
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(event)
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      logIntegration({ integration: "google_calendar", action: params.eventId ? "update_digest" : "create_digest", status: "success", detail: params.date });
+      return { success: true, eventId: data.id };
+    }
+    if (resp.status === 404 && params.eventId) {
+      return upsertAllDayEvent({ ...params, eventId: null });
+    }
+    const err = await resp.text();
+    logIntegration({ integration: "google_calendar", action: "digest", status: "error", detail: `HTTP ${resp.status}: ${err.substring(0, 80)}` });
+    return { success: false, error: `HTTP ${resp.status}` };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+}
 var NOTION_VERSION = "2022-06-28";
 async function saveToNotionComunicazioni(params) {
   const notionToken = process.env.NOTION_API_KEY;
@@ -24736,24 +24815,35 @@ function getBotModel() {
 var SYSTEM_PROMPT = `Sei l'assistente virtuale di AB STUDIO SRL (Studio Tributario Branca),
 studio di commercialista/tributarista, consulente del lavoro e amministratore di condominio.
 Titolare: Dott. Mariano Branca \u2014 Via Operai 102, 98051 Barcellona P.G. (ME).
-Orari studio: Lun-Ven 9:00-13:00 e 15:30-19:00.
 
-Stai rispondendo a un cliente su WhatsApp. Obiettivo: dialogare in modo cordiale e
-professionale (dare del Lei), CAPIRE di cosa ha bisogno, RACCOGLIERE le informazioni
-utili e, se serve un incontro, PROPORRE un appuntamento gestendo l'agenda.
+Stai rispondendo a un cliente su WhatsApp. Dai del Lei, tono cordiale e professionale,
+messaggi brevi.
+
+COMPORTAMENTO BASE:
+- Per qualunque richiesta o documento inviato, conferma che lo studio LI VALUTER\xC0
+  (es. "valuteremo la sua richiesta" / "valuteremo i documenti che ci ha inviato") e
+  NON entrare nel merito fiscale/legale via chat.
+- Invita SEMPRE il cliente a passare in studio e a fissare un appuntamento.
+- Per gli appuntamenti usa get_availability (proponi 2-3 opzioni) e, quando il cliente
+  sceglie, chiama propose_booking (l'appuntamento sar\xE0 poi confermato dallo studio).
+- ORARI STUDIO (get_availability li rispetta gi\xE0, ma tienili presente nel dialogo):
+  Lun-Ven 9:00-13:00; pomeriggio SOLO lun/mar/gio 15:30-19:00 (NO mercoled\xEC e venerd\xEC
+  pomeriggio). MAI sabato, domenica, feste comandate; chiuso dal 20 luglio al 31 agosto.
+
+CONTROLLO DUPLICATI (obbligatorio): prima di rispondere a una richiesta o a un invio di
+documenti, chiama find_previous_requests per verificare se il cliente aveva GI\xC0 inviato lo
+stesso documento o fatto la stessa richiesta in passato. Se s\xEC, faglielo presente con
+garbo citando la data (es. "risulta che ci aveva gi\xE0 inviato ... in data ...").
 
 REGOLE INDEROGABILI:
-1. Rispondi sempre in italiano, tono professionale ma cordiale, messaggi brevi da chat.
-2. NON dare MAI pareri o calcoli fiscali/legali precisi, importi, codici o scadenze via chat:
-   per la consulenza di merito raccogli i dati e proponi un appuntamento in studio.
-3. Per appuntamenti usa lo strumento get_availability per gli slot reali, poi proponi 2-3
-   opzioni; quando il cliente sceglie uno slot chiama propose_booking (l'appuntamento sar\xE0
-   confermato dallo studio).
-4. Urgenze gravi (cartella esattoriale, accertamento, udienza, atto notificato con termini):
-   NON gestirle da sola \u2192 chiama need_human; rassicura il cliente che il Dott. Branca verr\xE0
-   avvisato subito e chiedi di inviare copia dell'atto.
-5. Se il cliente invia documenti/foto, conferma la ricezione e indica che verranno esaminati.
-6. Firma sempre: "Assistente Virtuale \u2014 AB STUDIO SRL".
+1. Italiano, messaggi brevi da chat.
+2. NIENTE importi, calcoli, codici, scadenze o pareri precisi via chat \u2192 raccogli i dati e
+   rimanda all'appuntamento.
+3. Urgenze gravi (cartella esattoriale, accertamento, udienza, atto notificato con termini):
+   NON gestirle da sola \u2192 chiama need_human; rassicura che il Dott. Branca verr\xE0 avvisato
+   subito e chiedi copia dell'atto.
+4. Documenti/foto: conferma la ricezione e indica che verranno valutati.
+5. Firma sempre: "Assistente Virtuale \u2014 AB STUDIO SRL".
 
 Produci come messaggio finale SOLO il testo da inviare al cliente (niente preamboli).`;
 var TOOLS = [
@@ -24786,6 +24876,15 @@ var TOOLS = [
       properties: { reason: { type: "string", description: "Perch\xE9 serve l'intervento umano" } },
       required: ["reason"]
     }
+  },
+  {
+    name: "find_previous_requests",
+    description: "Cerca nello storico dei messaggi del cliente se aveva gi\xE0 inviato lo stesso documento o fatto la stessa richiesta in passato. Usalo SEMPRE prima di rispondere a una richiesta/invio documenti.",
+    input_schema: {
+      type: "object",
+      properties: { query: { type: "string", description: 'Parole chiave della richiesta/documento (es. "dichiarazione redditi", "visura", "f24")' } },
+      required: ["query"]
+    }
   }
 ];
 function buildTranscript(phone, contactName) {
@@ -24812,7 +24911,23 @@ function endTime(start) {
   const eh = (h + 1) % 24;
   return `${String(eh).padStart(2, "0")}:${String(m || 0).padStart(2, "0")}`;
 }
-async function runTool(name, input, out) {
+async function runTool(name, input, out, phone) {
+  if (name === "find_previous_requests") {
+    const kws = String(input?.query || "").toLowerCase().split(/\s+/).filter((w) => w.length > 3).slice(0, 6);
+    if (!kws.length) return "Nessun termine utile per la ricerca.";
+    const rows = db_default.prepare(`
+      SELECT content, timestamp FROM live_messages
+      WHERE phone = ? AND direction = 'received' AND content IS NOT NULL
+      ORDER BY timestamp DESC LIMIT 300
+    `).all(phone);
+    const cutoff = Date.now() - 2 * 864e5;
+    const hits = rows.filter((r) => {
+      const t = Date.parse(r.timestamp);
+      return !isNaN(t) && t < cutoff && kws.some((k) => (r.content || "").toLowerCase().includes(k));
+    }).slice(0, 5);
+    if (!hits.length) return "Nessuna richiesta o documento simile inviato in passato dal cliente.";
+    return "Richieste/documenti SIMILI gi\xE0 inviati in passato (cita la data al cliente):\n" + hits.map((h) => `- ${(h.timestamp || "").slice(0, 10)}: "${(h.content || "").replace(/\n+/g, " ").slice(0, 90)}"`).join("\n");
+  }
   if (name === "get_availability") {
     const days = Math.min(Math.max(parseInt(input?.days, 10) || 14, 1), 30);
     const { slots, calendarChecked } = await getAvailability(days);
@@ -24893,7 +25008,7 @@ Data odierna: ${todayStr} (${todayISO}). Usa SEMPRE date coerenti con oggi e non
       const toolResults = [];
       for (const b of blocks) {
         if (b.type === "tool_use") {
-          const result = await runTool(b.name, b.input, out);
+          const result = await runTool(b.name, b.input, out, phone);
           toolResults.push({ type: "tool_result", tool_use_id: b.id, content: result });
         }
       }
@@ -24934,6 +25049,123 @@ function markDraftSent(id) {
 }
 function markDraftRejected(id) {
   db_default.prepare(`UPDATE bot_drafts SET status = 'rejected' WHERE id = ?`).run(id);
+}
+
+// server/maintenance.ts
+init_db();
+var PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://wa-cruscotto-v2-production.up.railway.app";
+var WEBHOOK_URL = `${PUBLIC_BASE_URL}/api/webhook/message`;
+var STALE_MINUTES = 180;
+var REPAIR_COOLDOWN_MIN = 360;
+function getSetting2(key) {
+  try {
+    return db_default.prepare(`SELECT value FROM app_settings WHERE key = ?`).get(key)?.value ?? null;
+  } catch {
+    return null;
+  }
+}
+function setSetting2(key, value) {
+  db_default.prepare(`INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(key, value);
+}
+function romeNow() {
+  const now = /* @__PURE__ */ new Date();
+  const iso = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Rome" }).format(now);
+  const hour = parseInt(new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Rome", hour: "2-digit", hour12: false }).format(now), 10);
+  const wd = new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Rome", weekday: "short" }).format(now);
+  const dow = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(wd);
+  return { iso, hour, dow };
+}
+function isBusinessHours() {
+  const { hour, dow } = romeNow();
+  if (dow === 0 || dow === 6) return false;
+  return hour >= 9 && hour < 13 || hour >= 15 && hour < 19;
+}
+function buildDigest(dateISO) {
+  const rows = db_default.prepare(`
+    SELECT phone, contact_name, is_group, direction, content, timestamp
+    FROM live_messages WHERE substr(timestamp, 1, 10) = ?
+    ORDER BY timestamp ASC
+  `).all(dateISO);
+  const byPhone = {};
+  for (const r of rows) {
+    const k = r.phone;
+    if (!byPhone[k]) byPhone[k] = { name: r.contact_name || r.phone, group: !!r.is_group, rx: 0, tx: 0, last: "" };
+    if (r.direction === "sent") byPhone[k].tx++;
+    else byPhone[k].rx++;
+    if (r.content) byPhone[k].last = String(r.content).replace(/\n+/g, " ").slice(0, 60);
+  }
+  const entries = Object.entries(byPhone).sort((a, b) => b[1].rx + b[1].tx - (a[1].rx + a[1].tx));
+  const lines = entries.map(
+    ([phone, v]) => `\u2022 ${v.name}${v.group ? " [GRUPPO]" : ""} \u2014 ${v.rx} ricevuti${v.tx ? `, ${v.tx} inviati` : ""}${v.last ? `: "${v.last}"` : ""}`
+  );
+  const total = rows.length;
+  const contacts = entries.length;
+  const title = `\u{1F4F1} WhatsApp ${dateISO}: ${total} msg \xB7 ${contacts} contatti`;
+  const description = entries.length ? `Riepilogo comunicazioni WhatsApp del giorno (clienti e gruppi in sola lettura).
+
+${lines.join("\n").slice(0, 7500)}` : "Nessuna comunicazione WhatsApp registrata.";
+  return { title, description, total, contacts };
+}
+async function runDailyDigest(dateISO) {
+  const date = dateISO || romeNow().iso;
+  const { title, description, total } = buildDigest(date);
+  const prevId = getSetting2(`digest_event_${date}`);
+  const r = await upsertAllDayEvent({ title, description, date, eventId: prevId });
+  if (r.success && r.eventId) {
+    setSetting2(`digest_event_${date}`, r.eventId);
+    setSetting2(`digest_done_${date}`, "1");
+    return { ok: true, date, total, eventId: r.eventId };
+  }
+  return { ok: false, date, total, error: r.error };
+}
+function lastReceivedAgeMinutes() {
+  const row = db_default.prepare(`SELECT MAX(timestamp) AS t FROM live_messages WHERE direction = 'received'`).get();
+  if (!row?.t) return null;
+  const ms = Date.parse(row.t);
+  if (isNaN(ms)) return null;
+  return Math.round((Date.now() - ms) / 6e4);
+}
+function getFlowHealth() {
+  const age = lastReceivedAgeMinutes();
+  return {
+    lastAgeMin: age,
+    stale: isBusinessHours() && age !== null && age > STALE_MINUTES,
+    businessHours: isBusinessHours(),
+    webhookExpected: WEBHOOK_URL
+  };
+}
+async function repairWebhook() {
+  const previous = await getReceivedWebhook();
+  const ok = await setReceivedWebhook(WEBHOOK_URL);
+  setSetting2("last_webhook_repair", (/* @__PURE__ */ new Date()).toISOString());
+  broadcastEvent("flow_repair", { ok, webhook: WEBHOOK_URL, at: (/* @__PURE__ */ new Date()).toISOString() });
+  console.log(`[Watchdog] Riparazione webhook: ${ok ? "OK" : "FALLITA"} \u2192 ${WEBHOOK_URL} (precedente: ${previous})`);
+  return { ok, previous, set: WEBHOOK_URL };
+}
+async function watchdogTick() {
+  const h = getFlowHealth();
+  if (!h.stale) return;
+  const last = getSetting2("last_webhook_repair");
+  if (last && (Date.now() - Date.parse(last)) / 6e4 < REPAIR_COOLDOWN_MIN) return;
+  console.warn(`[Watchdog] Flusso messaggi fermo da ${h.lastAgeMin} min in orario lavorativo \u2192 riparazione webhook`);
+  await repairWebhook();
+}
+function startMaintenance() {
+  const tick = async () => {
+    try {
+      const { iso, hour } = romeNow();
+      if (hour >= 20 && getSetting2(`digest_done_${iso}`) !== "1") {
+        const r = await runDailyDigest(iso);
+        console.log(`[Digest] ${iso}: ${r.ok ? `evento aggiornato (${r.total} msg)` : `errore: ${r.error}`}`);
+      }
+      await watchdogTick();
+    } catch (e) {
+      console.error("[Maintenance] tick error:", e.message);
+    }
+  };
+  setInterval(tick, 30 * 60 * 1e3);
+  setTimeout(tick, 60 * 1e3);
+  console.log("[Maintenance] Scheduler avviato (digest 20:30 + watchdog flusso).");
 }
 
 // server/routes.ts
@@ -25915,6 +26147,18 @@ router.post("/bot/drafts/:id/approve", async (req, res) => {
     if (!d) return res.status(404).json({ error: "Bozza non trovata" });
     if (d.status !== "pending") return res.status(400).json({ error: "Bozza gi\xE0 gestita" });
     const text = req.body?.text && String(req.body.text).trim() || d.draft_text;
+    const force = req.body?.force === true;
+    if (d.proposed_event && !force) {
+      const ev = d.proposed_event;
+      const { busy, checked } = await isSlotBusy(ev.date, ev.start, ev.end);
+      if (busy && checked) {
+        return res.status(409).json({
+          conflict: true,
+          message: `Risulti impegnato ${ev.date} alle ${ev.start}. Confermare comunque l'appuntamento?`,
+          proposed_event: ev
+        });
+      }
+    }
     await sendTextMessage(d.phone, text);
     const now = (/* @__PURE__ */ new Date()).toISOString();
     db_default.prepare(`
@@ -25941,6 +26185,24 @@ Motivo: ${ev.reason}
     res.json({ success: true, calendar });
   } catch (err) {
     console.error("[Bot approve] Error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+router.post("/bot/daily-digest", async (req, res) => {
+  try {
+    const date = req.query.date || void 0;
+    res.json(await runDailyDigest(date));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.get("/bot/flow-health", (_req, res) => {
+  res.json(getFlowHealth());
+});
+router.post("/bot/repair-webhook", async (_req, res) => {
+  try {
+    res.json(await repairWebhook());
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
@@ -25973,6 +26235,7 @@ app.listen(PORT, () => {
   setTimeout(() => {
     startPolling(3e4);
   }, 2e3);
+  startMaintenance();
 });
 var server_default = app;
 /*! Bundled license information:

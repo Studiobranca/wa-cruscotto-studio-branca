@@ -39,15 +39,25 @@ export default function BotDrafts() {
     queryFn: async () => (await fetch(`${getApiBase()}/api/bot/config`)).json(),
   });
 
+  async function doApprove(id: number, text: string, force: boolean): Promise<any> {
+    const r = await fetch(`${getApiBase()}/api/bot/drafts/${id}/approve`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, force }),
+    });
+    if (r.status === 409) {
+      const data = await r.json();
+      // Conflitto agenda: chiedi conferma e, se sì, reinvia forzando
+      if (window.confirm(`${data.message}\n\n(L'appuntamento verrà comunque creato come "DA CONFERMARE".)`)) {
+        return doApprove(id, text, true);
+      }
+      return { skipped: true };
+    }
+    if (!r.ok) throw new Error(await r.text());
+    return r.json();
+  }
+
   const approve = useMutation({
-    mutationFn: async ({ id, text }: { id: number; text: string }) => {
-      const r = await fetch(`${getApiBase()}/api/bot/drafts/${id}/approve`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text }),
-      });
-      if (!r.ok) throw new Error(await r.text());
-      return r.json();
-    },
+    mutationFn: ({ id, text }: { id: number; text: string }) => doApprove(id, text, false),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['bot-drafts'] }),
   });
 

@@ -3,6 +3,7 @@ import path from 'path';
 import './db.js'; // Initialize database
 import routes from './routes.js';
 import { startPolling } from './polling.js';
+import { startMaintenance } from './maintenance.js';
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -43,6 +44,9 @@ app.listen(PORT, () => {
   setTimeout(() => {
     startPolling(30000);
   }, 2000);
+
+  // Manutenzione: digest giornaliero + watchdog flusso messaggi
+  startMaintenance();
 });
 
 export default app;

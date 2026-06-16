@@ -272,6 +272,57 @@ export async function createCalendarEvent(params: {
   }
 }
 
+/**
+ * Crea/aggiorna un evento "tutto il giorno" su Google Calendar.
+ * Usato dal digest giornaliero: se eventId è fornito aggiorna (PATCH), altrimenti
+ * crea. `date` = YYYY-MM-DD (l'evento copre l'intera giornata, transparent = non
+ * blocca l'agenda perché è una nota, non un impegno).
+ */
+export async function upsertAllDayEvent(params: {
+  title: string;
+  description: string;
+  date: string;
+  eventId?: string | null;
+  calendarId?: string;
+}): Promise<{ success: boolean; eventId?: string; error?: string }> {
+  const token = await getGoogleAccessToken();
+  if (!token) return { success: false, error: 'Google OAuth non configurato' };
+  const calId = params.calendarId || process.env.GOOGLE_CALENDAR_ID || 'primary';
+  const next = new Date(`${params.date}T00:00:00Z`);
+  next.setUTCDate(next.getUTCDate() + 1);
+  const endDate = next.toISOString().slice(0, 10);
+  const event = {
+    summary: params.title,
+    description: params.description,
+    start: { date: params.date },
+    end: { date: endDate },
+    transparency: 'transparent',
+  };
+  const base = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calId)}/events`;
+  const url = params.eventId ? `${base}/${encodeURIComponent(params.eventId)}` : base;
+  const method = params.eventId ? 'PATCH' : 'POST';
+  try {
+    const resp = await fetch(url, {
+      method,
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(event),
+    });
+    if (resp.ok) {
+      const data = await resp.json() as any;
+      logIntegration({ integration: 'google_calendar', action: params.eventId ? 'update_digest' : 'create_digest', status: 'success', detail: params.date });
+      return { success: true, eventId: data.id };
+    }
+    if (resp.status === 404 && params.eventId) {
+      return upsertAllDayEvent({ ...params, eventId: null }); // eventId stantio → ricrea
+    }
+    const err = await resp.text();
+    logIntegration({ integration: 'google_calendar', action: 'digest', status: 'error', detail: `HTTP ${resp.status}: ${err.substring(0, 80)}` });
+    return { success: false, error: `HTTP ${resp.status}` };
+  } catch (e: any) {
+    return { success: false, error: e.message };
+  }
+}
+
 // ─── NOTION ──────────────────────────────────────────────────────────────────
 
 const NOTION_VERSION = '2022-06-28';
