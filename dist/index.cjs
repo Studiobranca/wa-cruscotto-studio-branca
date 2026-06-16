@@ -24016,6 +24016,152 @@ var init_db = __esm({
   }
 });
 
+// server/zapi.ts
+var zapi_exports = {};
+__export(zapi_exports, {
+  ZAPI_BASE: () => ZAPI_BASE,
+  ZAPI_CLIENT_TOKEN: () => ZAPI_CLIENT_TOKEN,
+  ZAPI_INSTANCE: () => ZAPI_INSTANCE,
+  ZAPI_TOKEN: () => ZAPI_TOKEN,
+  getReceivedWebhook: () => getReceivedWebhook,
+  sendTextMessage: () => sendTextMessage,
+  setReceivedWebhook: () => setReceivedWebhook,
+  syncContacts: () => syncContacts,
+  zapiGet: () => zapiGet,
+  zapiHeaders: () => zapiHeaders,
+  zapiPost: () => zapiPost,
+  zapiPut: () => zapiPut
+});
+async function zapiGet(endpoint) {
+  const url = `${ZAPI_BASE}${endpoint}`;
+  const response = await fetch(url, {
+    method: "GET",
+    headers: zapiHeaders
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Z-API GET ${endpoint} failed: ${response.status} - ${text}`);
+  }
+  return response.json();
+}
+async function zapiPost(endpoint, body) {
+  const url = `${ZAPI_BASE}${endpoint}`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: zapiHeaders,
+    body: JSON.stringify(body)
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Z-API POST ${endpoint} failed: ${response.status} - ${text}`);
+  }
+  return response.json();
+}
+async function zapiPut(endpoint, body) {
+  const url = `${ZAPI_BASE}${endpoint}`;
+  const response = await fetch(url, {
+    method: "PUT",
+    headers: zapiHeaders,
+    body: JSON.stringify(body)
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Z-API PUT ${endpoint} failed: ${response.status} - ${text}`);
+  }
+  return response.json();
+}
+async function sendTextMessage(phone, message) {
+  return zapiPost("send-text", { phone, message });
+}
+async function getReceivedWebhook() {
+  try {
+    const r = await zapiGet("webhooks");
+    return r?.value ?? r?.delivery ?? r?.received ?? null;
+  } catch {
+    return null;
+  }
+}
+async function setReceivedWebhook(url) {
+  try {
+    await zapiPut("update-webhook-received", { value: url, notifySentByMe: true });
+    return true;
+  } catch (e) {
+    console.error("[ZAPI] setReceivedWebhook fallito:", e.message);
+    return false;
+  }
+}
+async function syncContacts() {
+  const { db: db2 } = await Promise.resolve().then(() => (init_db(), db_exports));
+  let page = 1;
+  const pageSize = 100;
+  let totalSynced = 0;
+  const insertConv = db2.prepare(`
+    INSERT INTO conversations 
+      (phone, contact_name, last_message, last_message_at, unread_count, is_group, created_at)
+    VALUES 
+      (@phone, @contact_name, @last_message, @last_message_at, @unread_count, @is_group, datetime('now'))
+    ON CONFLICT(phone) DO UPDATE SET
+      contact_name = excluded.contact_name,
+      last_message = excluded.last_message,
+      last_message_at = excluded.last_message_at,
+      unread_count = excluded.unread_count,
+      is_group = COALESCE(is_group, excluded.is_group)
+  `);
+  while (true) {
+    try {
+      const data = await zapiGet(`chats?page=${page}&pageSize=${pageSize}`);
+      const chats = Array.isArray(data) ? data : data.chats || data.data || [];
+      if (!chats || chats.length === 0) break;
+      const insertMany = db2.transaction((items) => {
+        for (const chat of items) {
+          const phone = chat.id || chat.phone || "";
+          if (!phone) continue;
+          const isGroup = phone.includes("@g.us") || phone.includes("-") && !phone.match(/^\d+$/);
+          let lastMessageAt = (/* @__PURE__ */ new Date()).toISOString();
+          try {
+            if (chat.lastMessageTime && chat.lastMessageTime > 0) {
+              const d = new Date(chat.lastMessageTime);
+              if (!isNaN(d.getTime())) lastMessageAt = d.toISOString();
+            }
+          } catch {
+          }
+          insertConv.run({
+            phone,
+            contact_name: chat.name || chat.contactName || chat.pushName || phone,
+            last_message: chat.lastMessage || chat.body || "",
+            last_message_at: lastMessageAt,
+            unread_count: parseInt(chat.messagesUnread || chat.unreadMessages || chat.unread || "0", 10) || 0,
+            is_group: isGroup ? 1 : 0
+          });
+          totalSynced++;
+        }
+      });
+      insertMany(chats);
+      if (chats.length < pageSize) break;
+      page++;
+    } catch (err) {
+      console.error(`[ZAPI] Sync error page ${page}:`, err);
+      break;
+    }
+  }
+  console.log(`[ZAPI] Synced ${totalSynced} contacts`);
+  return totalSynced;
+}
+var ZAPI_INSTANCE, ZAPI_TOKEN, ZAPI_CLIENT_TOKEN, ZAPI_BASE, zapiHeaders;
+var init_zapi = __esm({
+  "server/zapi.ts"() {
+    "use strict";
+    ZAPI_INSTANCE = process.env.ZAPI_INSTANCE || "3F439036DDF9C25F4C5C7AE31EDEB32B";
+    ZAPI_TOKEN = process.env.ZAPI_TOKEN || "0AB4EBF088FF1F7AADA158F3";
+    ZAPI_CLIENT_TOKEN = process.env.ZAPI_CLIENT_TOKEN || "F2bcb0c8154e74f3d9ff7b0482f6dd57bS";
+    ZAPI_BASE = process.env.ZAPI_BASE || `https://api.z-api.io/instances/${ZAPI_INSTANCE}/token/${ZAPI_TOKEN}/`;
+    zapiHeaders = {
+      "Content-Type": "application/json",
+      "client-token": ZAPI_CLIENT_TOKEN
+    };
+  }
+});
+
 // server/index.ts
 var server_exports = {};
 __export(server_exports, {
@@ -24176,117 +24322,8 @@ function formatAvailabilityIT(slots, maxDays = 4, maxPerDay = 3) {
   return lines.join("\n");
 }
 
-// server/zapi.ts
-var ZAPI_INSTANCE = process.env.ZAPI_INSTANCE || "3F439036DDF9C25F4C5C7AE31EDEB32B";
-var ZAPI_TOKEN = process.env.ZAPI_TOKEN || "0AB4EBF088FF1F7AADA158F3";
-var ZAPI_CLIENT_TOKEN = process.env.ZAPI_CLIENT_TOKEN || "F2bcb0c8154e74f3d9ff7b0482f6dd57bS";
-var ZAPI_BASE = process.env.ZAPI_BASE || `https://api.z-api.io/instances/${ZAPI_INSTANCE}/token/${ZAPI_TOKEN}/`;
-var zapiHeaders = {
-  "Content-Type": "application/json",
-  "client-token": ZAPI_CLIENT_TOKEN
-};
-async function zapiGet(endpoint) {
-  const url = `${ZAPI_BASE}${endpoint}`;
-  const response = await fetch(url, {
-    method: "GET",
-    headers: zapiHeaders
-  });
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Z-API GET ${endpoint} failed: ${response.status} - ${text}`);
-  }
-  return response.json();
-}
-async function zapiPost(endpoint, body) {
-  const url = `${ZAPI_BASE}${endpoint}`;
-  const response = await fetch(url, {
-    method: "POST",
-    headers: zapiHeaders,
-    body: JSON.stringify(body)
-  });
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Z-API POST ${endpoint} failed: ${response.status} - ${text}`);
-  }
-  return response.json();
-}
-async function sendTextMessage(phone, message) {
-  return zapiPost("send-text", { phone, message });
-}
-async function getReceivedWebhook() {
-  try {
-    const r = await zapiGet("webhooks");
-    return r?.value ?? r?.delivery ?? r?.received ?? null;
-  } catch {
-    return null;
-  }
-}
-async function setReceivedWebhook(url) {
-  try {
-    await zapiPost("update-webhook-received", { value: url });
-    return true;
-  } catch (e) {
-    console.error("[ZAPI] setReceivedWebhook fallito:", e.message);
-    return false;
-  }
-}
-async function syncContacts() {
-  const { db: db2 } = await Promise.resolve().then(() => (init_db(), db_exports));
-  let page = 1;
-  const pageSize = 100;
-  let totalSynced = 0;
-  const insertConv = db2.prepare(`
-    INSERT INTO conversations 
-      (phone, contact_name, last_message, last_message_at, unread_count, is_group, created_at)
-    VALUES 
-      (@phone, @contact_name, @last_message, @last_message_at, @unread_count, @is_group, datetime('now'))
-    ON CONFLICT(phone) DO UPDATE SET
-      contact_name = excluded.contact_name,
-      last_message = excluded.last_message,
-      last_message_at = excluded.last_message_at,
-      unread_count = excluded.unread_count,
-      is_group = COALESCE(is_group, excluded.is_group)
-  `);
-  while (true) {
-    try {
-      const data = await zapiGet(`chats?page=${page}&pageSize=${pageSize}`);
-      const chats = Array.isArray(data) ? data : data.chats || data.data || [];
-      if (!chats || chats.length === 0) break;
-      const insertMany = db2.transaction((items) => {
-        for (const chat of items) {
-          const phone = chat.id || chat.phone || "";
-          if (!phone) continue;
-          const isGroup = phone.includes("@g.us") || phone.includes("-") && !phone.match(/^\d+$/);
-          let lastMessageAt = (/* @__PURE__ */ new Date()).toISOString();
-          try {
-            if (chat.lastMessageTime && chat.lastMessageTime > 0) {
-              const d = new Date(chat.lastMessageTime);
-              if (!isNaN(d.getTime())) lastMessageAt = d.toISOString();
-            }
-          } catch {
-          }
-          insertConv.run({
-            phone,
-            contact_name: chat.name || chat.contactName || chat.pushName || phone,
-            last_message: chat.lastMessage || chat.body || "",
-            last_message_at: lastMessageAt,
-            unread_count: parseInt(chat.messagesUnread || chat.unreadMessages || chat.unread || "0", 10) || 0,
-            is_group: isGroup ? 1 : 0
-          });
-          totalSynced++;
-        }
-      });
-      insertMany(chats);
-      if (chats.length < pageSize) break;
-      page++;
-    } catch (err) {
-      console.error(`[ZAPI] Sync error page ${page}:`, err);
-      break;
-    }
-  }
-  console.log(`[ZAPI] Synced ${totalSynced} contacts`);
-  return totalSynced;
-}
+// server/routes.ts
+init_zapi();
 
 // server/sse.ts
 var clients = [];
@@ -24339,6 +24376,7 @@ function getClientCount() {
 }
 
 // server/polling.ts
+init_zapi();
 var pollingInterval = null;
 var isRunning = false;
 async function runPollingCycle() {
@@ -24772,6 +24810,7 @@ function getQueueStats() {
 
 // server/chatbot.ts
 init_db();
+init_zapi();
 var ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
 var ANTHROPIC_VERSION = "2023-06-01";
 var DEFAULT_MODEL = "claude-sonnet-4-6";
@@ -24833,7 +24872,7 @@ function shouldNotifyControl() {
   if (m === "always") return true;
   return !isBusinessHoursRome();
 }
-var SYSTEM_PROMPT = `Sei l'assistente virtuale di AB STUDIO SRL (Studio Tributario Branca),
+var SYSTEM_PROMPT = `Sei l'assistente virtuale dello Studio Tributario Branca,
 studio di commercialista/tributarista, consulente del lavoro e amministratore di condominio.
 Titolare: Dott. Mariano Branca \u2014 Via Operai 102, 98051 Barcellona P.G. (ME).
 
@@ -24864,7 +24903,7 @@ REGOLE INDEROGABILI:
    NON gestirle da sola \u2192 chiama need_human; rassicura che il Dott. Branca verr\xE0 avvisato
    subito e chiedi copia dell'atto.
 4. Documenti/foto: conferma la ricezione e indica che verranno valutati.
-5. Firma sempre: "Assistente Virtuale \u2014 AB STUDIO SRL".
+5. Firma sempre: "Assistente Virtuale \u2014 Studio Tributario Branca".
 6. Resta SEMPRE sui temi dello studio: NON aggiungere chiacchiere personali, social o
    battute tratte dalla cronologia (inviti, eventi privati, vacanze, ecc.).
 7. MOLTI clienti sono anche amici e mescolano lavoro e chiacchiere personali. Occupati
@@ -25194,6 +25233,7 @@ Rispondi "OK ${id} FORZA" per confermare comunque l'appuntamento.`;
 
 // server/maintenance.ts
 init_db();
+init_zapi();
 var PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://wa-cruscotto-v2-production.up.railway.app";
 var WEBHOOK_URL = `${PUBLIC_BASE_URL}/api/webhook/message`;
 var STALE_MINUTES = 180;
@@ -25258,6 +25298,10 @@ ${lines.join("\n").slice(0, 7500)}` : "Nessuna comunicazione WhatsApp registrata
 async function runDailyDigest(dateISO) {
   const date = dateISO || romeNow().iso;
   const { title, description, total } = buildDigest(date);
+  if (total === 0) {
+    setSetting2(`digest_done_${date}`, "1");
+    return { ok: true, date, total: 0, skipped: true };
+  }
   const prevId = getSetting2(`digest_event_${date}`);
   const r = await upsertAllDayEvent({ title, description, date, eventId: prevId });
   if (r.success && r.eventId) {
@@ -25967,14 +26011,23 @@ Da confermare.`,
         }
       });
     }
+    if (!isGroup && content && content.trim().length > 2) {
+      const fromControl = fromMe || phone === getControlNumber();
+      if (fromControl) {
+        setImmediate(async () => {
+          try {
+            const reply = await handleControlCommand(content);
+            if (reply) await sendTextMessage(getControlNumber(), reply);
+          } catch (e) {
+            console.error("[Chatbot] Comando controllo:", e.message);
+          }
+        });
+      }
+    }
     if (!fromMe && !isGroup && content && content.trim().length > 2 && isBotEnabled()) {
       setImmediate(async () => {
         try {
-          if (phone === getControlNumber()) {
-            const reply = await handleControlCommand(content);
-            if (reply) await sendTextMessage(phone, reply);
-            return;
-          }
+          if (phone === getControlNumber()) return;
           const c = db_default.prepare(`SELECT contact_name, priority FROM conversations WHERE phone = ?`).get(phone);
           const pr = c?.priority || "none";
           if (pr === "vip" || pr === "high") return;
@@ -26323,8 +26376,64 @@ router.post("/bot/daily-digest", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+router.post("/bot/backfill-digest", async (req, res) => {
+  const days = Math.min(Math.max(parseInt(String(req.query.days || req.body?.days || "60"), 10) || 60, 1), 366);
+  const written = [];
+  const today = /* @__PURE__ */ new Date();
+  for (let i = 0; i <= days; i++) {
+    const d = new Date(today);
+    d.setDate(today.getDate() - i);
+    const iso = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Rome" }).format(d);
+    try {
+      const r = await runDailyDigest(iso);
+      if (r.ok && r.total > 0) written.push({ date: iso, total: r.total });
+    } catch (e) {
+      written.push({ date: iso, error: e.message });
+    }
+  }
+  res.json({ daysScanned: days + 1, eventsWritten: written.length, days: written });
+});
 router.get("/bot/flow-health", (_req, res) => {
   res.json(getFlowHealth());
+});
+router.get("/bot/zapi-info", async (_req, res) => {
+  const out = { controlNumber: getControlNumber() };
+  for (const ep of ["device", "status"]) {
+    try {
+      out[ep] = await zapiGet(ep);
+    } catch (e) {
+      out[ep] = { error: e.message };
+    }
+  }
+  try {
+    out.receivedWebhook = await getReceivedWebhook();
+  } catch (e) {
+    out.receivedWebhook = { error: e.message };
+  }
+  try {
+    out.webhooksRaw = await zapiGet("webhooks");
+  } catch (e) {
+    out.webhooksRaw = { error: e.message };
+  }
+  res.json(out);
+});
+router.post("/bot/enable-self-commands", async (_req, res) => {
+  const base = process.env.PUBLIC_BASE_URL || "https://wa-cruscotto-v2-production.up.railway.app";
+  const url = `${base}/api/webhook/message`;
+  const results = {};
+  const { zapiPut: zapiPut2 } = await Promise.resolve().then(() => (init_zapi(), zapi_exports));
+  const attempts = [
+    ["update-webhook-received", { value: url, notifySentByMe: true }],
+    ["update-webhook-received", { value: url }]
+  ];
+  for (const [path3, body] of attempts) {
+    try {
+      results[`PUT ${path3} ${JSON.stringify(body)}`] = await zapiPut2(path3, body);
+    } catch (e) {
+      results[`PUT ${path3} ${JSON.stringify(body)}`] = { error: e.message };
+    }
+  }
+  res.json({ webhook: url, results });
 });
 router.post("/bot/repair-webhook", async (_req, res) => {
   try {

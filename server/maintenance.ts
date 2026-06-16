@@ -88,9 +88,10 @@ export function buildDigest(dateISO: string): { title: string; description: stri
   return { title, description, total, contacts };
 }
 
-export async function runDailyDigest(dateISO?: string): Promise<{ ok: boolean; date: string; total: number; eventId?: string; error?: string }> {
+export async function runDailyDigest(dateISO?: string): Promise<{ ok: boolean; date: string; total: number; eventId?: string; error?: string; skipped?: boolean }> {
   const date = dateISO || romeNow().iso;
   const { title, description, total } = buildDigest(date);
+  if (total === 0) { setSetting(`digest_done_${date}`, '1'); return { ok: true, date, total: 0, skipped: true }; }
   const prevId = getSetting(`digest_event_${date}`);
   const r = await upsertAllDayEvent({ title, description, date, eventId: prevId });
   if (r.success && r.eventId) {
