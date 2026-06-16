@@ -25082,9 +25082,12 @@ function isBusinessHours() {
 }
 function buildDigest(dateISO) {
   const rows = db_default.prepare(`
-    SELECT phone, contact_name, is_group, direction, content, timestamp
-    FROM live_messages WHERE substr(timestamp, 1, 10) = ?
-    ORDER BY timestamp ASC
+    SELECT lm.phone, lm.contact_name, lm.is_group, lm.direction, lm.content, lm.timestamp
+    FROM live_messages lm
+    LEFT JOIN conversations c ON c.phone = lm.phone
+    WHERE substr(lm.timestamp, 1, 10) = ?
+      AND COALESCE(c.priority, 'none') NOT IN ('vip', 'high')
+    ORDER BY lm.timestamp ASC
   `).all(dateISO);
   const byPhone = {};
   for (const r of rows) {
