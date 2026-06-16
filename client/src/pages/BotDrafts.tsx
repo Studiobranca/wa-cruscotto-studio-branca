@@ -14,7 +14,7 @@ interface Draft {
   created_at: string;
 }
 
-interface BotConfig { enabled: boolean; model: string; }
+interface BotConfig { enabled: boolean; model: string; notifyMode?: string; controlNumber?: string; }
 
 const DOW = ['domenica', 'lunedì', 'martedì', 'mercoledì', 'giovedì', 'venerdì', 'sabato'];
 function fmtDate(d: string): string {
@@ -80,6 +80,17 @@ export default function BotDrafts() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['bot-config'] }),
   });
 
+  const setNotify = useMutation({
+    mutationFn: async (notifyMode: string) => {
+      const r = await fetch(`${getApiBase()}/api/bot/config`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ notifyMode }),
+      });
+      return r.json();
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['bot-config'] }),
+  });
+
   return (
     <div className="page-container">
       <header className="page-header">
@@ -104,6 +115,19 @@ export default function BotDrafts() {
               onChange={(e) => toggle.mutate(e.target.checked)} />
             <span className="toggle-slider" />
           </label>
+        </div>
+        <div style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid #eee', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' }}>
+          <div style={{ fontSize: 13, color: '#555' }}>
+            Avvisami su WhatsApp{config?.controlNumber ? ` (${config.controlNumber})` : ''}
+          </div>
+          <select
+            value={config?.notifyMode ?? 'outside_hours'}
+            onChange={(e) => setNotify.mutate(e.target.value)}
+            style={{ padding: '6px 10px', borderRadius: 8, border: '1px solid #ddd', fontSize: 13 }}>
+            <option value="outside_hours">Solo fuori orario (sere/weekend)</option>
+            <option value="always">Sempre</option>
+            <option value="off">Mai (solo Cruscotto)</option>
+          </select>
         </div>
       </div>
 
