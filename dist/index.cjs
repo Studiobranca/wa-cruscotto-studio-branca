@@ -24844,8 +24844,14 @@ REGOLE INDEROGABILI:
    subito e chiedi copia dell'atto.
 4. Documenti/foto: conferma la ricezione e indica che verranno valutati.
 5. Firma sempre: "Assistente Virtuale \u2014 AB STUDIO SRL".
+6. Resta SEMPRE sui temi dello studio: NON aggiungere chiacchiere personali, social o
+   battute tratte dalla cronologia (inviti, eventi privati, vacanze, ecc.).
+7. Se la conversazione \xE8 chiaramente privata / non rivolta allo studio, NON inventare una
+   risposta: usa need_human con motivo "conversazione non pertinente" e scrivi un messaggio
+   neutro e brevissimo (o nulla di pi\xF9 della firma).
 
-Produci come messaggio finale SOLO il testo da inviare al cliente (niente preamboli).`;
+Il tuo output finale deve contenere ESCLUSIVAMENTE il testo del messaggio da inviare al
+cliente: NIENTE analisi, premesse, ragionamenti o commenti tra parentesi.`;
 var TOOLS = [
   {
     name: "get_availability",
