@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import db from './db.js';
 import { getAvailability, formatAvailabilityIT, isSlotBusy } from './appointments.js';
-import { sendTextMessage, syncContacts } from './zapi.js';
+import { sendTextMessage, syncContacts, zapiGet, getReceivedWebhook } from './zapi.js';
 import { addSSEClient, broadcastEvent, getClientCount } from './sse.js';
 import { startPolling, stopPolling, isPollingRunning } from './polling.js';
 import {
@@ -770,16 +770,27 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
     // Genera una bozza SOLO per i clienti di lavoro: niente messaggi propri,
     // gruppi o VIP/high (viplist gestita da Mariano). Non invia nulla: la bozza
     // resta in attesa di approvazione nel Cruscotto.
+    // ─── Comando di controllo da Mariano via WhatsApp ───────────────────────
+    // Funziona sia se lo studio WhatsApp è il NUMERO STESSO di Mariano (il comando
+    // arriva come 'fromMe'), sia se il numero di controllo è separato (comando
+    // 'received'). handleControlCommand ignora i messaggi che non sono comandi.
+    if (!isGroup && content && content.trim().length > 2) {
+      const fromControl = fromMe || phone === getControlNumber();
+      if (fromControl) {
+        setImmediate(async () => {
+          try {
+            const reply = await handleControlCommand(content);
+            if (reply) await sendTextMessage(getControlNumber(), reply);
+          } catch (e: any) { console.error('[Chatbot] Comando controllo:', e.message); }
+        });
+      }
+    }
+
     if (!fromMe && !isGroup && content && content.trim().length > 2 && isBotEnabled()) {
       setImmediate(async () => {
         try {
-          // Numero di controllo (Mariano): se risponde con un comando (OK/NO <id>),
-          // approva/rifiuta la bozza da WhatsApp. Mai generare bozze per questo numero.
-          if (phone === getControlNumber()) {
-            const reply = await handleControlCommand(content);
-            if (reply) await sendTextMessage(phone, reply);
-            return;
-          }
+          // Mai generare bozze per il numero di controllo (Mariano stesso).
+          if (phone === getControlNumber()) return;
           const c = db.prepare(`SELECT contact_name, priority FROM conversations WHERE phone = ?`).get(phone) as any;
           const pr = (c?.priority || 'none');
           if (pr === 'vip' || pr === 'high') return; // viplist → gestisce Mariano
@@ -1216,6 +1227,17 @@ router.post('/bot/daily-digest', async (req: Request, res: Response) => {
 
 router.get('/bot/flow-health', (_req: Request, res: Response) => {
   res.json(getFlowHealth());
+});
+
+// Diagnostica: numero WhatsApp collegato + webhook configurato (per capire se i
+// comandi di Mariano arrivano come 'fromMe' — studio = suo numero — o 'received').
+router.get('/bot/zapi-info', async (_req: Request, res: Response) => {
+  const out: any = { controlNumber: getControlNumber() };
+  for (const ep of ['device', 'status']) {
+    try { out[ep] = await zapiGet(ep); } catch (e: any) { out[ep] = { error: e.message }; }
+  }
+  try { out.receivedWebhook = await getReceivedWebhook(); } catch (e: any) { out.receivedWebhook = { error: e.message }; }
+  res.json(out);
 });
 
 router.post('/bot/repair-webhook', async (_req: Request, res: Response) => {

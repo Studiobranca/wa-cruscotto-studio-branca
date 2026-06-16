@@ -25967,14 +25967,23 @@ Da confermare.`,
         }
       });
     }
+    if (!isGroup && content && content.trim().length > 2) {
+      const fromControl = fromMe || phone === getControlNumber();
+      if (fromControl) {
+        setImmediate(async () => {
+          try {
+            const reply = await handleControlCommand(content);
+            if (reply) await sendTextMessage(getControlNumber(), reply);
+          } catch (e) {
+            console.error("[Chatbot] Comando controllo:", e.message);
+          }
+        });
+      }
+    }
     if (!fromMe && !isGroup && content && content.trim().length > 2 && isBotEnabled()) {
       setImmediate(async () => {
         try {
-          if (phone === getControlNumber()) {
-            const reply = await handleControlCommand(content);
-            if (reply) await sendTextMessage(phone, reply);
-            return;
-          }
+          if (phone === getControlNumber()) return;
           const c = db_default.prepare(`SELECT contact_name, priority FROM conversations WHERE phone = ?`).get(phone);
           const pr = c?.priority || "none";
           if (pr === "vip" || pr === "high") return;
@@ -26325,6 +26334,22 @@ router.post("/bot/daily-digest", async (req, res) => {
 });
 router.get("/bot/flow-health", (_req, res) => {
   res.json(getFlowHealth());
+});
+router.get("/bot/zapi-info", async (_req, res) => {
+  const out = { controlNumber: getControlNumber() };
+  for (const ep of ["device", "status"]) {
+    try {
+      out[ep] = await zapiGet(ep);
+    } catch (e) {
+      out[ep] = { error: e.message };
+    }
+  }
+  try {
+    out.receivedWebhook = await getReceivedWebhook();
+  } catch (e) {
+    out.receivedWebhook = { error: e.message };
+  }
+  res.json(out);
 });
 router.post("/bot/repair-webhook", async (_req, res) => {
   try {
