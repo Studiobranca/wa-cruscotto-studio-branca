@@ -24872,7 +24872,7 @@ function shouldNotifyControl() {
   if (m === "always") return true;
   return !isBusinessHoursRome();
 }
-var SYSTEM_PROMPT = `Sei l'assistente virtuale di AB STUDIO SRL (Studio Tributario Branca),
+var SYSTEM_PROMPT = `Sei l'assistente virtuale dello Studio Tributario Branca,
 studio di commercialista/tributarista, consulente del lavoro e amministratore di condominio.
 Titolare: Dott. Mariano Branca \u2014 Via Operai 102, 98051 Barcellona P.G. (ME).
 
@@ -24903,7 +24903,7 @@ REGOLE INDEROGABILI:
    NON gestirle da sola \u2192 chiama need_human; rassicura che il Dott. Branca verr\xE0 avvisato
    subito e chiedi copia dell'atto.
 4. Documenti/foto: conferma la ricezione e indica che verranno valutati.
-5. Firma sempre: "Assistente Virtuale \u2014 AB STUDIO SRL".
+5. Firma sempre: "Assistente Virtuale \u2014 Studio Tributario Branca".
 6. Resta SEMPRE sui temi dello studio: NON aggiungere chiacchiere personali, social o
    battute tratte dalla cronologia (inviti, eventi privati, vacanze, ecc.).
 7. MOLTI clienti sono anche amici e mescolano lavoro e chiacchiere personali. Occupati
@@ -25298,6 +25298,10 @@ ${lines.join("\n").slice(0, 7500)}` : "Nessuna comunicazione WhatsApp registrata
 async function runDailyDigest(dateISO) {
   const date = dateISO || romeNow().iso;
   const { title, description, total } = buildDigest(date);
+  if (total === 0) {
+    setSetting2(`digest_done_${date}`, "1");
+    return { ok: true, date, total: 0, skipped: true };
+  }
   const prevId = getSetting2(`digest_event_${date}`);
   const r = await upsertAllDayEvent({ title, description, date, eventId: prevId });
   if (r.success && r.eventId) {
@@ -26371,6 +26375,23 @@ router.post("/bot/daily-digest", async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+router.post("/bot/backfill-digest", async (req, res) => {
+  const days = Math.min(Math.max(parseInt(String(req.query.days || req.body?.days || "60"), 10) || 60, 1), 366);
+  const written = [];
+  const today = /* @__PURE__ */ new Date();
+  for (let i = 0; i <= days; i++) {
+    const d = new Date(today);
+    d.setDate(today.getDate() - i);
+    const iso = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Rome" }).format(d);
+    try {
+      const r = await runDailyDigest(iso);
+      if (r.ok && r.total > 0) written.push({ date: iso, total: r.total });
+    } catch (e) {
+      written.push({ date: iso, error: e.message });
+    }
+  }
+  res.json({ daysScanned: days + 1, eventsWritten: written.length, days: written });
 });
 router.get("/bot/flow-health", (_req, res) => {
   res.json(getFlowHealth());

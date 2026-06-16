@@ -1225,6 +1225,23 @@ router.post('/bot/daily-digest', async (req: Request, res: Response) => {
   }
 });
 
+// Backfill: annota sull'agenda anche i giorni passati (arretrato). Salta i giorni
+// senza messaggi di lavoro. days = quanti giorni indietro (oggi incluso).
+router.post('/bot/backfill-digest', async (req: Request, res: Response) => {
+  const days = Math.min(Math.max(parseInt(String((req.query.days as string) || req.body?.days || '60'), 10) || 60, 1), 366);
+  const written: any[] = [];
+  const today = new Date();
+  for (let i = 0; i <= days; i++) {
+    const d = new Date(today); d.setDate(today.getDate() - i);
+    const iso = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Rome' }).format(d);
+    try {
+      const r = await runDailyDigest(iso);
+      if (r.ok && r.total > 0) written.push({ date: iso, total: r.total });
+    } catch (e: any) { written.push({ date: iso, error: e.message }); }
+  }
+  res.json({ daysScanned: days + 1, eventsWritten: written.length, days: written });
+});
+
 router.get('/bot/flow-health', (_req: Request, res: Response) => {
   res.json(getFlowHealth());
 });
