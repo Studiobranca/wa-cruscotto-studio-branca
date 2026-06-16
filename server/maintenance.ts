@@ -47,10 +47,15 @@ function isBusinessHours(): boolean {
 
 // ═══ 1) DIGEST GIORNALIERO ═══════════════════════════════════════════════════
 export function buildDigest(dateISO: string): { title: string; description: string; total: number; contacts: number } {
+  // Esclude i contatti VIP/high (viplist = familiari/privati): non vanno annotati
+  // nell'agenda di lavoro.
   const rows = db.prepare(`
-    SELECT phone, contact_name, is_group, direction, content, timestamp
-    FROM live_messages WHERE substr(timestamp, 1, 10) = ?
-    ORDER BY timestamp ASC
+    SELECT lm.phone, lm.contact_name, lm.is_group, lm.direction, lm.content, lm.timestamp
+    FROM live_messages lm
+    LEFT JOIN conversations c ON c.phone = lm.phone
+    WHERE substr(lm.timestamp, 1, 10) = ?
+      AND COALESCE(c.priority, 'none') NOT IN ('vip', 'high')
+    ORDER BY lm.timestamp ASC
   `).all(dateISO) as any[];
 
   const byPhone: Record<string, { name: string; group: boolean; rx: number; tx: number; last: string }> = {};
