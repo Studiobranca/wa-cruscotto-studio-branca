@@ -58,9 +58,17 @@ export function buildDigest(dateISO: string): { title: string; description: stri
     ORDER BY lm.timestamp ASC
   `).all(dateISO) as any[];
 
+  // Riporta SOLO il lavoro: escludi i numeri la cui attività del giorno è stata
+  // classificata personale (e mai lavoro) dal chatbot — utile per i contatti
+  // amico+cliente che mescolano chiacchiere e pratiche.
+  const cls = db.prepare(`SELECT phone, kind FROM bot_msg_class WHERE day = ?`).all(dateISO) as any[];
+  const workPhones = new Set(cls.filter((c) => c.kind === 'work').map((c) => c.phone));
+  const personalOnly = new Set(cls.filter((c) => c.kind === 'personal' && !workPhones.has(c.phone)).map((c) => c.phone));
+
   const byPhone: Record<string, { name: string; group: boolean; rx: number; tx: number; last: string }> = {};
   for (const r of rows) {
     const k = r.phone;
+    if (personalOnly.has(k)) continue; // chat personale del giorno → non riportare
     if (!byPhone[k]) byPhone[k] = { name: r.contact_name || r.phone, group: !!r.is_group, rx: 0, tx: 0, last: '' };
     if (r.direction === 'sent') byPhone[k].tx++; else byPhone[k].rx++;
     if (r.content) byPhone[k].last = String(r.content).replace(/\n+/g, ' ').slice(0, 60);
@@ -69,7 +77,7 @@ export function buildDigest(dateISO: string): { title: string; description: stri
   const lines = entries.map(([phone, v]) =>
     `• ${v.name}${v.group ? ' [GRUPPO]' : ''} — ${v.rx} ricevuti${v.tx ? `, ${v.tx} inviati` : ''}${v.last ? `: "${v.last}"` : ''}`
   );
-  const total = rows.length;
+  const total = entries.reduce((s, [, v]) => s + v.rx + v.tx, 0); // solo i messaggi riportati (no personali)
   const contacts = entries.length;
   const title = `📱 WhatsApp ${dateISO}: ${total} msg · ${contacts} contatti`;
   const description = entries.length

@@ -87,9 +87,10 @@ REGOLE INDEROGABILI:
 5. Firma sempre: "Assistente Virtuale — AB STUDIO SRL".
 6. Resta SEMPRE sui temi dello studio: NON aggiungere chiacchiere personali, social o
    battute tratte dalla cronologia (inviti, eventi privati, vacanze, ecc.).
-7. Se la conversazione è chiaramente privata / non rivolta allo studio, NON inventare una
-   risposta: usa need_human con motivo "conversazione non pertinente" e scrivi un messaggio
-   neutro e brevissimo (o nulla di più della firma).
+7. MOLTI clienti sono anche amici e mescolano lavoro e chiacchiere personali. Occupati
+   SOLO del lavoro. Se l'ultimo messaggio del cliente NON contiene una richiesta/argomento
+   di studio (è solo personale, sociale, off-topic), chiama ignore_personal e NON produrre
+   alcun messaggio: di quella chat lo studio non si occupa.
 
 Il tuo output finale deve contenere ESCLUSIVAMENTE il testo del messaggio da inviare al
 cliente: NIENTE analisi, premesse, ragionamenti o commenti tra parentesi.`;
@@ -126,6 +127,15 @@ const TOOLS = [
     },
   },
   {
+    name: 'ignore_personal',
+    description: 'Segnala che il messaggio è personale/non rivolto allo studio (chiacchiere, social, off-topic). Lo studio non se ne occupa: NON verrà prodotta alcuna risposta.',
+    input_schema: {
+      type: 'object',
+      properties: { reason: { type: 'string', description: 'Perché è personale/non pertinente' } },
+      required: ['reason'],
+    },
+  },
+  {
     name: 'find_previous_requests',
     description: 'Cerca nello storico dei messaggi del cliente se aveva già inviato lo stesso documento o fatto la stessa richiesta in passato. Usalo SEMPRE prima di rispondere a una richiesta/invio documenti.',
     input_schema: {
@@ -158,6 +168,31 @@ interface DraftResult {
   proposedEvent: { date: string; start: string; end: string; reason: string } | null;
   needsHuman: boolean;
   humanReason?: string;
+  personal?: boolean;
+}
+
+// Esito della generazione: 'work' (bozza da approvare) o 'personal' (chat privata,
+// nessuna azione/bozza). null = il bot non ha potuto operare.
+export interface DraftOutcome {
+  kind: 'work' | 'personal';
+  result: DraftResult | null;
+}
+
+// Classificazione per-messaggio (lavoro/personale) usata dal digest per riportare
+// SOLO il lavoro, anche sui contatti misti amico+cliente.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS bot_msg_class (
+    message_id TEXT PRIMARY KEY,
+    phone TEXT,
+    day TEXT,
+    kind TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_bot_msg_class_day ON bot_msg_class(day);
+`);
+export function recordClassification(messageId: string, phone: string, day: string, kind: 'work' | 'personal'): void {
+  if (!messageId) return;
+  db.prepare(`INSERT OR REPLACE INTO bot_msg_class (message_id, phone, day, kind) VALUES (?, ?, ?, ?)`).run(messageId, phone, day, kind);
 }
 
 function endTime(start: string): string {
@@ -207,6 +242,10 @@ async function runTool(name: string, input: any, out: DraftResult, phone: string
     out.humanReason = String(input?.reason || '');
     return 'Segnalato al Dott. Branca. Scrivi al cliente un messaggio rassicurante (verrà ricontattato al più presto).';
   }
+  if (name === 'ignore_personal') {
+    out.personal = true;
+    return 'Ok: messaggio personale/non pertinente. NON produrre alcuna risposta.';
+  }
   return 'Strumento sconosciuto.';
 }
 
@@ -214,7 +253,7 @@ async function runTool(name: string, input: any, out: DraftResult, phone: string
  * Genera la bozza di risposta. Ritorna null se il bot non può operare
  * (manca ANTHROPIC_API_KEY) o se non produce testo.
  */
-export async function generateDraft(phone: string, contactName: string): Promise<DraftResult | null> {
+export async function generateDraft(phone: string, contactName: string): Promise<DraftOutcome | null> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
     console.warn('[Chatbot] ANTHROPIC_API_KEY non configurata: bozza non generata.');
@@ -280,8 +319,9 @@ export async function generateDraft(phone: string, contactName: string): Promise
     break; // end_turn
   }
 
+  if (out.personal) return { kind: 'personal', result: null }; // chat privata → nessuna bozza
   if (!out.draftText) return null;
-  return out;
+  return { kind: 'work', result: out };
 }
 
 // ─── CRUD bozze ──────────────────────────────────────────────────────────────
