@@ -24816,8 +24816,8 @@ function getControlNumber() {
   return (getSetting("control_number", "") || process.env.CONTROL_WHATSAPP || "393457050479").replace(/\D/g, "");
 }
 function getNotifyMode() {
-  const m = getSetting("notify_mode", "outside_hours");
-  return m === "off" || m === "always" ? m : "outside_hours";
+  const m = getSetting("notify_mode", "always");
+  return m === "off" || m === "outside_hours" ? m : "always";
 }
 function isBusinessHoursRome() {
   const now = /* @__PURE__ */ new Date();

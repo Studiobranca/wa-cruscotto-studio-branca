@@ -60,9 +60,11 @@ export function getControlNumber(): string {
   return (getSetting('control_number', '') || process.env.CONTROL_WHATSAPP || '393457050479').replace(/\D/g, '');
 }
 // Quando inviare la notifica WhatsApp delle bozze a Mariano.
+// Default 'always' (scelta utente): ogni bozza viene notificata su WhatsApp; Mariano
+// risponde da WhatsApp oppure dal Cruscotto.
 export function getNotifyMode(): 'off' | 'outside_hours' | 'always' {
-  const m = getSetting('notify_mode', 'outside_hours');
-  return (m === 'off' || m === 'always') ? m : 'outside_hours';
+  const m = getSetting('notify_mode', 'always');
+  return (m === 'off' || m === 'outside_hours') ? m : 'always';
 }
 function isBusinessHoursRome(): boolean {
   const now = new Date();
@@ -72,8 +74,8 @@ function isBusinessHoursRome(): boolean {
   if (dow === 0 || dow === 6) return false;
   return (hour >= 9 && hour < 13) || (hour >= 15 && hour < 19);
 }
-// Default 'outside_hours': niente notifiche WhatsApp nei feriali in orario di studio
-// (lì si usa il Cruscotto); sì la sera, nei weekend e nelle feste.
+// Default 'always': ogni bozza è notificata su WhatsApp. ('outside_hours' = solo
+// fuori orario di studio; 'off' = mai, solo Cruscotto.)
 export function shouldNotifyControl(): boolean {
   const m = getNotifyMode();
   if (m === 'off') return false;
