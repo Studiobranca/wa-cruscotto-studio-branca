@@ -24812,6 +24812,27 @@ function isBotEnabled() {
 function getBotModel() {
   return getSetting("bot_model", DEFAULT_MODEL);
 }
+function getControlNumber() {
+  return (getSetting("control_number", "") || process.env.CONTROL_WHATSAPP || "393457050479").replace(/\D/g, "");
+}
+function getNotifyMode() {
+  const m = getSetting("notify_mode", "outside_hours");
+  return m === "off" || m === "always" ? m : "outside_hours";
+}
+function isBusinessHoursRome() {
+  const now = /* @__PURE__ */ new Date();
+  const hour = parseInt(new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Rome", hour: "2-digit", hour12: false }).format(now), 10);
+  const wd = new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Rome", weekday: "short" }).format(now);
+  const dow = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(wd);
+  if (dow === 0 || dow === 6) return false;
+  return hour >= 9 && hour < 13 || hour >= 15 && hour < 19;
+}
+function shouldNotifyControl() {
+  const m = getNotifyMode();
+  if (m === "off") return false;
+  if (m === "always") return true;
+  return !isBusinessHoursRome();
+}
 var SYSTEM_PROMPT = `Sei l'assistente virtuale di AB STUDIO SRL (Studio Tributario Branca),
 studio di commercialista/tributarista, consulente del lavoro e amministratore di condominio.
 Titolare: Dott. Mariano Branca \u2014 Via Operai 102, 98051 Barcellona P.G. (ME).
@@ -25085,6 +25106,91 @@ function markDraftSent(id) {
 function markDraftRejected(id) {
   db_default.prepare(`UPDATE bot_drafts SET status = 'rejected' WHERE id = ?`).run(id);
 }
+async function approveDraftCore(id, opts) {
+  const d = getDraft(id);
+  if (!d) return { ok: false, status: 404, message: "Bozza non trovata" };
+  if (d.status !== "pending") return { ok: false, status: 400, message: "Bozza gi\xE0 gestita" };
+  const finalText = opts.text && String(opts.text).trim() || d.draft_text;
+  if (d.proposed_event && !opts.force) {
+    const ev = d.proposed_event;
+    const { busy, checked } = await isSlotBusy(ev.date, ev.start, ev.end);
+    if (busy && checked) {
+      return {
+        ok: false,
+        status: 409,
+        conflict: true,
+        contactName: d.contact_name,
+        message: `Risulti impegnato ${ev.date} alle ${ev.start}.`
+      };
+    }
+  }
+  await sendTextMessage(d.phone, finalText);
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  db_default.prepare(`
+    INSERT OR IGNORE INTO live_messages
+      (message_id, phone, contact_name, content, direction, timestamp, is_read, created_at)
+    VALUES (?, ?, ?, ?, 'sent', ?, 1, ?)
+  `).run(`bot_${Date.now()}`, d.phone, d.contact_name || d.phone, finalText, now, now);
+  let calendar = null;
+  if (d.proposed_event) {
+    const ev = d.proposed_event;
+    calendar = await createCalendarEvent({
+      title: `[DA CONFERMARE] ${ev.reason} \u2014 ${d.contact_name || d.phone}`,
+      description: `Appuntamento proposto dal chatbot WhatsApp.
+Cliente: ${d.contact_name || ""} (${d.phone})
+Motivo: ${ev.reason}
+
+\u26A0\uFE0F Confermare con il cliente.`,
+      startDate: `${ev.date}T${ev.start}:00`,
+      endDate: `${ev.date}T${ev.end}:00`
+    });
+  }
+  markDraftSent(id);
+  broadcastEvent("message", { type: "sent", phone: d.phone, contactName: d.contact_name, content: finalText, timestamp: now });
+  return { ok: true, status: 200, calendar, contactName: d.contact_name, hadEvent: !!d.proposed_event };
+}
+async function notifyDraftToControl(id) {
+  const d = getDraft(id);
+  if (!d) return;
+  const parts = [`\u{1F195} Bozza #${d.id} \u2014 ${d.contact_name || d.phone}`];
+  if (d.needs_human) parts.push("\u26A0\uFE0F URGENTE / da gestire di persona");
+  if (d.incoming_excerpt) parts.push(`Cliente: "${d.incoming_excerpt}"`);
+  if (d.proposed_event) parts.push(`\u{1F4C5} Appuntamento: ${d.proposed_event.date} ore ${d.proposed_event.start} \u2014 ${d.proposed_event.reason} (DA CONFERMARE)`);
+  parts.push(`
+Bozza:
+\xAB${d.draft_text}\xBB`);
+  parts.push(`
+\u{1F449} Per inviare: OK ${d.id}
+\u{1F449} Per rifiutare: NO ${d.id}
+\u{1F449} Per modificare: OK ${d.id} <nuovo testo>`);
+  try {
+    await sendTextMessage(getControlNumber(), parts.join("\n"));
+  } catch (e) {
+    console.error("[Chatbot] notifica WhatsApp fallita:", e.message);
+  }
+}
+async function handleControlCommand(text) {
+  const m = (text || "").trim().match(/^(ok|sì|si|approva|invia|conferma|no|rifiuta|scarta)\s+#?(\d+)\s*([\s\S]*)$/i);
+  if (!m) return null;
+  const verb = m[1].toLowerCase();
+  const id = parseInt(m[2], 10);
+  const rest = (m[3] || "").trim();
+  const isReject = ["no", "rifiuta", "scarta"].includes(verb);
+  const d = getDraft(id);
+  if (!d) return `\u2753 Bozza #${id} non trovata.`;
+  if (d.status !== "pending") return `\u2139\uFE0F Bozza #${id} gi\xE0 gestita.`;
+  if (isReject) {
+    markDraftRejected(id);
+    return `\u{1F5D1}\uFE0F Bozza #${id} (${d.contact_name || d.phone}) rifiutata.`;
+  }
+  const force = /^(forza|conferma)$/i.test(rest);
+  const edited = !force && rest ? rest : void 0;
+  const r = await approveDraftCore(id, { text: edited, force });
+  if (r.conflict) return `\u26A0\uFE0F ${r.message}
+Rispondi "OK ${id} FORZA" per confermare comunque l'appuntamento.`;
+  if (!r.ok) return `\u274C ${r.message}`;
+  return `\u2705 Inviato a ${r.contactName || d.phone}.${r.hadEvent ? " Appuntamento [DA CONFERMARE] in agenda." : ""}`;
+}
 
 // server/maintenance.ts
 init_db();
@@ -25127,10 +25233,11 @@ function buildDigest(dateISO) {
   const cls = db_default.prepare(`SELECT phone, kind FROM bot_msg_class WHERE day = ?`).all(dateISO);
   const workPhones = new Set(cls.filter((c) => c.kind === "work").map((c) => c.phone));
   const personalOnly = new Set(cls.filter((c) => c.kind === "personal" && !workPhones.has(c.phone)).map((c) => c.phone));
+  const control = getControlNumber();
   const byPhone = {};
   for (const r of rows) {
     const k = r.phone;
-    if (personalOnly.has(k)) continue;
+    if (personalOnly.has(k) || k === control) continue;
     if (!byPhone[k]) byPhone[k] = { name: r.contact_name || r.phone, group: !!r.is_group, rx: 0, tx: 0, last: "" };
     if (r.direction === "sent") byPhone[k].tx++;
     else byPhone[k].rx++;
@@ -25863,6 +25970,11 @@ Da confermare.`,
     if (!fromMe && !isGroup && content && content.trim().length > 2 && isBotEnabled()) {
       setImmediate(async () => {
         try {
+          if (phone === getControlNumber()) {
+            const reply = await handleControlCommand(content);
+            if (reply) await sendTextMessage(phone, reply);
+            return;
+          }
           const c = db_default.prepare(`SELECT contact_name, priority FROM conversations WHERE phone = ?`).get(phone);
           const pr = c?.priority || "none";
           if (pr === "vip" || pr === "high") return;
@@ -25877,6 +25989,7 @@ Da confermare.`,
             const id = saveDraft({ phone, contactName: cName, incoming: content, result: outcome.result });
             broadcastEvent("bot_draft", { id, phone, contactName: cName, needsHuman: outcome.result.needsHuman });
             console.log(`[Chatbot] Bozza #${id} per ${cName} (${phone})${outcome.result.needsHuman ? " [need_human]" : ""}`);
+            if (shouldNotifyControl()) await notifyDraftToControl(id);
           }
         } catch (botErr) {
           console.error("[Chatbot] Error:", botErr.message);
@@ -26164,14 +26277,16 @@ router.get("/bot/drafts", (_req, res) => {
   }
 });
 router.get("/bot/config", (_req, res) => {
-  res.json({ enabled: isBotEnabled(), model: getBotModel() });
+  res.json({ enabled: isBotEnabled(), model: getBotModel(), notifyMode: getNotifyMode(), controlNumber: getControlNumber() });
 });
 router.post("/bot/config", (req, res) => {
   try {
-    const { enabled, model } = req.body || {};
+    const { enabled, model, notifyMode, controlNumber } = req.body || {};
     if (enabled !== void 0) setSetting("bot_enabled", enabled ? "1" : "0");
     if (model) setSetting("bot_model", String(model));
-    res.json({ enabled: isBotEnabled(), model: getBotModel() });
+    if (notifyMode && ["off", "outside_hours", "always"].includes(notifyMode)) setSetting("notify_mode", notifyMode);
+    if (controlNumber) setSetting("control_number", String(controlNumber).replace(/\D/g, ""));
+    res.json({ enabled: isBotEnabled(), model: getBotModel(), notifyMode: getNotifyMode(), controlNumber: getControlNumber() });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -26190,46 +26305,11 @@ router.post("/bot/drafts/:id/reject", (req, res) => {
 router.post("/bot/drafts/:id/approve", async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
-    const d = getDraft(id);
-    if (!d) return res.status(404).json({ error: "Bozza non trovata" });
-    if (d.status !== "pending") return res.status(400).json({ error: "Bozza gi\xE0 gestita" });
-    const text = req.body?.text && String(req.body.text).trim() || d.draft_text;
-    const force = req.body?.force === true;
-    if (d.proposed_event && !force) {
-      const ev = d.proposed_event;
-      const { busy, checked } = await isSlotBusy(ev.date, ev.start, ev.end);
-      if (busy && checked) {
-        return res.status(409).json({
-          conflict: true,
-          message: `Risulti impegnato ${ev.date} alle ${ev.start}. Confermare comunque l'appuntamento?`,
-          proposed_event: ev
-        });
-      }
+    const r = await approveDraftCore(id, { text: req.body?.text, force: req.body?.force === true });
+    if (!r.ok) {
+      return res.status(r.status).json({ conflict: r.conflict, message: r.message, error: r.message });
     }
-    await sendTextMessage(d.phone, text);
-    const now = (/* @__PURE__ */ new Date()).toISOString();
-    db_default.prepare(`
-      INSERT OR IGNORE INTO live_messages
-        (message_id, phone, contact_name, content, direction, timestamp, is_read, created_at)
-      VALUES (?, ?, ?, ?, 'sent', ?, 1, ?)
-    `).run(`bot_${Date.now()}`, d.phone, d.contact_name || d.phone, text, now, now);
-    let calendar = null;
-    if (d.proposed_event) {
-      const ev = d.proposed_event;
-      calendar = await createCalendarEvent({
-        title: `[DA CONFERMARE] ${ev.reason} \u2014 ${d.contact_name || d.phone}`,
-        description: `Appuntamento proposto dal chatbot WhatsApp.
-Cliente: ${d.contact_name || ""} (${d.phone})
-Motivo: ${ev.reason}
-
-\u26A0\uFE0F Confermare con il cliente.`,
-        startDate: `${ev.date}T${ev.start}:00`,
-        endDate: `${ev.date}T${ev.end}:00`
-      });
-    }
-    markDraftSent(id);
-    broadcastEvent("message", { type: "sent", phone: d.phone, contactName: d.contact_name, content: text, timestamp: now });
-    res.json({ success: true, calendar });
+    res.json({ success: true, calendar: r.calendar });
   } catch (err) {
     console.error("[Bot approve] Error:", err);
     res.status(500).json({ error: err.message });

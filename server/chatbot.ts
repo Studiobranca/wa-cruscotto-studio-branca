@@ -11,7 +11,10 @@
  */
 
 import db from './db.js';
-import { getAvailability, formatAvailabilityIT } from './appointments.js';
+import { getAvailability, formatAvailabilityIT, isSlotBusy } from './appointments.js';
+import { sendTextMessage } from './zapi.js';
+import { createCalendarEvent } from './integrations.js';
+import { broadcastEvent } from './sse.js';
 
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
 const ANTHROPIC_VERSION = '2023-06-01';
@@ -51,6 +54,32 @@ export function setSetting(key: string, value: string): void {
 }
 export function isBotEnabled(): boolean { return getSetting('bot_enabled', '1') === '1'; }
 export function getBotModel(): string { return getSetting('bot_model', DEFAULT_MODEL); }
+
+// Numero WhatsApp di Mariano per notifica/approvazione bozze (solo cifre).
+export function getControlNumber(): string {
+  return (getSetting('control_number', '') || process.env.CONTROL_WHATSAPP || '393457050479').replace(/\D/g, '');
+}
+// Quando inviare la notifica WhatsApp delle bozze a Mariano.
+export function getNotifyMode(): 'off' | 'outside_hours' | 'always' {
+  const m = getSetting('notify_mode', 'outside_hours');
+  return (m === 'off' || m === 'always') ? m : 'outside_hours';
+}
+function isBusinessHoursRome(): boolean {
+  const now = new Date();
+  const hour = parseInt(new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/Rome', hour: '2-digit', hour12: false }).format(now), 10);
+  const wd = new Intl.DateTimeFormat('en-US', { timeZone: 'Europe/Rome', weekday: 'short' }).format(now);
+  const dow = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(wd);
+  if (dow === 0 || dow === 6) return false;
+  return (hour >= 9 && hour < 13) || (hour >= 15 && hour < 19);
+}
+// Default 'outside_hours': niente notifiche WhatsApp nei feriali in orario di studio
+// (lì si usa il Cruscotto); sì la sera, nei weekend e nelle feste.
+export function shouldNotifyControl(): boolean {
+  const m = getNotifyMode();
+  if (m === 'off') return false;
+  if (m === 'always') return true;
+  return !isBusinessHoursRome();
+}
 
 // ─── Persona + guardrail (skill whatsapp-studio) ─────────────────────────────
 const SYSTEM_PROMPT = `Sei l'assistente virtuale di AB STUDIO SRL (Studio Tributario Branca),
@@ -356,4 +385,87 @@ export function markDraftSent(id: number): void {
 }
 export function markDraftRejected(id: number): void {
   db.prepare(`UPDATE bot_drafts SET status = 'rejected' WHERE id = ?`).run(id);
+}
+
+// ─── Approvazione condivisa (usata da endpoint HTTP e da WhatsApp) ───────────
+export interface ApproveResult {
+  ok: boolean; status: number; conflict?: boolean; message?: string;
+  calendar?: any; contactName?: string; hadEvent?: boolean;
+}
+export async function approveDraftCore(id: number, opts: { text?: string; force?: boolean }): Promise<ApproveResult> {
+  const d = getDraft(id);
+  if (!d) return { ok: false, status: 404, message: 'Bozza non trovata' };
+  if (d.status !== 'pending') return { ok: false, status: 400, message: 'Bozza già gestita' };
+  const finalText = (opts.text && String(opts.text).trim()) || d.draft_text;
+
+  // Controllo agenda: se Mariano è impegnato nello slot, blocca (salvo force)
+  if (d.proposed_event && !opts.force) {
+    const ev = d.proposed_event;
+    const { busy, checked } = await isSlotBusy(ev.date, ev.start, ev.end);
+    if (busy && checked) {
+      return { ok: false, status: 409, conflict: true, contactName: d.contact_name,
+        message: `Risulti impegnato ${ev.date} alle ${ev.start}.` };
+    }
+  }
+
+  await sendTextMessage(d.phone, finalText);
+  const now = new Date().toISOString();
+  db.prepare(`
+    INSERT OR IGNORE INTO live_messages
+      (message_id, phone, contact_name, content, direction, timestamp, is_read, created_at)
+    VALUES (?, ?, ?, ?, 'sent', ?, 1, ?)
+  `).run(`bot_${Date.now()}`, d.phone, d.contact_name || d.phone, finalText, now, now);
+
+  let calendar: any = null;
+  if (d.proposed_event) {
+    const ev = d.proposed_event;
+    calendar = await createCalendarEvent({
+      title: `[DA CONFERMARE] ${ev.reason} — ${d.contact_name || d.phone}`,
+      description: `Appuntamento proposto dal chatbot WhatsApp.\nCliente: ${d.contact_name || ''} (${d.phone})\nMotivo: ${ev.reason}\n\n⚠️ Confermare con il cliente.`,
+      startDate: `${ev.date}T${ev.start}:00`,
+      endDate: `${ev.date}T${ev.end}:00`,
+    });
+  }
+  markDraftSent(id);
+  broadcastEvent('message', { type: 'sent', phone: d.phone, contactName: d.contact_name, content: finalText, timestamp: now });
+  return { ok: true, status: 200, calendar, contactName: d.contact_name, hadEvent: !!d.proposed_event };
+}
+
+// ─── Notifica WhatsApp della bozza a Mariano ─────────────────────────────────
+export async function notifyDraftToControl(id: number): Promise<void> {
+  const d = getDraft(id);
+  if (!d) return;
+  const parts = [`🆕 Bozza #${d.id} — ${d.contact_name || d.phone}`];
+  if (d.needs_human) parts.push('⚠️ URGENTE / da gestire di persona');
+  if (d.incoming_excerpt) parts.push(`Cliente: "${d.incoming_excerpt}"`);
+  if (d.proposed_event) parts.push(`📅 Appuntamento: ${d.proposed_event.date} ore ${d.proposed_event.start} — ${d.proposed_event.reason} (DA CONFERMARE)`);
+  parts.push(`\nBozza:\n«${d.draft_text}»`);
+  parts.push(`\n👉 Per inviare: OK ${d.id}\n👉 Per rifiutare: NO ${d.id}\n👉 Per modificare: OK ${d.id} <nuovo testo>`);
+  try { await sendTextMessage(getControlNumber(), parts.join('\n')); }
+  catch (e: any) { console.error('[Chatbot] notifica WhatsApp fallita:', e.message); }
+}
+
+// ─── Comandi di approvazione via WhatsApp (risposte di Mariano) ──────────────
+// Riconosce: "OK 4", "SI 4", "NO 4", "OK 4 <nuovo testo>", "OK 4 FORZA".
+// Ritorna il testo di risposta da inviare a Mariano, o null se non è un comando.
+export async function handleControlCommand(text: string): Promise<string | null> {
+  const m = (text || '').trim().match(/^(ok|sì|si|approva|invia|conferma|no|rifiuta|scarta)\s+#?(\d+)\s*([\s\S]*)$/i);
+  if (!m) return null;
+  const verb = m[1].toLowerCase();
+  const id = parseInt(m[2], 10);
+  const rest = (m[3] || '').trim();
+  const isReject = ['no', 'rifiuta', 'scarta'].includes(verb);
+
+  const d = getDraft(id);
+  if (!d) return `❓ Bozza #${id} non trovata.`;
+  if (d.status !== 'pending') return `ℹ️ Bozza #${id} già gestita.`;
+
+  if (isReject) { markDraftRejected(id); return `🗑️ Bozza #${id} (${d.contact_name || d.phone}) rifiutata.`; }
+
+  const force = /^(forza|conferma)$/i.test(rest);
+  const edited = (!force && rest) ? rest : undefined;
+  const r = await approveDraftCore(id, { text: edited, force });
+  if (r.conflict) return `⚠️ ${r.message}\nRispondi "OK ${id} FORZA" per confermare comunque l'appuntamento.`;
+  if (!r.ok) return `❌ ${r.message}`;
+  return `✅ Inviato a ${r.contactName || d.phone}.${r.hadEvent ? ' Appuntamento [DA CONFERMARE] in agenda.' : ''}`;
 }

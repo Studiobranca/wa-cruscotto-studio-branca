@@ -28,6 +28,12 @@ import {
   getBotModel,
   setSetting as setBotSetting,
   recordClassification,
+  getControlNumber,
+  getNotifyMode,
+  shouldNotifyControl,
+  notifyDraftToControl,
+  handleControlCommand,
+  approveDraftCore,
 } from './chatbot.js';
 import { runDailyDigest, getFlowHealth, repairWebhook } from './maintenance.js';
 
@@ -767,6 +773,13 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
     if (!fromMe && !isGroup && content && content.trim().length > 2 && isBotEnabled()) {
       setImmediate(async () => {
         try {
+          // Numero di controllo (Mariano): se risponde con un comando (OK/NO <id>),
+          // approva/rifiuta la bozza da WhatsApp. Mai generare bozze per questo numero.
+          if (phone === getControlNumber()) {
+            const reply = await handleControlCommand(content);
+            if (reply) await sendTextMessage(phone, reply);
+            return;
+          }
           const c = db.prepare(`SELECT contact_name, priority FROM conversations WHERE phone = ?`).get(phone) as any;
           const pr = (c?.priority || 'none');
           if (pr === 'vip' || pr === 'high') return; // viplist → gestisce Mariano
@@ -783,6 +796,8 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
             const id = saveDraft({ phone, contactName: cName, incoming: content, result: outcome.result });
             broadcastEvent('bot_draft', { id, phone, contactName: cName, needsHuman: outcome.result.needsHuman });
             console.log(`[Chatbot] Bozza #${id} per ${cName} (${phone})${outcome.result.needsHuman ? ' [need_human]' : ''}`);
+            // Notifica WhatsApp a Mariano (default: solo fuori orario di studio)
+            if (shouldNotifyControl()) await notifyDraftToControl(id);
           }
         } catch (botErr: any) {
           console.error('[Chatbot] Error:', botErr.message);
@@ -1147,15 +1162,17 @@ router.get('/bot/drafts', (_req: Request, res: Response) => {
 });
 
 router.get('/bot/config', (_req: Request, res: Response) => {
-  res.json({ enabled: isBotEnabled(), model: getBotModel() });
+  res.json({ enabled: isBotEnabled(), model: getBotModel(), notifyMode: getNotifyMode(), controlNumber: getControlNumber() });
 });
 
 router.post('/bot/config', (req: Request, res: Response) => {
   try {
-    const { enabled, model } = req.body || {};
+    const { enabled, model, notifyMode, controlNumber } = req.body || {};
     if (enabled !== undefined) setBotSetting('bot_enabled', enabled ? '1' : '0');
     if (model) setBotSetting('bot_model', String(model));
-    res.json({ enabled: isBotEnabled(), model: getBotModel() });
+    if (notifyMode && ['off', 'outside_hours', 'always'].includes(notifyMode)) setBotSetting('notify_mode', notifyMode);
+    if (controlNumber) setBotSetting('control_number', String(controlNumber).replace(/\D/g, ''));
+    res.json({ enabled: isBotEnabled(), model: getBotModel(), notifyMode: getNotifyMode(), controlNumber: getControlNumber() });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -1176,51 +1193,11 @@ router.post('/bot/drafts/:id/reject', (req: Request, res: Response) => {
 router.post('/bot/drafts/:id/approve', async (req: Request, res: Response) => {
   try {
     const id = parseInt(req.params.id, 10);
-    const d = getDraft(id);
-    if (!d) return res.status(404).json({ error: 'Bozza non trovata' });
-    if (d.status !== 'pending') return res.status(400).json({ error: 'Bozza già gestita' });
-
-    const text = (req.body?.text && String(req.body.text).trim()) || d.draft_text;
-    const force = req.body?.force === true;
-
-    // 0. Se c'è un appuntamento proposto, controlla l'agenda di Mariano PRIMA di
-    //    inviare: se è impegnato in quello slot, fermati e avvisa (salvo override).
-    if (d.proposed_event && !force) {
-      const ev = d.proposed_event;
-      const { busy, checked } = await isSlotBusy(ev.date, ev.start, ev.end);
-      if (busy && checked) {
-        return res.status(409).json({
-          conflict: true,
-          message: `Risulti impegnato ${ev.date} alle ${ev.start}. Confermare comunque l'appuntamento?`,
-          proposed_event: ev,
-        });
-      }
+    const r = await approveDraftCore(id, { text: req.body?.text, force: req.body?.force === true });
+    if (!r.ok) {
+      return res.status(r.status).json({ conflict: r.conflict, message: r.message, error: r.message });
     }
-
-    // 1. Invia il messaggio al cliente via Z-API
-    await sendTextMessage(d.phone, text);
-    const now = new Date().toISOString();
-    db.prepare(`
-      INSERT OR IGNORE INTO live_messages
-        (message_id, phone, contact_name, content, direction, timestamp, is_read, created_at)
-      VALUES (?, ?, ?, ?, 'sent', ?, 1, ?)
-    `).run(`bot_${Date.now()}`, d.phone, d.contact_name || d.phone, text, now, now);
-
-    // 2. Se c'è un appuntamento proposto → evento "[DA CONFERMARE]" su Calendar
-    let calendar: any = null;
-    if (d.proposed_event) {
-      const ev = d.proposed_event;
-      calendar = await createCalendarEvent({
-        title: `[DA CONFERMARE] ${ev.reason} — ${d.contact_name || d.phone}`,
-        description: `Appuntamento proposto dal chatbot WhatsApp.\nCliente: ${d.contact_name || ''} (${d.phone})\nMotivo: ${ev.reason}\n\n⚠️ Confermare con il cliente.`,
-        startDate: `${ev.date}T${ev.start}:00`,
-        endDate: `${ev.date}T${ev.end}:00`,
-      });
-    }
-
-    markDraftSent(id);
-    broadcastEvent('message', { type: 'sent', phone: d.phone, contactName: d.contact_name, content: text, timestamp: now });
-    res.json({ success: true, calendar });
+    res.json({ success: true, calendar: r.calendar });
   } catch (err: any) {
     console.error('[Bot approve] Error:', err);
     res.status(500).json({ error: err.message });

@@ -16,6 +16,7 @@ import db from './db.js';
 import { upsertAllDayEvent } from './integrations.js';
 import { setReceivedWebhook, getReceivedWebhook } from './zapi.js';
 import { broadcastEvent } from './sse.js';
+import { getControlNumber } from './chatbot.js';
 
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://wa-cruscotto-v2-production.up.railway.app';
 const WEBHOOK_URL = `${PUBLIC_BASE_URL}/api/webhook/message`;
@@ -65,10 +66,11 @@ export function buildDigest(dateISO: string): { title: string; description: stri
   const workPhones = new Set(cls.filter((c) => c.kind === 'work').map((c) => c.phone));
   const personalOnly = new Set(cls.filter((c) => c.kind === 'personal' && !workPhones.has(c.phone)).map((c) => c.phone));
 
+  const control = getControlNumber();
   const byPhone: Record<string, { name: string; group: boolean; rx: number; tx: number; last: string }> = {};
   for (const r of rows) {
     const k = r.phone;
-    if (personalOnly.has(k)) continue; // chat personale del giorno → non riportare
+    if (personalOnly.has(k) || k === control) continue; // chat personale / numero di Mariano → non riportare
     if (!byPhone[k]) byPhone[k] = { name: r.contact_name || r.phone, group: !!r.is_group, rx: 0, tx: 0, last: '' };
     if (r.direction === 'sent') byPhone[k].tx++; else byPhone[k].rx++;
     if (r.content) byPhone[k].last = String(r.content).replace(/\n+/g, ' ').slice(0, 60);
