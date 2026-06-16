@@ -1237,7 +1237,30 @@ router.get('/bot/zapi-info', async (_req: Request, res: Response) => {
     try { out[ep] = await zapiGet(ep); } catch (e: any) { out[ep] = { error: e.message }; }
   }
   try { out.receivedWebhook = await getReceivedWebhook(); } catch (e: any) { out.receivedWebhook = { error: e.message }; }
+  try { out.webhooksRaw = await zapiGet('webhooks'); } catch (e: any) { out.webhooksRaw = { error: e.message }; }
   res.json(out);
+});
+
+// Riparazione: abilita su Z-API l'inoltro dei messaggi inviati da Mariano stesso
+// (fromMe) al webhook, così i comandi OK/NO arrivano al sistema. Imposta anche
+// l'URL del webhook ricevuti. Idempotente.
+router.post('/bot/enable-self-commands', async (_req: Request, res: Response) => {
+  const base = process.env.PUBLIC_BASE_URL || 'https://wa-cruscotto-v2-production.up.railway.app';
+  const url = `${base}/api/webhook/message`;
+  const results: any = {};
+  // Prova le varianti note dell'API Z-API per "notifica messaggi inviati da me"
+  const attempts: Array<[string, any]> = [
+    ['update-webhook-received', { value: url, notifySentByMe: true }],
+    ['update-webhook-received-delivery', { value: url }],
+    ['update-settings', { notifySentByMe: true }],
+  ];
+  for (const [path, body] of attempts) {
+    try {
+      const { zapiPost } = await import('./zapi.js');
+      results[path] = await zapiPost(path, body);
+    } catch (e: any) { results[path] = { error: e.message }; }
+  }
+  res.json({ webhook: url, results });
 });
 
 router.post('/bot/repair-webhook', async (_req: Request, res: Response) => {
