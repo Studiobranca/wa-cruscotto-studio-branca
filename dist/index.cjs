@@ -24075,7 +24075,7 @@ function isHoliday(ds) {
 }
 function isSummerClosure(ds) {
   const md = ds.slice(5);
-  return md >= "07-10" && md <= "08-20";
+  return md >= "07-20" && md <= "08-31";
 }
 function daySlots(ds, dow) {
   if (dow === 0 || dow === 6) return [];
@@ -24134,6 +24134,30 @@ async function getAvailability(days = 14) {
   });
   return { slots: free, calendarChecked };
 }
+async function isSlotBusy(date, start, end) {
+  const token = await getGoogleAccessToken();
+  if (!token) return { busy: false, checked: false };
+  const off = romeOffset(date);
+  try {
+    const resp = await fetch("https://www.googleapis.com/calendar/v3/freeBusy", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        timeMin: `${date}T${start}:00${off}`,
+        timeMax: `${date}T${end}:00${off}`,
+        timeZone: TZ,
+        items: [{ id: process.env.GOOGLE_CALENDAR_ID || "primary" }]
+      })
+    });
+    if (!resp.ok) return { busy: false, checked: false };
+    const data = await resp.json();
+    const cal = data.calendars?.[Object.keys(data.calendars || {})[0]];
+    const busy = (cal?.busy || []).length > 0;
+    return { busy, checked: true };
+  } catch {
+    return { busy: false, checked: false };
+  }
+}
 var DOW_IT = ["domenica", "luned\xEC", "marted\xEC", "mercoled\xEC", "gioved\xEC", "venerd\xEC", "sabato"];
 var MONTH_IT = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"];
 function formatAvailabilityIT(slots, maxDays = 4, maxPerDay = 3) {
@@ -24188,6 +24212,23 @@ async function zapiPost(endpoint, body) {
 }
 async function sendTextMessage(phone, message) {
   return zapiPost("send-text", { phone, message });
+}
+async function getReceivedWebhook() {
+  try {
+    const r = await zapiGet("webhooks");
+    return r?.value ?? r?.delivery ?? r?.received ?? null;
+  } catch {
+    return null;
+  }
+}
+async function setReceivedWebhook(url) {
+  try {
+    await zapiPost("update-webhook-received", { value: url });
+    return true;
+  } catch (e) {
+    console.error("[ZAPI] setReceivedWebhook fallito:", e.message);
+    return false;
+  }
 }
 async function syncContacts() {
   const { db: db2 } = await Promise.resolve().then(() => (init_db(), db_exports));
@@ -24533,6 +24574,44 @@ async function createCalendarEvent(params) {
     return { success: false, error: e.message };
   }
 }
+async function upsertAllDayEvent(params) {
+  const token = await getGoogleAccessToken2();
+  if (!token) return { success: false, error: "Google OAuth non configurato" };
+  const calId = params.calendarId || process.env.GOOGLE_CALENDAR_ID || "primary";
+  const next = /* @__PURE__ */ new Date(`${params.date}T00:00:00Z`);
+  next.setUTCDate(next.getUTCDate() + 1);
+  const endDate = next.toISOString().slice(0, 10);
+  const event = {
+    summary: params.title,
+    description: params.description,
+    start: { date: params.date },
+    end: { date: endDate },
+    transparency: "transparent"
+  };
+  const base = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calId)}/events`;
+  const url = params.eventId ? `${base}/${encodeURIComponent(params.eventId)}` : base;
+  const method = params.eventId ? "PATCH" : "POST";
+  try {
+    const resp = await fetch(url, {
+      method,
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(event)
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      logIntegration({ integration: "google_calendar", action: params.eventId ? "update_digest" : "create_digest", status: "success", detail: params.date });
+      return { success: true, eventId: data.id };
+    }
+    if (resp.status === 404 && params.eventId) {
+      return upsertAllDayEvent({ ...params, eventId: null });
+    }
+    const err = await resp.text();
+    logIntegration({ integration: "google_calendar", action: "digest", status: "error", detail: `HTTP ${resp.status}: ${err.substring(0, 80)}` });
+    return { success: false, error: `HTTP ${resp.status}` };
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+}
 var NOTION_VERSION = "2022-06-28";
 async function saveToNotionComunicazioni(params) {
   const notionToken = process.env.NOTION_API_KEY;
@@ -24689,6 +24768,404 @@ function getQueueStats() {
   } catch {
     return [];
   }
+}
+
+// server/chatbot.ts
+init_db();
+var ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
+var ANTHROPIC_VERSION = "2023-06-01";
+var DEFAULT_MODEL = "claude-sonnet-4-6";
+var MAX_TOOL_LOOPS = 4;
+var HISTORY_LIMIT = 20;
+db_default.exec(`
+  CREATE TABLE IF NOT EXISTS bot_drafts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    phone TEXT NOT NULL,
+    contact_name TEXT,
+    incoming_excerpt TEXT,
+    draft_text TEXT,
+    proposed_event TEXT,            -- JSON {date,start,end,reason} oppure NULL
+    needs_human INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'pending',  -- pending | sent | rejected
+    created_at TEXT DEFAULT (datetime('now')),
+    sent_at TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_bot_drafts_status ON bot_drafts(status);
+`);
+function getSetting(key, def) {
+  try {
+    const row = db_default.prepare(`SELECT value FROM app_settings WHERE key = ?`).get(key);
+    return row?.value ?? def;
+  } catch {
+    return def;
+  }
+}
+function setSetting(key, value) {
+  db_default.prepare(`
+    INSERT INTO app_settings (key, value) VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `).run(key, value);
+}
+function isBotEnabled() {
+  return getSetting("bot_enabled", "1") === "1";
+}
+function getBotModel() {
+  return getSetting("bot_model", DEFAULT_MODEL);
+}
+var SYSTEM_PROMPT = `Sei l'assistente virtuale di AB STUDIO SRL (Studio Tributario Branca),
+studio di commercialista/tributarista, consulente del lavoro e amministratore di condominio.
+Titolare: Dott. Mariano Branca \u2014 Via Operai 102, 98051 Barcellona P.G. (ME).
+
+Stai rispondendo a un cliente su WhatsApp. Dai del Lei, tono cordiale e professionale,
+messaggi brevi.
+
+COMPORTAMENTO BASE:
+- Per qualunque richiesta o documento inviato, conferma che lo studio LI VALUTER\xC0
+  (es. "valuteremo la sua richiesta" / "valuteremo i documenti che ci ha inviato") e
+  NON entrare nel merito fiscale/legale via chat.
+- Invita SEMPRE il cliente a passare in studio e a fissare un appuntamento.
+- Per gli appuntamenti usa get_availability (proponi 2-3 opzioni) e, quando il cliente
+  sceglie, chiama propose_booking (l'appuntamento sar\xE0 poi confermato dallo studio).
+- ORARI STUDIO (get_availability li rispetta gi\xE0, ma tienili presente nel dialogo):
+  Lun-Ven 9:00-13:00; pomeriggio SOLO lun/mar/gio 15:30-19:00 (NO mercoled\xEC e venerd\xEC
+  pomeriggio). MAI sabato, domenica, feste comandate; chiuso dal 20 luglio al 31 agosto.
+
+CONTROLLO DUPLICATI (obbligatorio): prima di rispondere a una richiesta o a un invio di
+documenti, chiama find_previous_requests per verificare se il cliente aveva GI\xC0 inviato lo
+stesso documento o fatto la stessa richiesta in passato. Se s\xEC, faglielo presente con
+garbo citando la data (es. "risulta che ci aveva gi\xE0 inviato ... in data ...").
+
+REGOLE INDEROGABILI:
+1. Italiano, messaggi brevi da chat.
+2. NIENTE importi, calcoli, codici, scadenze o pareri precisi via chat \u2192 raccogli i dati e
+   rimanda all'appuntamento.
+3. Urgenze gravi (cartella esattoriale, accertamento, udienza, atto notificato con termini):
+   NON gestirle da sola \u2192 chiama need_human; rassicura che il Dott. Branca verr\xE0 avvisato
+   subito e chiedi copia dell'atto.
+4. Documenti/foto: conferma la ricezione e indica che verranno valutati.
+5. Firma sempre: "Assistente Virtuale \u2014 AB STUDIO SRL".
+
+Produci come messaggio finale SOLO il testo da inviare al cliente (niente preamboli).`;
+var TOOLS = [
+  {
+    name: "get_availability",
+    description: "Restituisce i prossimi slot liberi reali dell'agenda dello studio (incrocia Google Calendar con gli orari studio). Usalo prima di proporre un appuntamento.",
+    input_schema: {
+      type: "object",
+      properties: { days: { type: "integer", description: "Giorni avanti da considerare (default 14)" } }
+    }
+  },
+  {
+    name: "propose_booking",
+    description: `Registra la proposta di appuntamento sullo slot scelto dal cliente. NON conferma definitivamente: l'evento verr\xE0 creato come "DA CONFERMARE" e validato dallo studio.`,
+    input_schema: {
+      type: "object",
+      properties: {
+        date: { type: "string", description: "Data YYYY-MM-DD" },
+        start: { type: "string", description: "Ora inizio HH:MM (24h)" },
+        reason: { type: "string", description: "Motivo/oggetto dell'appuntamento" }
+      },
+      required: ["date", "start", "reason"]
+    }
+  },
+  {
+    name: "need_human",
+    description: "Segnala che la richiesta \xE8 urgente o complessa e deve gestirla direttamente il Dott. Branca (no risposta automatica risolutiva).",
+    input_schema: {
+      type: "object",
+      properties: { reason: { type: "string", description: "Perch\xE9 serve l'intervento umano" } },
+      required: ["reason"]
+    }
+  },
+  {
+    name: "find_previous_requests",
+    description: "Cerca nello storico dei messaggi del cliente se aveva gi\xE0 inviato lo stesso documento o fatto la stessa richiesta in passato. Usalo SEMPRE prima di rispondere a una richiesta/invio documenti.",
+    input_schema: {
+      type: "object",
+      properties: { query: { type: "string", description: 'Parole chiave della richiesta/documento (es. "dichiarazione redditi", "visura", "f24")' } },
+      required: ["query"]
+    }
+  }
+];
+function buildTranscript(phone, contactName) {
+  const rows = db_default.prepare(`
+    SELECT direction, content, is_audio, is_image
+    FROM live_messages
+    WHERE phone = ? AND content IS NOT NULL AND content != ''
+    ORDER BY timestamp DESC, id DESC
+    LIMIT ?
+  `).all(phone, HISTORY_LIMIT);
+  rows.reverse();
+  const lines = rows.map((r) => {
+    const who = r.direction === "sent" ? "STUDIO" : "CLIENTE";
+    return `[${who}] ${(r.content || "").replace(/\n+/g, " ").trim()}`;
+  });
+  return `Conversazione WhatsApp con ${contactName} (${phone}):
+
+${lines.join("\n")}
+
+Genera la prossima risposta dello STUDIO.`;
+}
+function endTime(start) {
+  const [h, m] = start.split(":").map((x) => parseInt(x, 10));
+  const eh = (h + 1) % 24;
+  return `${String(eh).padStart(2, "0")}:${String(m || 0).padStart(2, "0")}`;
+}
+async function runTool(name, input, out, phone) {
+  if (name === "find_previous_requests") {
+    const kws = String(input?.query || "").toLowerCase().split(/\s+/).filter((w) => w.length > 3).slice(0, 6);
+    if (!kws.length) return "Nessun termine utile per la ricerca.";
+    const rows = db_default.prepare(`
+      SELECT content, timestamp FROM live_messages
+      WHERE phone = ? AND direction = 'received' AND content IS NOT NULL
+      ORDER BY timestamp DESC LIMIT 300
+    `).all(phone);
+    const cutoff = Date.now() - 2 * 864e5;
+    const hits = rows.filter((r) => {
+      const t = Date.parse(r.timestamp);
+      return !isNaN(t) && t < cutoff && kws.some((k) => (r.content || "").toLowerCase().includes(k));
+    }).slice(0, 5);
+    if (!hits.length) return "Nessuna richiesta o documento simile inviato in passato dal cliente.";
+    return "Richieste/documenti SIMILI gi\xE0 inviati in passato (cita la data al cliente):\n" + hits.map((h) => `- ${(h.timestamp || "").slice(0, 10)}: "${(h.content || "").replace(/\n+/g, " ").slice(0, 90)}"`).join("\n");
+  }
+  if (name === "get_availability") {
+    const days = Math.min(Math.max(parseInt(input?.days, 10) || 14, 1), 30);
+    const { slots, calendarChecked } = await getAvailability(days);
+    const txt = formatAvailabilityIT(slots);
+    const iso = slots.slice(0, 12).map((s) => `${s.date} ${s.start}`).join("; ");
+    return `${calendarChecked ? "" : "(agenda non verificata su Calendar) "}Prossime disponibilit\xE0 (da mostrare al cliente):
+${txt}
+
+Slot con data esatta da usare in propose_booking (date=YYYY-MM-DD, start=HH:MM): ${iso}`;
+  }
+  if (name === "propose_booking") {
+    const date = String(input?.date || "");
+    const start = String(input?.start || "");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !/^\d{1,2}:\d{2}$/.test(start)) {
+      return "Errore: data o ora non valide. Usa get_availability e riprova con uno slot esatto.";
+    }
+    out.proposedEvent = { date, start, end: endTime(start), reason: String(input?.reason || "Appuntamento") };
+    return "Proposta registrata. L'appuntamento sar\xE0 confermato dallo studio: comunica al cliente che \xE8 in fase di conferma e ringrazia.";
+  }
+  if (name === "need_human") {
+    out.needsHuman = true;
+    out.humanReason = String(input?.reason || "");
+    return "Segnalato al Dott. Branca. Scrivi al cliente un messaggio rassicurante (verr\xE0 ricontattato al pi\xF9 presto).";
+  }
+  return "Strumento sconosciuto.";
+}
+async function generateDraft(phone, contactName) {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    console.warn("[Chatbot] ANTHROPIC_API_KEY non configurata: bozza non generata.");
+    return null;
+  }
+  const out = { draftText: "", proposedEvent: null, needsHuman: false };
+  const messages = [{ role: "user", content: buildTranscript(phone, contactName) }];
+  const todayStr = (/* @__PURE__ */ new Date()).toLocaleDateString("it-IT", {
+    weekday: "long",
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+    timeZone: "Europe/Rome"
+  });
+  const todayISO = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Rome" }).format(/* @__PURE__ */ new Date());
+  const system = `${SYSTEM_PROMPT}
+
+Data odierna: ${todayStr} (${todayISO}). Usa SEMPRE date coerenti con oggi e non inventare l'anno.`;
+  for (let loop = 0; loop < MAX_TOOL_LOOPS; loop++) {
+    let data;
+    try {
+      const resp = await fetch(ANTHROPIC_URL, {
+        method: "POST",
+        headers: {
+          "x-api-key": apiKey,
+          "anthropic-version": ANTHROPIC_VERSION,
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({
+          model: getBotModel(),
+          max_tokens: 1024,
+          system,
+          tools: TOOLS,
+          messages
+        })
+      });
+      if (!resp.ok) {
+        console.error("[Chatbot] Anthropic HTTP", resp.status, (await resp.text()).substring(0, 200));
+        return null;
+      }
+      data = await resp.json();
+    } catch (e) {
+      console.error("[Chatbot] Errore chiamata Anthropic:", e.message);
+      return null;
+    }
+    const blocks = data.content || [];
+    const text = blocks.filter((b) => b.type === "text").map((b) => b.text).join("").trim();
+    if (text) out.draftText = text;
+    if (data.stop_reason === "tool_use") {
+      messages.push({ role: "assistant", content: blocks });
+      const toolResults = [];
+      for (const b of blocks) {
+        if (b.type === "tool_use") {
+          const result = await runTool(b.name, b.input, out, phone);
+          toolResults.push({ type: "tool_result", tool_use_id: b.id, content: result });
+        }
+      }
+      messages.push({ role: "user", content: toolResults });
+      continue;
+    }
+    break;
+  }
+  if (!out.draftText) return null;
+  return out;
+}
+function saveDraft(d) {
+  db_default.prepare(`UPDATE bot_drafts SET status = 'rejected' WHERE phone = ? AND status = 'pending'`).run(d.phone);
+  const info = db_default.prepare(`
+    INSERT INTO bot_drafts (phone, contact_name, incoming_excerpt, draft_text, proposed_event, needs_human, status)
+    VALUES (?, ?, ?, ?, ?, ?, 'pending')
+  `).run(
+    d.phone,
+    d.contactName,
+    (d.incoming || "").substring(0, 300),
+    d.result.draftText,
+    d.result.proposedEvent ? JSON.stringify(d.result.proposedEvent) : null,
+    d.result.needsHuman ? 1 : 0
+  );
+  return Number(info.lastInsertRowid);
+}
+function getPendingDrafts() {
+  const rows = db_default.prepare(`SELECT * FROM bot_drafts WHERE status = 'pending' ORDER BY created_at DESC`).all();
+  return rows.map((r) => ({ ...r, proposed_event: r.proposed_event ? JSON.parse(r.proposed_event) : null }));
+}
+function getDraft(id) {
+  const r = db_default.prepare(`SELECT * FROM bot_drafts WHERE id = ?`).get(id);
+  if (!r) return null;
+  return { ...r, proposed_event: r.proposed_event ? JSON.parse(r.proposed_event) : null };
+}
+function markDraftSent(id) {
+  db_default.prepare(`UPDATE bot_drafts SET status = 'sent', sent_at = datetime('now') WHERE id = ?`).run(id);
+}
+function markDraftRejected(id) {
+  db_default.prepare(`UPDATE bot_drafts SET status = 'rejected' WHERE id = ?`).run(id);
+}
+
+// server/maintenance.ts
+init_db();
+var PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://wa-cruscotto-v2-production.up.railway.app";
+var WEBHOOK_URL = `${PUBLIC_BASE_URL}/api/webhook/message`;
+var STALE_MINUTES = 180;
+var REPAIR_COOLDOWN_MIN = 360;
+function getSetting2(key) {
+  try {
+    return db_default.prepare(`SELECT value FROM app_settings WHERE key = ?`).get(key)?.value ?? null;
+  } catch {
+    return null;
+  }
+}
+function setSetting2(key, value) {
+  db_default.prepare(`INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(key, value);
+}
+function romeNow() {
+  const now = /* @__PURE__ */ new Date();
+  const iso = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Rome" }).format(now);
+  const hour = parseInt(new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Rome", hour: "2-digit", hour12: false }).format(now), 10);
+  const wd = new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Rome", weekday: "short" }).format(now);
+  const dow = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(wd);
+  return { iso, hour, dow };
+}
+function isBusinessHours() {
+  const { hour, dow } = romeNow();
+  if (dow === 0 || dow === 6) return false;
+  return hour >= 9 && hour < 13 || hour >= 15 && hour < 19;
+}
+function buildDigest(dateISO) {
+  const rows = db_default.prepare(`
+    SELECT phone, contact_name, is_group, direction, content, timestamp
+    FROM live_messages WHERE substr(timestamp, 1, 10) = ?
+    ORDER BY timestamp ASC
+  `).all(dateISO);
+  const byPhone = {};
+  for (const r of rows) {
+    const k = r.phone;
+    if (!byPhone[k]) byPhone[k] = { name: r.contact_name || r.phone, group: !!r.is_group, rx: 0, tx: 0, last: "" };
+    if (r.direction === "sent") byPhone[k].tx++;
+    else byPhone[k].rx++;
+    if (r.content) byPhone[k].last = String(r.content).replace(/\n+/g, " ").slice(0, 60);
+  }
+  const entries = Object.entries(byPhone).sort((a, b) => b[1].rx + b[1].tx - (a[1].rx + a[1].tx));
+  const lines = entries.map(
+    ([phone, v]) => `\u2022 ${v.name}${v.group ? " [GRUPPO]" : ""} \u2014 ${v.rx} ricevuti${v.tx ? `, ${v.tx} inviati` : ""}${v.last ? `: "${v.last}"` : ""}`
+  );
+  const total = rows.length;
+  const contacts = entries.length;
+  const title = `\u{1F4F1} WhatsApp ${dateISO}: ${total} msg \xB7 ${contacts} contatti`;
+  const description = entries.length ? `Riepilogo comunicazioni WhatsApp del giorno (clienti e gruppi in sola lettura).
+
+${lines.join("\n").slice(0, 7500)}` : "Nessuna comunicazione WhatsApp registrata.";
+  return { title, description, total, contacts };
+}
+async function runDailyDigest(dateISO) {
+  const date = dateISO || romeNow().iso;
+  const { title, description, total } = buildDigest(date);
+  const prevId = getSetting2(`digest_event_${date}`);
+  const r = await upsertAllDayEvent({ title, description, date, eventId: prevId });
+  if (r.success && r.eventId) {
+    setSetting2(`digest_event_${date}`, r.eventId);
+    setSetting2(`digest_done_${date}`, "1");
+    return { ok: true, date, total, eventId: r.eventId };
+  }
+  return { ok: false, date, total, error: r.error };
+}
+function lastReceivedAgeMinutes() {
+  const row = db_default.prepare(`SELECT MAX(timestamp) AS t FROM live_messages WHERE direction = 'received'`).get();
+  if (!row?.t) return null;
+  const ms = Date.parse(row.t);
+  if (isNaN(ms)) return null;
+  return Math.round((Date.now() - ms) / 6e4);
+}
+function getFlowHealth() {
+  const age = lastReceivedAgeMinutes();
+  return {
+    lastAgeMin: age,
+    stale: isBusinessHours() && age !== null && age > STALE_MINUTES,
+    businessHours: isBusinessHours(),
+    webhookExpected: WEBHOOK_URL
+  };
+}
+async function repairWebhook() {
+  const previous = await getReceivedWebhook();
+  const ok = await setReceivedWebhook(WEBHOOK_URL);
+  setSetting2("last_webhook_repair", (/* @__PURE__ */ new Date()).toISOString());
+  broadcastEvent("flow_repair", { ok, webhook: WEBHOOK_URL, at: (/* @__PURE__ */ new Date()).toISOString() });
+  console.log(`[Watchdog] Riparazione webhook: ${ok ? "OK" : "FALLITA"} \u2192 ${WEBHOOK_URL} (precedente: ${previous})`);
+  return { ok, previous, set: WEBHOOK_URL };
+}
+async function watchdogTick() {
+  const h = getFlowHealth();
+  if (!h.stale) return;
+  const last = getSetting2("last_webhook_repair");
+  if (last && (Date.now() - Date.parse(last)) / 6e4 < REPAIR_COOLDOWN_MIN) return;
+  console.warn(`[Watchdog] Flusso messaggi fermo da ${h.lastAgeMin} min in orario lavorativo \u2192 riparazione webhook`);
+  await repairWebhook();
+}
+function startMaintenance() {
+  const tick = async () => {
+    try {
+      const { iso, hour } = romeNow();
+      if (hour >= 20 && getSetting2(`digest_done_${iso}`) !== "1") {
+        const r = await runDailyDigest(iso);
+        console.log(`[Digest] ${iso}: ${r.ok ? `evento aggiornato (${r.total} msg)` : `errore: ${r.error}`}`);
+      }
+      await watchdogTick();
+    } catch (e) {
+      console.error("[Maintenance] tick error:", e.message);
+    }
+  };
+  setInterval(tick, 30 * 60 * 1e3);
+  setTimeout(tick, 60 * 1e3);
+  console.log("[Maintenance] Scheduler avviato (digest 20:30 + watchdog flusso).");
 }
 
 // server/routes.ts
@@ -25341,6 +25818,24 @@ Da confermare.`,
         }
       });
     }
+    if (!fromMe && !isGroup && content && content.trim().length > 2 && isBotEnabled()) {
+      setImmediate(async () => {
+        try {
+          const c = db_default.prepare(`SELECT contact_name, priority FROM conversations WHERE phone = ?`).get(phone);
+          const pr = c?.priority || "none";
+          if (pr === "vip" || pr === "high") return;
+          const cName = c?.contact_name || senderName || phone;
+          const result = await generateDraft(phone, cName);
+          if (result) {
+            const id = saveDraft({ phone, contactName: cName, incoming: content, result });
+            broadcastEvent("bot_draft", { id, phone, contactName: cName, needsHuman: result.needsHuman });
+            console.log(`[Chatbot] Bozza #${id} per ${cName} (${phone})${result.needsHuman ? " [need_human]" : ""}`);
+          }
+        } catch (botErr) {
+          console.error("[Chatbot] Error:", botErr.message);
+        }
+      });
+    }
     res.json({ success: true });
   } catch (err) {
     console.error("[Webhook] Error:", err);
@@ -25614,6 +26109,103 @@ router.post("/admin/cleanup-test-data", (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+router.get("/bot/drafts", (_req, res) => {
+  try {
+    res.json(getPendingDrafts());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.get("/bot/config", (_req, res) => {
+  res.json({ enabled: isBotEnabled(), model: getBotModel() });
+});
+router.post("/bot/config", (req, res) => {
+  try {
+    const { enabled, model } = req.body || {};
+    if (enabled !== void 0) setSetting("bot_enabled", enabled ? "1" : "0");
+    if (model) setSetting("bot_model", String(model));
+    res.json({ enabled: isBotEnabled(), model: getBotModel() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.post("/bot/drafts/:id/reject", (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const d = getDraft(id);
+    if (!d) return res.status(404).json({ error: "Bozza non trovata" });
+    markDraftRejected(id);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.post("/bot/drafts/:id/approve", async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const d = getDraft(id);
+    if (!d) return res.status(404).json({ error: "Bozza non trovata" });
+    if (d.status !== "pending") return res.status(400).json({ error: "Bozza gi\xE0 gestita" });
+    const text = req.body?.text && String(req.body.text).trim() || d.draft_text;
+    const force = req.body?.force === true;
+    if (d.proposed_event && !force) {
+      const ev = d.proposed_event;
+      const { busy, checked } = await isSlotBusy(ev.date, ev.start, ev.end);
+      if (busy && checked) {
+        return res.status(409).json({
+          conflict: true,
+          message: `Risulti impegnato ${ev.date} alle ${ev.start}. Confermare comunque l'appuntamento?`,
+          proposed_event: ev
+        });
+      }
+    }
+    await sendTextMessage(d.phone, text);
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    db_default.prepare(`
+      INSERT OR IGNORE INTO live_messages
+        (message_id, phone, contact_name, content, direction, timestamp, is_read, created_at)
+      VALUES (?, ?, ?, ?, 'sent', ?, 1, ?)
+    `).run(`bot_${Date.now()}`, d.phone, d.contact_name || d.phone, text, now, now);
+    let calendar = null;
+    if (d.proposed_event) {
+      const ev = d.proposed_event;
+      calendar = await createCalendarEvent({
+        title: `[DA CONFERMARE] ${ev.reason} \u2014 ${d.contact_name || d.phone}`,
+        description: `Appuntamento proposto dal chatbot WhatsApp.
+Cliente: ${d.contact_name || ""} (${d.phone})
+Motivo: ${ev.reason}
+
+\u26A0\uFE0F Confermare con il cliente.`,
+        startDate: `${ev.date}T${ev.start}:00`,
+        endDate: `${ev.date}T${ev.end}:00`
+      });
+    }
+    markDraftSent(id);
+    broadcastEvent("message", { type: "sent", phone: d.phone, contactName: d.contact_name, content: text, timestamp: now });
+    res.json({ success: true, calendar });
+  } catch (err) {
+    console.error("[Bot approve] Error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+router.post("/bot/daily-digest", async (req, res) => {
+  try {
+    const date = req.query.date || void 0;
+    res.json(await runDailyDigest(date));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.get("/bot/flow-health", (_req, res) => {
+  res.json(getFlowHealth());
+});
+router.post("/bot/repair-webhook", async (_req, res) => {
+  try {
+    res.json(await repairWebhook());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 var routes_default = router;
 
 // server/index.ts
@@ -25643,6 +26235,7 @@ app.listen(PORT, () => {
   setTimeout(() => {
     startPolling(3e4);
   }, 2e3);
+  startMaintenance();
 });
 var server_default = app;
 /*! Bundled license information:

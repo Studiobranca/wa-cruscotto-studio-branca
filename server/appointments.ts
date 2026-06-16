@@ -6,7 +6,7 @@
  *  - mattina 9:00–13:00 (lun–ven), pomeriggio 15:00–18:00 (lun, mar, gio)
  *  - ESCLUSI: mercoledì pomeriggio, venerdì pomeriggio, sabato, domenica
  *  - ESCLUSE: feste comandate italiane (incl. lunedì dell'Angelo)
- *  - ESCLUSA: chiusura estiva 10 luglio – 20 agosto (ogni anno)
+ *  - ESCLUSA: chiusura estiva 20 luglio – 31 agosto (ogni anno)
  */
 
 const TZ = 'Europe/Rome';
@@ -58,7 +58,7 @@ function isHoliday(ds: string): boolean {
 
 function isSummerClosure(ds: string): boolean {
   const md = ds.slice(5); // MM-DD
-  return md >= '07-10' && md <= '08-20';
+  return md >= '07-20' && md <= '08-31';
 }
 
 interface Slot { date: string; start: string; end: string; dow: number; }
@@ -126,6 +126,37 @@ export async function getAvailability(days = 14): Promise<{ slots: Slot[]; calen
     return !busy.some(b => b.start < en && b.end > st);
   });
   return { slots: free, calendarChecked };
+}
+
+/**
+ * Verifica se uno slot specifico è occupato in Google Calendar (freeBusy).
+ * Usato al momento dell'approvazione di un appuntamento per avvisare Mariano
+ * se nel frattempo è diventato impegnato. Ritorna { busy, checked }: se il
+ * calendario non è verificabile (checked=false) NON si blocca l'approvazione.
+ */
+export async function isSlotBusy(date: string, start: string, end: string): Promise<{ busy: boolean; checked: boolean }> {
+  const token = await getGoogleAccessToken();
+  if (!token) return { busy: false, checked: false };
+  const off = romeOffset(date);
+  try {
+    const resp = await fetch('https://www.googleapis.com/calendar/v3/freeBusy', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        timeMin: `${date}T${start}:00${off}`,
+        timeMax: `${date}T${end}:00${off}`,
+        timeZone: TZ,
+        items: [{ id: process.env.GOOGLE_CALENDAR_ID || 'primary' }],
+      }),
+    });
+    if (!resp.ok) return { busy: false, checked: false };
+    const data = await resp.json() as any;
+    const cal = data.calendars?.[Object.keys(data.calendars || {})[0]];
+    const busy = (cal?.busy || []).length > 0;
+    return { busy, checked: true };
+  } catch {
+    return { busy: false, checked: false };
+  }
 }
 
 const DOW_IT = ['domenica', 'lunedì', 'martedì', 'mercoledì', 'giovedì', 'venerdì', 'sabato'];

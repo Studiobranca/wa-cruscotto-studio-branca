@@ -40,6 +40,25 @@ export async function sendTextMessage(phone: string, message: string): Promise<a
   return zapiPost('send-text', { phone, message });
 }
 
+// ─── Riparazione flusso: (ri)registra il webhook di ricezione su Z-API ───────
+export async function getReceivedWebhook(): Promise<string | null> {
+  try {
+    const r = await zapiGet('webhooks');
+    return r?.value ?? r?.delivery ?? r?.received ?? null;
+  } catch { return null; }
+}
+
+export async function setReceivedWebhook(url: string): Promise<boolean> {
+  try {
+    // Z-API: aggiorna l'URL su cui vengono inoltrati i messaggi in arrivo.
+    await zapiPost('update-webhook-received', { value: url });
+    return true;
+  } catch (e) {
+    console.error('[ZAPI] setReceivedWebhook fallito:', (e as any).message);
+    return false;
+  }
+}
+
 export async function syncContacts(): Promise<number> {
   const { db } = await import('./db.js');
   let page = 1;
