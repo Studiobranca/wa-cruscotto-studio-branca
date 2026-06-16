@@ -24029,7 +24029,8 @@ __export(zapi_exports, {
   syncContacts: () => syncContacts,
   zapiGet: () => zapiGet,
   zapiHeaders: () => zapiHeaders,
-  zapiPost: () => zapiPost
+  zapiPost: () => zapiPost,
+  zapiPut: () => zapiPut
 });
 async function zapiGet(endpoint) {
   const url = `${ZAPI_BASE}${endpoint}`;
@@ -24056,6 +24057,19 @@ async function zapiPost(endpoint, body) {
   }
   return response.json();
 }
+async function zapiPut(endpoint, body) {
+  const url = `${ZAPI_BASE}${endpoint}`;
+  const response = await fetch(url, {
+    method: "PUT",
+    headers: zapiHeaders,
+    body: JSON.stringify(body)
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Z-API PUT ${endpoint} failed: ${response.status} - ${text}`);
+  }
+  return response.json();
+}
 async function sendTextMessage(phone, message) {
   return zapiPost("send-text", { phone, message });
 }
@@ -24069,7 +24083,7 @@ async function getReceivedWebhook() {
 }
 async function setReceivedWebhook(url) {
   try {
-    await zapiPost("update-webhook-received", { value: url });
+    await zapiPut("update-webhook-received", { value: url, notifySentByMe: true });
     return true;
   } catch (e) {
     console.error("[ZAPI] setReceivedWebhook fallito:", e.message);
@@ -26386,17 +26400,16 @@ router.post("/bot/enable-self-commands", async (_req, res) => {
   const base = process.env.PUBLIC_BASE_URL || "https://wa-cruscotto-v2-production.up.railway.app";
   const url = `${base}/api/webhook/message`;
   const results = {};
+  const { zapiPut: zapiPut2 } = await Promise.resolve().then(() => (init_zapi(), zapi_exports));
   const attempts = [
     ["update-webhook-received", { value: url, notifySentByMe: true }],
-    ["update-webhook-received-delivery", { value: url }],
-    ["update-settings", { notifySentByMe: true }]
+    ["update-webhook-received", { value: url }]
   ];
   for (const [path3, body] of attempts) {
     try {
-      const { zapiPost: zapiPost2 } = await Promise.resolve().then(() => (init_zapi(), zapi_exports));
-      results[path3] = await zapiPost2(path3, body);
+      results[`PUT ${path3} ${JSON.stringify(body)}`] = await zapiPut2(path3, body);
     } catch (e) {
-      results[path3] = { error: e.message };
+      results[`PUT ${path3} ${JSON.stringify(body)}`] = { error: e.message };
     }
   }
   res.json({ webhook: url, results });

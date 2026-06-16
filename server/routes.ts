@@ -1248,17 +1248,16 @@ router.post('/bot/enable-self-commands', async (_req: Request, res: Response) =>
   const base = process.env.PUBLIC_BASE_URL || 'https://wa-cruscotto-v2-production.up.railway.app';
   const url = `${base}/api/webhook/message`;
   const results: any = {};
-  // Prova le varianti note dell'API Z-API per "notifica messaggi inviati da me"
+  const { zapiPut } = await import('./zapi.js');
+  // Z-API usa PUT. notifySentByMe = inoltra al webhook anche i messaggi inviati da
+  // Mariano (così i comandi OK/NO arrivano). Provo le varianti note.
   const attempts: Array<[string, any]> = [
     ['update-webhook-received', { value: url, notifySentByMe: true }],
-    ['update-webhook-received-delivery', { value: url }],
-    ['update-settings', { notifySentByMe: true }],
+    ['update-webhook-received', { value: url }],
   ];
   for (const [path, body] of attempts) {
-    try {
-      const { zapiPost } = await import('./zapi.js');
-      results[path] = await zapiPost(path, body);
-    } catch (e: any) { results[path] = { error: e.message }; }
+    try { results[`PUT ${path} ${JSON.stringify(body)}`] = await zapiPut(path, body); }
+    catch (e: any) { results[`PUT ${path} ${JSON.stringify(body)}`] = { error: e.message }; }
   }
   res.json({ webhook: url, results });
 });

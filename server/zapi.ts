@@ -36,6 +36,20 @@ export async function zapiPost(endpoint: string, body: any): Promise<any> {
   return response.json();
 }
 
+export async function zapiPut(endpoint: string, body: any): Promise<any> {
+  const url = `${ZAPI_BASE}${endpoint}`;
+  const response = await fetch(url, {
+    method: 'PUT',
+    headers: zapiHeaders,
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Z-API PUT ${endpoint} failed: ${response.status} - ${text}`);
+  }
+  return response.json();
+}
+
 export async function sendTextMessage(phone: string, message: string): Promise<any> {
   return zapiPost('send-text', { phone, message });
 }
@@ -50,8 +64,9 @@ export async function getReceivedWebhook(): Promise<string | null> {
 
 export async function setReceivedWebhook(url: string): Promise<boolean> {
   try {
-    // Z-API: aggiorna l'URL su cui vengono inoltrati i messaggi in arrivo.
-    await zapiPost('update-webhook-received', { value: url });
+    // Z-API: aggiorna l'URL dei messaggi in arrivo (metodo PUT). notifySentByMe
+    // chiede di inoltrare anche i messaggi inviati da Mariano stesso (i comandi).
+    await zapiPut('update-webhook-received', { value: url, notifySentByMe: true });
     return true;
   } catch (e) {
     console.error('[ZAPI] setReceivedWebhook fallito:', (e as any).message);
