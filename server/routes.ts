@@ -27,6 +27,7 @@ import {
   isBotEnabled,
   getBotModel,
   setSetting as setBotSetting,
+  recordClassification,
 } from './chatbot.js';
 import { runDailyDigest, getFlowHealth, repairWebhook } from './maintenance.js';
 
@@ -770,11 +771,18 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
           const pr = (c?.priority || 'none');
           if (pr === 'vip' || pr === 'high') return; // viplist → gestisce Mariano
           const cName = c?.contact_name || senderName || phone;
-          const result = await generateDraft(phone, cName);
-          if (result) {
-            const id = saveDraft({ phone, contactName: cName, incoming: content, result });
-            broadcastEvent('bot_draft', { id, phone, contactName: cName, needsHuman: result.needsHuman });
-            console.log(`[Chatbot] Bozza #${id} per ${cName} (${phone})${result.needsHuman ? ' [need_human]' : ''}`);
+          const day = (timestamp || new Date().toISOString()).slice(0, 10);
+          const outcome = await generateDraft(phone, cName);
+          if (outcome?.kind === 'personal') {
+            // Chat privata (anche da cliente-amico): nessuna bozza, e il messaggio
+            // resta marcato "personale" così il digest non lo riporta.
+            recordClassification(messageId, phone, day, 'personal');
+            console.log(`[Chatbot] Messaggio personale ignorato — ${cName} (${phone})`);
+          } else if (outcome?.kind === 'work' && outcome.result) {
+            recordClassification(messageId, phone, day, 'work');
+            const id = saveDraft({ phone, contactName: cName, incoming: content, result: outcome.result });
+            broadcastEvent('bot_draft', { id, phone, contactName: cName, needsHuman: outcome.result.needsHuman });
+            console.log(`[Chatbot] Bozza #${id} per ${cName} (${phone})${outcome.result.needsHuman ? ' [need_human]' : ''}`);
           }
         } catch (botErr: any) {
           console.error('[Chatbot] Error:', botErr.message);

@@ -24846,9 +24846,10 @@ REGOLE INDEROGABILI:
 5. Firma sempre: "Assistente Virtuale \u2014 AB STUDIO SRL".
 6. Resta SEMPRE sui temi dello studio: NON aggiungere chiacchiere personali, social o
    battute tratte dalla cronologia (inviti, eventi privati, vacanze, ecc.).
-7. Se la conversazione \xE8 chiaramente privata / non rivolta allo studio, NON inventare una
-   risposta: usa need_human con motivo "conversazione non pertinente" e scrivi un messaggio
-   neutro e brevissimo (o nulla di pi\xF9 della firma).
+7. MOLTI clienti sono anche amici e mescolano lavoro e chiacchiere personali. Occupati
+   SOLO del lavoro. Se l'ultimo messaggio del cliente NON contiene una richiesta/argomento
+   di studio (\xE8 solo personale, sociale, off-topic), chiama ignore_personal e NON produrre
+   alcun messaggio: di quella chat lo studio non si occupa.
 
 Il tuo output finale deve contenere ESCLUSIVAMENTE il testo del messaggio da inviare al
 cliente: NIENTE analisi, premesse, ragionamenti o commenti tra parentesi.`;
@@ -24884,6 +24885,15 @@ var TOOLS = [
     }
   },
   {
+    name: "ignore_personal",
+    description: "Segnala che il messaggio \xE8 personale/non rivolto allo studio (chiacchiere, social, off-topic). Lo studio non se ne occupa: NON verr\xE0 prodotta alcuna risposta.",
+    input_schema: {
+      type: "object",
+      properties: { reason: { type: "string", description: "Perch\xE9 \xE8 personale/non pertinente" } },
+      required: ["reason"]
+    }
+  },
+  {
     name: "find_previous_requests",
     description: "Cerca nello storico dei messaggi del cliente se aveva gi\xE0 inviato lo stesso documento o fatto la stessa richiesta in passato. Usalo SEMPRE prima di rispondere a una richiesta/invio documenti.",
     input_schema: {
@@ -24911,6 +24921,20 @@ function buildTranscript(phone, contactName) {
 ${lines.join("\n")}
 
 Genera la prossima risposta dello STUDIO.`;
+}
+db_default.exec(`
+  CREATE TABLE IF NOT EXISTS bot_msg_class (
+    message_id TEXT PRIMARY KEY,
+    phone TEXT,
+    day TEXT,
+    kind TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_bot_msg_class_day ON bot_msg_class(day);
+`);
+function recordClassification(messageId, phone, day, kind) {
+  if (!messageId) return;
+  db_default.prepare(`INSERT OR REPLACE INTO bot_msg_class (message_id, phone, day, kind) VALUES (?, ?, ?, ?)`).run(messageId, phone, day, kind);
 }
 function endTime(start) {
   const [h, m] = start.split(":").map((x) => parseInt(x, 10));
@@ -24957,6 +24981,10 @@ Slot con data esatta da usare in propose_booking (date=YYYY-MM-DD, start=HH:MM):
     out.needsHuman = true;
     out.humanReason = String(input?.reason || "");
     return "Segnalato al Dott. Branca. Scrivi al cliente un messaggio rassicurante (verr\xE0 ricontattato al pi\xF9 presto).";
+  }
+  if (name === "ignore_personal") {
+    out.personal = true;
+    return "Ok: messaggio personale/non pertinente. NON produrre alcuna risposta.";
   }
   return "Strumento sconosciuto.";
 }
@@ -25023,8 +25051,9 @@ Data odierna: ${todayStr} (${todayISO}). Usa SEMPRE date coerenti con oggi e non
     }
     break;
   }
+  if (out.personal) return { kind: "personal", result: null };
   if (!out.draftText) return null;
-  return out;
+  return { kind: "work", result: out };
 }
 function saveDraft(d) {
   db_default.prepare(`UPDATE bot_drafts SET status = 'rejected' WHERE phone = ? AND status = 'pending'`).run(d.phone);
@@ -25095,9 +25124,13 @@ function buildDigest(dateISO) {
       AND COALESCE(c.priority, 'none') NOT IN ('vip', 'high')
     ORDER BY lm.timestamp ASC
   `).all(dateISO);
+  const cls = db_default.prepare(`SELECT phone, kind FROM bot_msg_class WHERE day = ?`).all(dateISO);
+  const workPhones = new Set(cls.filter((c) => c.kind === "work").map((c) => c.phone));
+  const personalOnly = new Set(cls.filter((c) => c.kind === "personal" && !workPhones.has(c.phone)).map((c) => c.phone));
   const byPhone = {};
   for (const r of rows) {
     const k = r.phone;
+    if (personalOnly.has(k)) continue;
     if (!byPhone[k]) byPhone[k] = { name: r.contact_name || r.phone, group: !!r.is_group, rx: 0, tx: 0, last: "" };
     if (r.direction === "sent") byPhone[k].tx++;
     else byPhone[k].rx++;
@@ -25107,7 +25140,7 @@ function buildDigest(dateISO) {
   const lines = entries.map(
     ([phone, v]) => `\u2022 ${v.name}${v.group ? " [GRUPPO]" : ""} \u2014 ${v.rx} ricevuti${v.tx ? `, ${v.tx} inviati` : ""}${v.last ? `: "${v.last}"` : ""}`
   );
-  const total = rows.length;
+  const total = entries.reduce((s, [, v]) => s + v.rx + v.tx, 0);
   const contacts = entries.length;
   const title = `\u{1F4F1} WhatsApp ${dateISO}: ${total} msg \xB7 ${contacts} contatti`;
   const description = entries.length ? `Riepilogo comunicazioni WhatsApp del giorno (clienti e gruppi in sola lettura).
@@ -25834,11 +25867,16 @@ Da confermare.`,
           const pr = c?.priority || "none";
           if (pr === "vip" || pr === "high") return;
           const cName = c?.contact_name || senderName || phone;
-          const result = await generateDraft(phone, cName);
-          if (result) {
-            const id = saveDraft({ phone, contactName: cName, incoming: content, result });
-            broadcastEvent("bot_draft", { id, phone, contactName: cName, needsHuman: result.needsHuman });
-            console.log(`[Chatbot] Bozza #${id} per ${cName} (${phone})${result.needsHuman ? " [need_human]" : ""}`);
+          const day = (timestamp || (/* @__PURE__ */ new Date()).toISOString()).slice(0, 10);
+          const outcome = await generateDraft(phone, cName);
+          if (outcome?.kind === "personal") {
+            recordClassification(messageId, phone, day, "personal");
+            console.log(`[Chatbot] Messaggio personale ignorato \u2014 ${cName} (${phone})`);
+          } else if (outcome?.kind === "work" && outcome.result) {
+            recordClassification(messageId, phone, day, "work");
+            const id = saveDraft({ phone, contactName: cName, incoming: content, result: outcome.result });
+            broadcastEvent("bot_draft", { id, phone, contactName: cName, needsHuman: outcome.result.needsHuman });
+            console.log(`[Chatbot] Bozza #${id} per ${cName} (${phone})${outcome.result.needsHuman ? " [need_human]" : ""}`);
           }
         } catch (botErr) {
           console.error("[Chatbot] Error:", botErr.message);
