@@ -141,6 +141,15 @@ async function watchdogTick(): Promise<void> {
 
 // ─── Scheduler interno ───────────────────────────────────────────────────────
 export function startMaintenance(): void {
+  // All'avvio: assicura che il webhook Z-API sia registrato con notifySentByMe,
+  // così i comandi WhatsApp di Mariano (fromMe) vengono sempre inoltrati. Idempotente.
+  setTimeout(async () => {
+    try {
+      const ok = await setReceivedWebhook(WEBHOOK_URL);
+      console.log(`[Maintenance] Webhook Z-API auto-configurato (notifySentByMe): ${ok ? 'OK' : 'FALLITO'}`);
+    } catch (e: any) { console.error('[Maintenance] auto-config webhook:', e.message); }
+  }, 5000);
+
   const tick = async () => {
     try {
       // Digest: alle 20:30 Rome (o dopo), una volta al giorno

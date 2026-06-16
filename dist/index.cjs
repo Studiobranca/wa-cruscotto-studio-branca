@@ -25344,6 +25344,14 @@ async function watchdogTick() {
   await repairWebhook();
 }
 function startMaintenance() {
+  setTimeout(async () => {
+    try {
+      const ok = await setReceivedWebhook(WEBHOOK_URL);
+      console.log(`[Maintenance] Webhook Z-API auto-configurato (notifySentByMe): ${ok ? "OK" : "FALLITO"}`);
+    } catch (e) {
+      console.error("[Maintenance] auto-config webhook:", e.message);
+    }
+  }, 5e3);
   const tick = async () => {
     try {
       const { iso, hour } = romeNow();
