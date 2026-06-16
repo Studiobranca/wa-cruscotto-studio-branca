@@ -17,6 +17,17 @@ import {
   markEventProcessed,
   getQueueStats,
 } from './integrations.js';
+import {
+  generateDraft,
+  saveDraft,
+  getPendingDrafts,
+  getDraft,
+  markDraftSent,
+  markDraftRejected,
+  isBotEnabled,
+  getBotModel,
+  setSetting as setBotSetting,
+} from './chatbot.js';
 
 const router = Router();
 
@@ -747,6 +758,29 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
     }
     // ────────────────────────────────────────────────────────────────────────
 
+    // ─── CHATBOT: bozza di risposta (draft mode, async non bloccante) ────────
+    // Genera una bozza SOLO per i clienti di lavoro: niente messaggi propri,
+    // gruppi o VIP/high (viplist gestita da Mariano). Non invia nulla: la bozza
+    // resta in attesa di approvazione nel Cruscotto.
+    if (!fromMe && !isGroup && content && content.trim().length > 2 && isBotEnabled()) {
+      setImmediate(async () => {
+        try {
+          const c = db.prepare(`SELECT contact_name, priority FROM conversations WHERE phone = ?`).get(phone) as any;
+          const pr = (c?.priority || 'none');
+          if (pr === 'vip' || pr === 'high') return; // viplist → gestisce Mariano
+          const cName = c?.contact_name || senderName || phone;
+          const result = await generateDraft(phone, cName);
+          if (result) {
+            const id = saveDraft({ phone, contactName: cName, incoming: content, result });
+            broadcastEvent('bot_draft', { id, phone, contactName: cName, needsHuman: result.needsHuman });
+            console.log(`[Chatbot] Bozza #${id} per ${cName} (${phone})${result.needsHuman ? ' [need_human]' : ''}`);
+          }
+        } catch (botErr: any) {
+          console.error('[Chatbot] Error:', botErr.message);
+        }
+      });
+    }
+
     res.json({ success: true });
   } catch (err: any) {
     console.error('[Webhook] Error:', err);
@@ -1090,6 +1124,81 @@ router.post('/admin/cleanup-test-data', (req: Request, res: Response) => {
     deleted += r3.changes + r4.changes;
     res.json({ success: true, deleted });
   } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── CHATBOT / BOZZE ─────────────────────────────────────────────────────────
+router.get('/bot/drafts', (_req: Request, res: Response) => {
+  try {
+    res.json(getPendingDrafts());
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/bot/config', (_req: Request, res: Response) => {
+  res.json({ enabled: isBotEnabled(), model: getBotModel() });
+});
+
+router.post('/bot/config', (req: Request, res: Response) => {
+  try {
+    const { enabled, model } = req.body || {};
+    if (enabled !== undefined) setBotSetting('bot_enabled', enabled ? '1' : '0');
+    if (model) setBotSetting('bot_model', String(model));
+    res.json({ enabled: isBotEnabled(), model: getBotModel() });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/bot/drafts/:id/reject', (req: Request, res: Response) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const d = getDraft(id);
+    if (!d) return res.status(404).json({ error: 'Bozza non trovata' });
+    markDraftRejected(id);
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/bot/drafts/:id/approve', async (req: Request, res: Response) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const d = getDraft(id);
+    if (!d) return res.status(404).json({ error: 'Bozza non trovata' });
+    if (d.status !== 'pending') return res.status(400).json({ error: 'Bozza già gestita' });
+
+    const text = (req.body?.text && String(req.body.text).trim()) || d.draft_text;
+
+    // 1. Invia il messaggio al cliente via Z-API
+    await sendTextMessage(d.phone, text);
+    const now = new Date().toISOString();
+    db.prepare(`
+      INSERT OR IGNORE INTO live_messages
+        (message_id, phone, contact_name, content, direction, timestamp, is_read, created_at)
+      VALUES (?, ?, ?, ?, 'sent', ?, 1, ?)
+    `).run(`bot_${Date.now()}`, d.phone, d.contact_name || d.phone, text, now, now);
+
+    // 2. Se c'è un appuntamento proposto → evento "[DA CONFERMARE]" su Calendar
+    let calendar: any = null;
+    if (d.proposed_event) {
+      const ev = d.proposed_event;
+      calendar = await createCalendarEvent({
+        title: `[DA CONFERMARE] ${ev.reason} — ${d.contact_name || d.phone}`,
+        description: `Appuntamento proposto dal chatbot WhatsApp.\nCliente: ${d.contact_name || ''} (${d.phone})\nMotivo: ${ev.reason}\n\n⚠️ Confermare con il cliente.`,
+        startDate: `${ev.date}T${ev.start}:00`,
+        endDate: `${ev.date}T${ev.end}:00`,
+      });
+    }
+
+    markDraftSent(id);
+    broadcastEvent('message', { type: 'sent', phone: d.phone, contactName: d.contact_name, content: text, timestamp: now });
+    res.json({ success: true, calendar });
+  } catch (err: any) {
+    console.error('[Bot approve] Error:', err);
     res.status(500).json({ error: err.message });
   }
 });

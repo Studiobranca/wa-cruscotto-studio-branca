@@ -24691,6 +24691,251 @@ function getQueueStats() {
   }
 }
 
+// server/chatbot.ts
+init_db();
+var ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
+var ANTHROPIC_VERSION = "2023-06-01";
+var DEFAULT_MODEL = "claude-sonnet-4-6";
+var MAX_TOOL_LOOPS = 4;
+var HISTORY_LIMIT = 20;
+db_default.exec(`
+  CREATE TABLE IF NOT EXISTS bot_drafts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    phone TEXT NOT NULL,
+    contact_name TEXT,
+    incoming_excerpt TEXT,
+    draft_text TEXT,
+    proposed_event TEXT,            -- JSON {date,start,end,reason} oppure NULL
+    needs_human INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'pending',  -- pending | sent | rejected
+    created_at TEXT DEFAULT (datetime('now')),
+    sent_at TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_bot_drafts_status ON bot_drafts(status);
+`);
+function getSetting(key, def) {
+  try {
+    const row = db_default.prepare(`SELECT value FROM app_settings WHERE key = ?`).get(key);
+    return row?.value ?? def;
+  } catch {
+    return def;
+  }
+}
+function setSetting(key, value) {
+  db_default.prepare(`
+    INSERT INTO app_settings (key, value) VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+  `).run(key, value);
+}
+function isBotEnabled() {
+  return getSetting("bot_enabled", "1") === "1";
+}
+function getBotModel() {
+  return getSetting("bot_model", DEFAULT_MODEL);
+}
+var SYSTEM_PROMPT = `Sei l'assistente virtuale di AB STUDIO SRL (Studio Tributario Branca),
+studio di commercialista/tributarista, consulente del lavoro e amministratore di condominio.
+Titolare: Dott. Mariano Branca \u2014 Via Operai 102, 98051 Barcellona P.G. (ME).
+Orari studio: Lun-Ven 9:00-13:00 e 15:30-19:00.
+
+Stai rispondendo a un cliente su WhatsApp. Obiettivo: dialogare in modo cordiale e
+professionale (dare del Lei), CAPIRE di cosa ha bisogno, RACCOGLIERE le informazioni
+utili e, se serve un incontro, PROPORRE un appuntamento gestendo l'agenda.
+
+REGOLE INDEROGABILI:
+1. Rispondi sempre in italiano, tono professionale ma cordiale, messaggi brevi da chat.
+2. NON dare MAI pareri o calcoli fiscali/legali precisi, importi, codici o scadenze via chat:
+   per la consulenza di merito raccogli i dati e proponi un appuntamento in studio.
+3. Per appuntamenti usa lo strumento get_availability per gli slot reali, poi proponi 2-3
+   opzioni; quando il cliente sceglie uno slot chiama propose_booking (l'appuntamento sar\xE0
+   confermato dallo studio).
+4. Urgenze gravi (cartella esattoriale, accertamento, udienza, atto notificato con termini):
+   NON gestirle da sola \u2192 chiama need_human; rassicura il cliente che il Dott. Branca verr\xE0
+   avvisato subito e chiedi di inviare copia dell'atto.
+5. Se il cliente invia documenti/foto, conferma la ricezione e indica che verranno esaminati.
+6. Firma sempre: "Assistente Virtuale \u2014 AB STUDIO SRL".
+
+Produci come messaggio finale SOLO il testo da inviare al cliente (niente preamboli).`;
+var TOOLS = [
+  {
+    name: "get_availability",
+    description: "Restituisce i prossimi slot liberi reali dell'agenda dello studio (incrocia Google Calendar con gli orari studio). Usalo prima di proporre un appuntamento.",
+    input_schema: {
+      type: "object",
+      properties: { days: { type: "integer", description: "Giorni avanti da considerare (default 14)" } }
+    }
+  },
+  {
+    name: "propose_booking",
+    description: `Registra la proposta di appuntamento sullo slot scelto dal cliente. NON conferma definitivamente: l'evento verr\xE0 creato come "DA CONFERMARE" e validato dallo studio.`,
+    input_schema: {
+      type: "object",
+      properties: {
+        date: { type: "string", description: "Data YYYY-MM-DD" },
+        start: { type: "string", description: "Ora inizio HH:MM (24h)" },
+        reason: { type: "string", description: "Motivo/oggetto dell'appuntamento" }
+      },
+      required: ["date", "start", "reason"]
+    }
+  },
+  {
+    name: "need_human",
+    description: "Segnala che la richiesta \xE8 urgente o complessa e deve gestirla direttamente il Dott. Branca (no risposta automatica risolutiva).",
+    input_schema: {
+      type: "object",
+      properties: { reason: { type: "string", description: "Perch\xE9 serve l'intervento umano" } },
+      required: ["reason"]
+    }
+  }
+];
+function buildTranscript(phone, contactName) {
+  const rows = db_default.prepare(`
+    SELECT direction, content, is_audio, is_image
+    FROM live_messages
+    WHERE phone = ? AND content IS NOT NULL AND content != ''
+    ORDER BY timestamp DESC, id DESC
+    LIMIT ?
+  `).all(phone, HISTORY_LIMIT);
+  rows.reverse();
+  const lines = rows.map((r) => {
+    const who = r.direction === "sent" ? "STUDIO" : "CLIENTE";
+    return `[${who}] ${(r.content || "").replace(/\n+/g, " ").trim()}`;
+  });
+  return `Conversazione WhatsApp con ${contactName} (${phone}):
+
+${lines.join("\n")}
+
+Genera la prossima risposta dello STUDIO.`;
+}
+function endTime(start) {
+  const [h, m] = start.split(":").map((x) => parseInt(x, 10));
+  const eh = (h + 1) % 24;
+  return `${String(eh).padStart(2, "0")}:${String(m || 0).padStart(2, "0")}`;
+}
+async function runTool(name, input, out) {
+  if (name === "get_availability") {
+    const days = Math.min(Math.max(parseInt(input?.days, 10) || 14, 1), 30);
+    const { slots, calendarChecked } = await getAvailability(days);
+    const txt = formatAvailabilityIT(slots);
+    const iso = slots.slice(0, 12).map((s) => `${s.date} ${s.start}`).join("; ");
+    return `${calendarChecked ? "" : "(agenda non verificata su Calendar) "}Prossime disponibilit\xE0 (da mostrare al cliente):
+${txt}
+
+Slot con data esatta da usare in propose_booking (date=YYYY-MM-DD, start=HH:MM): ${iso}`;
+  }
+  if (name === "propose_booking") {
+    const date = String(input?.date || "");
+    const start = String(input?.start || "");
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !/^\d{1,2}:\d{2}$/.test(start)) {
+      return "Errore: data o ora non valide. Usa get_availability e riprova con uno slot esatto.";
+    }
+    out.proposedEvent = { date, start, end: endTime(start), reason: String(input?.reason || "Appuntamento") };
+    return "Proposta registrata. L'appuntamento sar\xE0 confermato dallo studio: comunica al cliente che \xE8 in fase di conferma e ringrazia.";
+  }
+  if (name === "need_human") {
+    out.needsHuman = true;
+    out.humanReason = String(input?.reason || "");
+    return "Segnalato al Dott. Branca. Scrivi al cliente un messaggio rassicurante (verr\xE0 ricontattato al pi\xF9 presto).";
+  }
+  return "Strumento sconosciuto.";
+}
+async function generateDraft(phone, contactName) {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    console.warn("[Chatbot] ANTHROPIC_API_KEY non configurata: bozza non generata.");
+    return null;
+  }
+  const out = { draftText: "", proposedEvent: null, needsHuman: false };
+  const messages = [{ role: "user", content: buildTranscript(phone, contactName) }];
+  const todayStr = (/* @__PURE__ */ new Date()).toLocaleDateString("it-IT", {
+    weekday: "long",
+    day: "numeric",
+    month: "long",
+    year: "numeric",
+    timeZone: "Europe/Rome"
+  });
+  const todayISO = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Rome" }).format(/* @__PURE__ */ new Date());
+  const system = `${SYSTEM_PROMPT}
+
+Data odierna: ${todayStr} (${todayISO}). Usa SEMPRE date coerenti con oggi e non inventare l'anno.`;
+  for (let loop = 0; loop < MAX_TOOL_LOOPS; loop++) {
+    let data;
+    try {
+      const resp = await fetch(ANTHROPIC_URL, {
+        method: "POST",
+        headers: {
+          "x-api-key": apiKey,
+          "anthropic-version": ANTHROPIC_VERSION,
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({
+          model: getBotModel(),
+          max_tokens: 1024,
+          system,
+          tools: TOOLS,
+          messages
+        })
+      });
+      if (!resp.ok) {
+        console.error("[Chatbot] Anthropic HTTP", resp.status, (await resp.text()).substring(0, 200));
+        return null;
+      }
+      data = await resp.json();
+    } catch (e) {
+      console.error("[Chatbot] Errore chiamata Anthropic:", e.message);
+      return null;
+    }
+    const blocks = data.content || [];
+    const text = blocks.filter((b) => b.type === "text").map((b) => b.text).join("").trim();
+    if (text) out.draftText = text;
+    if (data.stop_reason === "tool_use") {
+      messages.push({ role: "assistant", content: blocks });
+      const toolResults = [];
+      for (const b of blocks) {
+        if (b.type === "tool_use") {
+          const result = await runTool(b.name, b.input, out);
+          toolResults.push({ type: "tool_result", tool_use_id: b.id, content: result });
+        }
+      }
+      messages.push({ role: "user", content: toolResults });
+      continue;
+    }
+    break;
+  }
+  if (!out.draftText) return null;
+  return out;
+}
+function saveDraft(d) {
+  db_default.prepare(`UPDATE bot_drafts SET status = 'rejected' WHERE phone = ? AND status = 'pending'`).run(d.phone);
+  const info = db_default.prepare(`
+    INSERT INTO bot_drafts (phone, contact_name, incoming_excerpt, draft_text, proposed_event, needs_human, status)
+    VALUES (?, ?, ?, ?, ?, ?, 'pending')
+  `).run(
+    d.phone,
+    d.contactName,
+    (d.incoming || "").substring(0, 300),
+    d.result.draftText,
+    d.result.proposedEvent ? JSON.stringify(d.result.proposedEvent) : null,
+    d.result.needsHuman ? 1 : 0
+  );
+  return Number(info.lastInsertRowid);
+}
+function getPendingDrafts() {
+  const rows = db_default.prepare(`SELECT * FROM bot_drafts WHERE status = 'pending' ORDER BY created_at DESC`).all();
+  return rows.map((r) => ({ ...r, proposed_event: r.proposed_event ? JSON.parse(r.proposed_event) : null }));
+}
+function getDraft(id) {
+  const r = db_default.prepare(`SELECT * FROM bot_drafts WHERE id = ?`).get(id);
+  if (!r) return null;
+  return { ...r, proposed_event: r.proposed_event ? JSON.parse(r.proposed_event) : null };
+}
+function markDraftSent(id) {
+  db_default.prepare(`UPDATE bot_drafts SET status = 'sent', sent_at = datetime('now') WHERE id = ?`).run(id);
+}
+function markDraftRejected(id) {
+  db_default.prepare(`UPDATE bot_drafts SET status = 'rejected' WHERE id = ?`).run(id);
+}
+
 // server/routes.ts
 var router = (0, import_express.Router)();
 try {
@@ -25341,6 +25586,24 @@ Da confermare.`,
         }
       });
     }
+    if (!fromMe && !isGroup && content && content.trim().length > 2 && isBotEnabled()) {
+      setImmediate(async () => {
+        try {
+          const c = db_default.prepare(`SELECT contact_name, priority FROM conversations WHERE phone = ?`).get(phone);
+          const pr = c?.priority || "none";
+          if (pr === "vip" || pr === "high") return;
+          const cName = c?.contact_name || senderName || phone;
+          const result = await generateDraft(phone, cName);
+          if (result) {
+            const id = saveDraft({ phone, contactName: cName, incoming: content, result });
+            broadcastEvent("bot_draft", { id, phone, contactName: cName, needsHuman: result.needsHuman });
+            console.log(`[Chatbot] Bozza #${id} per ${cName} (${phone})${result.needsHuman ? " [need_human]" : ""}`);
+          }
+        } catch (botErr) {
+          console.error("[Chatbot] Error:", botErr.message);
+        }
+      });
+    }
     res.json({ success: true });
   } catch (err) {
     console.error("[Webhook] Error:", err);
@@ -25611,6 +25874,73 @@ router.post("/admin/cleanup-test-data", (req, res) => {
     deleted += r3.changes + r4.changes;
     res.json({ success: true, deleted });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.get("/bot/drafts", (_req, res) => {
+  try {
+    res.json(getPendingDrafts());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.get("/bot/config", (_req, res) => {
+  res.json({ enabled: isBotEnabled(), model: getBotModel() });
+});
+router.post("/bot/config", (req, res) => {
+  try {
+    const { enabled, model } = req.body || {};
+    if (enabled !== void 0) setSetting("bot_enabled", enabled ? "1" : "0");
+    if (model) setSetting("bot_model", String(model));
+    res.json({ enabled: isBotEnabled(), model: getBotModel() });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.post("/bot/drafts/:id/reject", (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const d = getDraft(id);
+    if (!d) return res.status(404).json({ error: "Bozza non trovata" });
+    markDraftRejected(id);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.post("/bot/drafts/:id/approve", async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const d = getDraft(id);
+    if (!d) return res.status(404).json({ error: "Bozza non trovata" });
+    if (d.status !== "pending") return res.status(400).json({ error: "Bozza gi\xE0 gestita" });
+    const text = req.body?.text && String(req.body.text).trim() || d.draft_text;
+    await sendTextMessage(d.phone, text);
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    db_default.prepare(`
+      INSERT OR IGNORE INTO live_messages
+        (message_id, phone, contact_name, content, direction, timestamp, is_read, created_at)
+      VALUES (?, ?, ?, ?, 'sent', ?, 1, ?)
+    `).run(`bot_${Date.now()}`, d.phone, d.contact_name || d.phone, text, now, now);
+    let calendar = null;
+    if (d.proposed_event) {
+      const ev = d.proposed_event;
+      calendar = await createCalendarEvent({
+        title: `[DA CONFERMARE] ${ev.reason} \u2014 ${d.contact_name || d.phone}`,
+        description: `Appuntamento proposto dal chatbot WhatsApp.
+Cliente: ${d.contact_name || ""} (${d.phone})
+Motivo: ${ev.reason}
+
+\u26A0\uFE0F Confermare con il cliente.`,
+        startDate: `${ev.date}T${ev.start}:00`,
+        endDate: `${ev.date}T${ev.end}:00`
+      });
+    }
+    markDraftSent(id);
+    broadcastEvent("message", { type: "sent", phone: d.phone, contactName: d.contact_name, content: text, timestamp: now });
+    res.json({ success: true, calendar });
+  } catch (err) {
+    console.error("[Bot approve] Error:", err);
     res.status(500).json({ error: err.message });
   }
 });

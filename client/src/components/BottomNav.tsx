@@ -1,9 +1,10 @@
 import { useLocation, Link } from 'wouter';
-import { LayoutDashboard, MessageSquare, BarChart2, Plug, Settings } from 'lucide-react';
+import { LayoutDashboard, MessageSquare, Bot, BarChart2, Plug, Settings } from 'lucide-react';
 
 const navItems = [
   { path: '/', label: 'Home', icon: LayoutDashboard },
   { path: '/inbox', label: 'Inbox', icon: MessageSquare },
+  { path: '/bot', label: 'Bozze', icon: Bot },
   { path: '/report', label: 'Report', icon: BarChart2 },
   { path: '/integrations', label: 'Connettori', icon: Plug },
   { path: '/settings', label: 'Config', icon: Settings },
