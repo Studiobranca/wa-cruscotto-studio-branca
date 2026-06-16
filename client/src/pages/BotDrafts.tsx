@@ -121,11 +121,11 @@ export default function BotDrafts() {
             Avvisami su WhatsApp{config?.controlNumber ? ` (${config.controlNumber})` : ''}
           </div>
           <select
-            value={config?.notifyMode ?? 'outside_hours'}
+            value={config?.notifyMode ?? 'always'}
             onChange={(e) => setNotify.mutate(e.target.value)}
             style={{ padding: '6px 10px', borderRadius: 8, border: '1px solid #ddd', fontSize: 13 }}>
-            <option value="outside_hours">Solo fuori orario (sere/weekend)</option>
             <option value="always">Sempre</option>
+            <option value="outside_hours">Solo fuori orario (sere/weekend)</option>
             <option value="off">Mai (solo Cruscotto)</option>
           </select>
         </div>
