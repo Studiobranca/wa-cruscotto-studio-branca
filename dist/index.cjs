@@ -26432,11 +26432,12 @@ router.post("/bot/enable-self-commands", async (_req, res) => {
   const { zapiPut: zapiPut2 } = await Promise.resolve().then(() => (init_zapi(), zapi_exports));
   const attempts = [
     ["update-webhook-received", { value: url, notifySentByMe: true }],
-    ["update-webhook-received", { value: url }]
+    ["update-webhook-received", { value: url, notifySentByMe: true }]
   ];
   for (const [path3, body] of attempts) {
     try {
       results[`PUT ${path3} ${JSON.stringify(body)}`] = await zapiPut2(path3, body);
+      break;
     } catch (e) {
       results[`PUT ${path3} ${JSON.stringify(body)}`] = { error: e.message };
     }

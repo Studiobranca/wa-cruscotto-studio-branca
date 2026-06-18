@@ -1267,14 +1267,23 @@ router.post('/bot/enable-self-commands', async (_req: Request, res: Response) =>
   const results: any = {};
   const { zapiPut } = await import('./zapi.js');
   // Z-API usa PUT. notifySentByMe = inoltra al webhook anche i messaggi inviati da
-  // Mariano (così i comandi OK/NO arrivano). Provo le varianti note.
+  // Mariano (così i comandi OK/NO e le risposte dal telefono arrivano al cruscotto).
+  // FIX 18/06/2026: prima c'erano DUE chiamate eseguite in sequenza e la 2ª, SENZA
+  // notifySentByMe, SOVRASCRIVEVA la 1ª riportando il flag a false → rispondere da
+  // WhatsApp non aggiornava più la gestione messaggi. Ora il flag c'è in ENTRAMBE le
+  // varianti e ci si ferma al PRIMO successo (mai sovrascrivere con una variante che
+  // azzera il flag).
   const attempts: Array<[string, any]> = [
     ['update-webhook-received', { value: url, notifySentByMe: true }],
-    ['update-webhook-received', { value: url }],
+    ['update-webhook-received', { value: url, notifySentByMe: true }],
   ];
   for (const [path, body] of attempts) {
-    try { results[`PUT ${path} ${JSON.stringify(body)}`] = await zapiPut(path, body); }
-    catch (e: any) { results[`PUT ${path} ${JSON.stringify(body)}`] = { error: e.message }; }
+    try {
+      results[`PUT ${path} ${JSON.stringify(body)}`] = await zapiPut(path, body);
+      break; // primo successo basta: non riregistrare con varianti successive
+    } catch (e: any) {
+      results[`PUT ${path} ${JSON.stringify(body)}`] = { error: e.message };
+    }
   }
   res.json({ webhook: url, results });
 });
