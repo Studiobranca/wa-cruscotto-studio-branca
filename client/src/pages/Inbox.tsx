@@ -1,11 +1,11 @@
 import { useState, useEffect, useRef } from 'react';
-import { useConversations, useMessages, useSendMessage, useSetPriority, useAutoReply, useSSE } from '../lib/hooks';
+import { useConversations, useMessages, useSendMessage, useSetPriority, useAutoReply, useDeleteMessage, useDeleteConversation, useSSE } from '../lib/hooks';
 import { flashScreen } from '../lib/useFlash';
 import RequestsPanel from '../components/RequestsPanel';
 import PriorityBadge from '../components/PriorityBadge';
 import Loader from '../components/Loader';
 import type { Conversation } from '../lib/types';
-import { Search, Send, ArrowLeft, MoreVertical, Star, AlertTriangle, User, Volume2, Bot, X } from 'lucide-react';
+import { Search, Send, ArrowLeft, MoreVertical, Star, AlertTriangle, User, Volume2, Bot, X, Trash2 } from 'lucide-react';
 
 export default function Inbox() {
   const [selectedPhone, setSelectedPhone] = useState<string | null>(null);
@@ -23,6 +23,8 @@ export default function Inbox() {
   const sendMsg = useSendMessage(selectedPhone || '');
   const setPriority = useSetPriority(selectedPhone || '');
   const autoReplyMutation = useAutoReply(selectedPhone || '');
+  const deleteMsg = useDeleteMessage(selectedPhone || '');
+  const deleteConv = useDeleteConversation();
 
   const connectSSE = useSSE((type, data) => {
     if (type === 'message') {
@@ -74,6 +76,23 @@ export default function Inbox() {
     } catch (e) {
       console.error('Send error:', e);
     }
+  };
+
+  const handleDeleteMessage = (id: number) => {
+    if (!window.confirm('Eliminare definitivamente questo messaggio dal cruscotto?\nL\'operazione non è reversibile.')) return;
+    deleteMsg.mutate(id);
+  };
+
+  const handleDeleteConversation = () => {
+    if (!selectedPhone) return;
+    const nome = selectedConv?.contactName || selectedPhone;
+    if (!window.confirm(`Eliminare DEFINITIVAMENTE tutta la conversazione con ${nome}?\nVerranno rimossi tutti i messaggi dal cruscotto. Operazione non reversibile.`)) return;
+    deleteConv.mutate(selectedPhone, {
+      onSuccess: () => {
+        setShowPriorityMenu(false);
+        setSelectedPhone(null);
+      },
+    });
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -239,6 +258,9 @@ export default function Inbox() {
                       <button onClick={() => { setPriority.mutate({ priority: 'none', priorityLabel: '' }); setShowPriorityMenu(false); }}>
                         Nessuna
                       </button>
+                      <button className="priority-dropdown-danger" onClick={handleDeleteConversation}>
+                        <Trash2 size={14} /> Elimina conversazione
+                      </button>
                     </div>
                   )}
                 </div>
@@ -318,6 +340,13 @@ export default function Inbox() {
                       <div className="message-time">
                         {formatTime(msg.timestamp || msg.createdAt)}
                       </div>
+                      <button
+                        className="msg-del-btn"
+                        title="Elimina messaggio definitivamente"
+                        onClick={() => handleDeleteMessage(msg.id)}
+                      >
+                        <Trash2 size={12} />
+                      </button>
                     </div>
                   ))
                 )}

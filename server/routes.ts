@@ -491,6 +491,42 @@ router.patch('/conversations/:phone/archive', (req: Request, res: Response) => {
   }
 });
 
+// ─── Eliminazione DEFINITIVA (non è un semplice "archivia") ──────────────────────
+// Rimuove i dati dalla banca dati del cruscotto in modo permanente e non reversibile.
+// NB: NON ritira il messaggio da WhatsApp/Z-API né dal telefono del destinatario:
+// pulisce solo ciò che è memorizzato qui (inbox/dashboard).
+
+// Elimina un singolo messaggio per id.
+router.delete('/messages/:id', (req: Request, res: Response) => {
+  try {
+    const id = parseInt(String(req.params.id), 10);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: 'id non valido' });
+    const row = db.prepare(`SELECT phone FROM live_messages WHERE id = ?`).get(id) as any;
+    if (!row) return res.status(404).json({ error: 'Messaggio non trovato' });
+    const r = db.prepare(`DELETE FROM live_messages WHERE id = ?`).run(id);
+    // I contatori della lista conversazioni sono ricalcolati dinamicamente dai
+    // live_messages, quindi non serve correggerli a mano.
+    broadcastEvent('sync', { action: 'message-deleted', id, phone: row.phone, timestamp: new Date().toISOString() });
+    res.json({ success: true, deleted: r.changes, phone: row.phone });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Elimina un'intera conversazione: tutti i suoi messaggi + la riga conversazione.
+router.delete('/conversations/:phone', (req: Request, res: Response) => {
+  try {
+    const { phone } = req.params;
+    if (!phone) return res.status(400).json({ error: 'phone richiesto' });
+    const r1 = db.prepare(`DELETE FROM live_messages WHERE phone = ?`).run(phone);
+    const r2 = db.prepare(`DELETE FROM conversations WHERE phone = ?`).run(phone);
+    broadcastEvent('sync', { action: 'conversation-deleted', phone, timestamp: new Date().toISOString() });
+    res.json({ success: true, deletedMessages: r1.changes, deletedConversation: r2.changes });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── Webhook ──────────────────────────────────────────────────────────────────
 
 router.post('/webhook/message', async (req: Request, res: Response) => {

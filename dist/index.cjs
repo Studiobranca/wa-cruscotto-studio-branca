@@ -25770,6 +25770,31 @@ router.patch("/conversations/:phone/archive", (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+router.delete("/messages/:id", (req, res) => {
+  try {
+    const id = parseInt(String(req.params.id), 10);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: "id non valido" });
+    const row = db_default.prepare(`SELECT phone FROM live_messages WHERE id = ?`).get(id);
+    if (!row) return res.status(404).json({ error: "Messaggio non trovato" });
+    const r = db_default.prepare(`DELETE FROM live_messages WHERE id = ?`).run(id);
+    broadcastEvent("sync", { action: "message-deleted", id, phone: row.phone, timestamp: (/* @__PURE__ */ new Date()).toISOString() });
+    res.json({ success: true, deleted: r.changes, phone: row.phone });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.delete("/conversations/:phone", (req, res) => {
+  try {
+    const { phone } = req.params;
+    if (!phone) return res.status(400).json({ error: "phone richiesto" });
+    const r1 = db_default.prepare(`DELETE FROM live_messages WHERE phone = ?`).run(phone);
+    const r2 = db_default.prepare(`DELETE FROM conversations WHERE phone = ?`).run(phone);
+    broadcastEvent("sync", { action: "conversation-deleted", phone, timestamp: (/* @__PURE__ */ new Date()).toISOString() });
+    res.json({ success: true, deletedMessages: r1.changes, deletedConversation: r2.changes });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 router.post("/webhook/message", async (req, res) => {
   try {
     const body = req.body;

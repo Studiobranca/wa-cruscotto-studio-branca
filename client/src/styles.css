@@ -552,6 +552,31 @@ input, textarea, select {
 
 .priority-dropdown button:hover { background: var(--bg3); }
 
+.priority-dropdown-danger {
+  color: #ef4444 !important;
+  border-top: 1px solid var(--border);
+  margin-top: 4px;
+  padding-top: 8px !important;
+}
+.priority-dropdown-danger:hover { background: rgba(239,68,68,0.12) !important; }
+
+.msg-del-btn {
+  position: absolute;
+  top: 2px;
+  right: 4px;
+  background: none;
+  border: none;
+  color: inherit;
+  opacity: 0.3;
+  cursor: pointer;
+  padding: 2px;
+  line-height: 0;
+  border-radius: 4px;
+  transition: opacity .15s, color .15s, background .15s;
+}
+.message-bubble:hover .msg-del-btn { opacity: 0.75; }
+.msg-del-btn:hover { opacity: 1; color: #ef4444; background: rgba(239,68,68,0.15); }
+
 .messages-area {
   flex: 1;
   overflow-y: auto;
