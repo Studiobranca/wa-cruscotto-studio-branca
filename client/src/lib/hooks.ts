@@ -113,6 +113,30 @@ export function useAutoReply(phone: string) {
   });
 }
 
+export function useDeleteMessage(phone: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: number) => apiRequest('DELETE', `/api/messages/${id}`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['messages', phone] });
+      qc.invalidateQueries({ queryKey: ['conversations'] });
+      qc.invalidateQueries({ queryKey: ['overview'] });
+    },
+  });
+}
+
+export function useDeleteConversation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (phone: string) =>
+      apiRequest('DELETE', `/api/conversations/${encodeURIComponent(phone)}`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['conversations'] });
+      qc.invalidateQueries({ queryKey: ['overview'] });
+    },
+  });
+}
+
 // SSE hook
 export function useSSE(onEvent: (type: string, data: any) => void) {
   const qc = useQueryClient();

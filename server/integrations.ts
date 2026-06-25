@@ -273,6 +273,53 @@ export async function createCalendarEvent(params: {
 }
 
 /**
+ * Aggiorna (PATCH) un evento esistente su Google Calendar.
+ * Usato per confermare un appuntamento "[DA CONFERMARE]" quando il cliente conferma:
+ * cambia titolo, descrizione e colore. Tutti i campi sono opzionali (PATCH parziale).
+ */
+export async function updateCalendarEvent(params: {
+  eventId: string;
+  title?: string;
+  description?: string;
+  colorId?: string;        // es. '10' = verde "Basil" (confermato)
+  startDate?: string;      // ISO8601
+  endDate?: string;        // ISO8601
+  calendarId?: string;
+}): Promise<{ success: boolean; error?: string }> {
+  const token = await getGoogleAccessToken();
+  if (!token) return { success: false, error: 'Google OAuth non configurato' };
+  const calId = params.calendarId || process.env.GOOGLE_CALENDAR_ID || 'primary';
+
+  const body: Record<string, any> = {};
+  if (params.title !== undefined) body.summary = params.title;
+  if (params.description !== undefined) body.description = params.description;
+  if (params.colorId !== undefined) body.colorId = params.colorId;
+  if (params.startDate) body.start = { dateTime: params.startDate, timeZone: 'Europe/Rome' };
+  if (params.endDate) body.end = { dateTime: params.endDate, timeZone: 'Europe/Rome' };
+
+  try {
+    const resp = await fetch(
+      `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calId)}/events/${encodeURIComponent(params.eventId)}`,
+      {
+        method: 'PATCH',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      }
+    );
+    if (resp.ok) {
+      logIntegration({ integration: 'google_calendar', action: 'update_event', status: 'success', detail: `Evento ${params.eventId} aggiornato` });
+      return { success: true };
+    }
+    const err = await resp.text();
+    logIntegration({ integration: 'google_calendar', action: 'update_event', status: 'error', detail: `HTTP ${resp.status}: ${err.substring(0, 100)}` });
+    return { success: false, error: `HTTP ${resp.status}` };
+  } catch (e: any) {
+    logIntegration({ integration: 'google_calendar', action: 'update_event', status: 'error', detail: e.message });
+    return { success: false, error: e.message };
+  }
+}
+
+/**
  * Crea/aggiorna un evento "tutto il giorno" su Google Calendar.
  * Usato dal digest giornaliero: se eventId è fornito aggiorna (PATCH), altrimenti
  * crea. `date` = YYYY-MM-DD (l'evento copre l'intera giornata, transparent = non
