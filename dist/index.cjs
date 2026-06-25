@@ -24226,10 +24226,10 @@ function isSummerClosure(ds) {
 function daySlots(ds, dow) {
   if (dow === 0 || dow === 6) return [];
   if (isHoliday(ds) || isSummerClosure(ds)) return [];
+  const fullDay = dow === 1 || dow === 2 || dow === 4;
+  const lastHour = fullDay ? 18 : 13;
   const out = [];
-  for (let h = 9; h < 13; h++) out.push({ date: ds, start: `${String(h).padStart(2, "0")}:00`, end: `${String(h + 1).padStart(2, "0")}:00`, dow });
-  const afternoonOk = dow === 1 || dow === 2 || dow === 4;
-  if (afternoonOk) for (let h = 15; h < 18; h++) out.push({ date: ds, start: `${String(h).padStart(2, "0")}:00`, end: `${String(h + 1).padStart(2, "0")}:00`, dow });
+  for (let h = 9; h < lastHour; h++) out.push({ date: ds, start: `${String(h).padStart(2, "0")}:00`, end: `${String(h + 1).padStart(2, "0")}:00`, dow });
   return out;
 }
 function romeOffset(ds) {
@@ -24643,6 +24643,27 @@ async function updateCalendarEvent(params) {
     return { success: false, error: e.message };
   }
 }
+async function appendEventDescription(eventId, text, calendarId) {
+  const token = await getGoogleAccessToken2();
+  if (!token) return { success: false, error: "Google OAuth non configurato" };
+  const calId = calendarId || process.env.GOOGLE_CALENDAR_ID || "primary";
+  try {
+    const getResp = await fetch(
+      `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calId)}/events/${encodeURIComponent(eventId)}`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    let desc = "";
+    if (getResp.ok) {
+      const ev = await getResp.json();
+      desc = ev.description || "";
+    }
+    const newDesc = desc ? `${desc}
+${text}` : text;
+    return updateCalendarEvent({ eventId, description: newDesc, calendarId: calId });
+  } catch (e) {
+    return { success: false, error: e.message };
+  }
+}
 async function upsertAllDayEvent(params) {
   const token = await getGoogleAccessToken2();
   if (!token) return { success: false, error: "Google OAuth non configurato" };
@@ -24878,6 +24899,36 @@ db_default.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_bot_appt_phone ON bot_appointments(phone, status);
 `);
+db_default.exec(`
+  CREATE TABLE IF NOT EXISTS bot_doc_notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    phone TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    attached INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_bot_doc_notes_phone ON bot_doc_notes(phone, attached);
+`);
+function recordDocNote(phone, summary) {
+  db_default.prepare(`INSERT INTO bot_doc_notes (phone, summary) VALUES (?, ?)`).run(phone, summary);
+}
+function getUnattachedDocNotes(phone) {
+  return db_default.prepare(`SELECT id, summary, created_at FROM bot_doc_notes WHERE phone = ? AND attached = 0 ORDER BY created_at ASC`).all(phone);
+}
+function markDocNotesAttached(phone) {
+  db_default.prepare(`UPDATE bot_doc_notes SET attached = 1 WHERE phone = ? AND attached = 0`).run(phone);
+}
+function formatDocNotes(notes) {
+  if (!notes.length) return "";
+  return notes.map((n) => `\u{1F4CE} Documenti ricevuti (${(n.created_at || "").slice(0, 10)}): ${n.summary}`).join("\n");
+}
+function getActiveAppointmentWithEvent(phone) {
+  return db_default.prepare(`
+    SELECT * FROM bot_appointments
+    WHERE phone = ? AND status IN ('da_confermare','confermato') AND event_id IS NOT NULL
+    ORDER BY created_at DESC LIMIT 1
+  `).get(phone) || null;
+}
 function recordAppointment(a) {
   db_default.prepare(`UPDATE bot_appointments SET status = 'annullato' WHERE phone = ? AND status = 'da_confermare'`).run(a.phone);
   const info = db_default.prepare(`
@@ -24970,6 +25021,15 @@ function getBotModel() {
 function isAutoSendEnabled() {
   return getSetting("bot_auto_send", "0") === "1";
 }
+function todayRome() {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Rome" }).format(/* @__PURE__ */ new Date());
+}
+function courtesySentToday(phone) {
+  return getSetting(`courtesy_${phone}`, "") === todayRome();
+}
+function markCourtesySent(phone) {
+  setSetting(`courtesy_${phone}`, todayRome());
+}
 function getControlNumber() {
   return (getSetting("control_number", "") || process.env.CONTROL_WHATSAPP || "393457050479").replace(/\D/g, "");
 }
@@ -24995,44 +25055,89 @@ var SYSTEM_PROMPT = `Sei l'assistente virtuale dello Studio Tributario Branca,
 studio di commercialista/tributarista, consulente del lavoro e amministratore di condominio.
 Titolare: Dott. Mariano Branca \u2014 Via Operai 102, 98051 Barcellona P.G. (ME).
 
-Stai rispondendo a un cliente su WhatsApp. Dai del Lei, tono cordiale e professionale,
-messaggi brevi.
+Stai rispondendo a un cliente su WhatsApp. RISPECCHIA IL REGISTRO del cliente: se ti d\xE0 del
+tu rispondi col tu, se ti d\xE0 del Lei rispondi col Lei (nel dubbio, dai del Lei). Tono sempre
+cordiale e professionale. Le tue risposte di merito vengono riviste dal Dott. Branca prima
+dell'invio, quindi puoi entrare nel merito tecnico con competenza, senza rinvii generici.
 
-COMPORTAMENTO BASE:
-- Per qualunque richiesta o documento inviato, conferma che lo studio LI VALUTER\xC0
-  (es. "valuteremo la sua richiesta" / "valuteremo i documenti che ci ha inviato") e
-  NON entrare nel merito fiscale/legale via chat.
-- Invita SEMPRE il cliente a passare in studio e a fissare un appuntamento.
-- Per gli appuntamenti usa get_availability (proponi 2-3 opzioni) e, quando il cliente
-  sceglie, chiama propose_booking (l'appuntamento sar\xE0 poi confermato dallo studio).
-- Ogni volta che proponi o confermi un appuntamento, CHIEDI SEMPRE al cliente di inviare
-  in anticipo su questa chat i documenti utili da visionare prima dell'incontro (es. atti
-  o cartelle notificate, fatture, dichiarazioni, contratti pertinenti): cos\xEC l'incontro \xE8
-  pi\xF9 produttivo.
-- ORARI STUDIO (get_availability li rispetta gi\xE0, ma tienili presente nel dialogo):
-  Lun-Ven 9:00-13:00; pomeriggio SOLO lun/mar/gio 15:30-19:00 (NO mercoled\xEC e venerd\xEC
-  pomeriggio). MAI sabato, domenica, feste comandate; chiuso dal 20 luglio al 31 agosto.
+OBIETTIVO \u2014 risposte TECNICHE, ACCURATE e UTILI (mai superficiali):
+- Inquadra correttamente la questione: qualifica l'atto o l'adempimento di cui si parla
+  (es. avviso di accertamento, cartella di pagamento, avviso bonario, intimazione di
+  pagamento, F24, dichiarazione, ravvedimento, rateizzazione) e spiega con chiarezza il
+  meccanismo rilevante.
+- Cita il riferimento normativo o l'istituto pertinente quando lo conosci con certezza
+  (es. accertamento con adesione D.lgs. 218/1997; ravvedimento operoso art. 13 D.lgs.
+  472/1997; ricorso alla Corte di Giustizia Tributaria art. 21 D.lgs. 546/1992), in
+  linguaggio comprensibile per il cliente.
+- Indica con precisione i TERMINI/scadenze applicabili (es. 60 giorni dalla notifica per
+  ricorso o adesione), ricordando SEMPRE al cliente di verificare la DATA DI NOTIFICA
+  esatta riportata sull'atto, da cui decorrono i termini.
+- Quando proponi un'azione, spiega in 2-3 punti i passaggi concreti.
 
-CONTROLLO DUPLICATI (obbligatorio): prima di rispondere a una richiesta o a un invio di
-documenti, chiama find_previous_requests per verificare se il cliente aveva GI\xC0 inviato lo
-stesso documento o fatto la stessa richiesta in passato. Se s\xEC, faglielo presente con
-garbo citando la data (es. "risulta che ci aveva gi\xE0 inviato ... in data ...").
+LIMITI DI ACCURATEZZA (zero-errori \u2014 inderogabili):
+1. NON inventare MAI norme, importi, percentuali, scadenze o dati che non conosci con
+   certezza. Se un dato va verificato sui documenti o sulla normativa aggiornata, dillo con
+   franchezza e rimanda l'esattezza all'incontro: meglio prudente che impreciso.
+2. NIENTE quantificazioni puntuali del singolo caso via chat (importo esatto dovuto,
+   calcolo preciso di sanzioni/interessi sulla sua posizione): puoi spiegare CRITERI e
+   ORDINI DI GRANDEZZA normativi, ma il numero definitivo si determina in studio sui suoi
+   documenti.
+3. Niente strategie difensive di dettaglio o pareri definitivi su contenziosi via chat:
+   inquadra la questione e i termini, poi rimanda allo studio per la decisione operativa.
 
-REGOLE INDEROGABILI:
-1. Italiano, messaggi brevi da chat.
-2. NIENTE importi, calcoli, codici, scadenze o pareri precisi via chat \u2192 raccogli i dati e
-   rimanda all'appuntamento.
-3. Urgenze gravi (cartella esattoriale, accertamento, udienza, atto notificato con termini):
-   NON gestirle da sola \u2192 chiama need_human; rassicura che il Dott. Branca verr\xE0 avvisato
-   subito e chiedi copia dell'atto.
-4. Documenti/foto: conferma la ricezione e indica che verranno valutati.
-5. Firma sempre: "Assistente Virtuale \u2014 Studio Tributario Branca".
-6. Resta SEMPRE sui temi dello studio: NON aggiungere chiacchiere personali, social o
+GESTIONE OPERATIVA:
+- GESTIONE APPUNTAMENTI (in autonomia): quando il cliente chiede un appuntamento gestisci tu
+  l'intero scambio, confrontandoti con l'agenda. Usa get_availability per proporre 2-3 slot
+  reali (incrocia gi\xE0 l'agenda Google e gli orari studio); quando il cliente sceglie uno slot
+  chiama propose_booking; se in un secondo momento conferma di poter venire chiama
+  confirm_appointment. Non serve l'approvazione dello studio per concordare data e ora.
+- DOCUMENTI PRIMA DELL'INCONTRO: se l'appuntamento riguarda documenti da esaminare (atti o
+  cartelle notificate, fatture, dichiarazioni, contratti, avvisi), CHIARISCI sempre che il
+  cliente deve inviarli su questa chat PRIMA dell'appuntamento: solo cos\xEC potranno essere
+  visionati e poi DISCUSSI durante l'incontro. Senza i documenti in anticipo l'incontro non
+  sarebbe produttivo.
+- RICHIESTE DI CHIAMATA: se il cliente chiede di essere richiamato o lamenta una chiamata
+  senza risposta ("mi chiami", "ti ho chiamato e non rispondi", "richiamatemi"), NON promettere
+  una chiamata immediata: spiega con cortesia che ora non \xE8 possibile rispondere subito e che lo
+  studio lo richiamer\xE0 appena libero. Poi: chiedi se \xE8 urgente (se s\xEC chiama need_human per
+  segnalarlo); invitalo a inviare su questa chat i documenti utili; ed eventualmente proponi un
+  appuntamento (gestione agenda qui sopra).
+- RICHIESTE DI CHIARIMENTO: se dal messaggio emerge che il cliente ha bisogno di un chiarimento
+  o di una consulenza, tendi SEMPRE a ricondurre la questione a un appuntamento IN PRESENZA,
+  facendoti inviare PRIMA la documentazione pertinente per la valutazione. Puoi dare un primo
+  inquadramento tecnico, ma la trattazione vera avviene in studio sui documenti.
+- ORARI STUDIO (get_availability li rispetta gi\xE0; non proporre MAI fuori da questi):
+  luned\xEC, marted\xEC e gioved\xEC 9:00\u201318:00 (orario continuato); mercoled\xEC e venerd\xEC 9:00\u201313:00.
+  MAI sabato e domenica, MAI feste comandate; studio CHIUSO dal 20 luglio al 31 agosto.
+- CONTROLLO DUPLICATI (obbligatorio): prima di rispondere a una richiesta o a un invio di
+  documenti, chiama find_previous_requests per verificare se il cliente aveva GI\xC0 inviato lo
+  stesso documento o fatto la stessa richiesta. Se s\xEC, faglielo presente con garbo citando
+  la data (es. "risulta che ci aveva gi\xE0 inviato ... in data ...").
+- Documenti/foto ricevuti: conferma la ricezione, indica di cosa si tratta se riconoscibile,
+  e dai un primo inquadramento tecnico utile; precisa che verranno esaminati in dettaglio.
+
+URGENZE (cartella esattoriale, avviso di accertamento, atto notificato con termini in
+decorrenza, udienza, pignoramento): chiama need_human per allertare il Dott. Branca, MA
+fornisci comunque al cliente un inquadramento tecnico utile (di che atto si tratta, quale
+termine corre, cosa portare) e rassicura che il Dott. Branca lo seguir\xE0 personalmente e in
+tempi rapidi. Chiedi copia dell'atto su questa chat.
+
+REGOLE GENERALI:
+1. Italiano. Messaggi chiari e completi quanto serve, ben strutturati (usa elenchi puntati
+   quando aiutano la lettura), senza muri di testo n\xE9 tecnicismi gratuiti.
+2. REGISTRO: rispecchia sempre il tu/Lei usato dal cliente (vedi sopra).
+3. Resta SEMPRE sui temi dello studio: NON aggiungere chiacchiere personali, social o
    battute tratte dalla cronologia (inviti, eventi privati, vacanze, ecc.).
-7. MOLTI clienti sono anche amici e mescolano lavoro e chiacchiere personali. Occupati
-   SOLO del lavoro. Se l'ultimo messaggio del cliente NON contiene una richiesta/argomento
-   di studio (\xE8 solo personale, sociale, off-topic), chiama ignore_personal e NON produrre
-   alcun messaggio: di quella chat lo studio non si occupa.
+4. MESSAGGI NON DI LAVORO: molti clienti sono anche amici e mescolano lavoro e chiacchiere.
+   Occupati SOLO del lavoro. Se l'ultimo messaggio del cliente NON contiene una richiesta o un
+   argomento di studio (\xE8 solo personale, sociale, off-topic), chiama ignore_personal per
+   classificarlo e scrivi comunque un BREVE messaggio di cortesia: che il Dott. Branca al
+   momento \xE8 impegnato e lo ricontatter\xE0 appena libero. Nient'altro: non alimentare la
+   conversazione personale.
+5. CHIUSURA (sempre, in OGNI messaggio \u2014 anche dopo aver fissato un appuntamento e anche nei
+   messaggi di cortesia): ricorda che per parlare con lo studio negli orari di segreteria si
+   pu\xF2 chiamare lo 0909797187, e chiudi con la firma "Assistente Virtuale \u2014 Studio Tributario
+   Branca".
 
 Il tuo output finale deve contenere ESCLUSIVAMENTE il testo del messaggio da inviare al
 cliente: NIENTE analisi, premesse, ragionamenti o commenti tra parentesi.`;
@@ -25077,11 +25182,20 @@ var TOOLS = [
   },
   {
     name: "ignore_personal",
-    description: "Segnala che il messaggio \xE8 personale/non rivolto allo studio (chiacchiere, social, off-topic). Lo studio non se ne occupa: NON verr\xE0 prodotta alcuna risposta.",
+    description: "Classifica il messaggio come personale/non di lavoro (chiacchiere, social, off-topic), cos\xEC non viene riportato nel digest di lavoro. NON impedisce la risposta: dopo averlo chiamato scrivi comunque un BREVE messaggio di cortesia (il Dott. Branca \xE8 impegnato e ricontatter\xE0 appena libero).",
     input_schema: {
       type: "object",
-      properties: { reason: { type: "string", description: "Perch\xE9 \xE8 personale/non pertinente" } },
+      properties: { reason: { type: "string", description: "Perch\xE9 \xE8 personale/non di lavoro" } },
       required: ["reason"]
+    }
+  },
+  {
+    name: "note_documents",
+    description: "Quando il cliente INVIA documentazione (atti, cartelle, fatture, dichiarazioni, contratti, avvisi, foto di documenti), registra un BREVE sunto di a cosa si riferisce: verr\xE0 annotato sull'appuntamento in agenda come promemoria per lo studio (di cosa si parler\xE0). Usalo ogni volta che arrivano documenti.",
+    input_schema: {
+      type: "object",
+      properties: { summary: { type: "string", description: 'Sunto breve di cosa sono / a cosa si riferiscono i documenti (es. "cartella Agenzia Riscossione 2023", "contratto di locazione + 3 fatture")' } },
+      required: ["summary"]
     }
   },
   {
@@ -25150,6 +25264,7 @@ async function runTool(name, input, out, phone) {
     return "Richieste/documenti SIMILI gi\xE0 inviati in passato (cita la data al cliente):\n" + hits.map((h) => `- ${(h.timestamp || "").slice(0, 10)}: "${(h.content || "").replace(/\n+/g, " ").slice(0, 90)}"`).join("\n");
   }
   if (name === "get_availability") {
+    out.appointmentFlow = true;
     const days = Math.min(Math.max(parseInt(input?.days, 10) || 14, 1), 30);
     const { slots, calendarChecked } = await getAvailability(days);
     const txt = formatAvailabilityIT(slots);
@@ -25166,15 +25281,17 @@ Slot con data esatta da usare in propose_booking (date=YYYY-MM-DD, start=HH:MM):
       return "Errore: data o ora non valide. Usa get_availability e riprova con uno slot esatto.";
     }
     out.proposedEvent = { date, start, end: endTime(start), reason: String(input?.reason || "Appuntamento") };
-    return "Proposta registrata. Comunica al cliente che l'appuntamento \xE8 in fase di conferma da parte dello studio, ringrazia e CHIEDIGLI di inviare in anticipo su questa chat i documenti utili da visionare prima dell'incontro (es. atti/cartelle notificate, fatture, dichiarazioni, contratti pertinenti).";
+    out.appointmentFlow = true;
+    return "Proposta registrata. Comunica al cliente lo slot e che resta in attesa di conferma, ringrazia e \u2014 se l'incontro riguarda documenti da esaminare \u2014 CHIARISCI che deve inviarli su questa chat PRIMA dell'appuntamento (es. atti/cartelle notificate, fatture, dichiarazioni, contratti, avvisi): solo cos\xEC potranno essere visionati e poi discussi durante l'incontro. Infine chiedigli di confermare quando avr\xE0 la certezza di poter venire.";
   }
   if (name === "confirm_appointment") {
+    out.appointmentFlow = true;
     const appt = getPendingAppointment(phone);
     if (!appt) {
       return "Non risulta alcun appuntamento in attesa di conferma per questo cliente: non confermare nulla, prosegui normalmente.";
     }
     const r = await confirmAppointmentRow(appt, { notify: true });
-    return `Appuntamento confermato e ${r.calendarUpdated ? "agenda aggiornata" : "segnalato al Dott. Branca"}. Scrivi al cliente un breve messaggio che CONFERMA l'appuntamento del ${appt.date} alle ${appt.start}, ringrazia, CHIEDIGLI di inviare in anticipo su questa chat i documenti utili da visionare prima dell'incontro, e indica che lo studio \xE8 in Via Operai 102, Barcellona P.G. (ME).`;
+    return `Appuntamento confermato e ${r.calendarUpdated ? "agenda aggiornata" : "segnalato al Dott. Branca"}. Scrivi al cliente un breve messaggio che CONFERMA l'appuntamento del ${appt.date} alle ${appt.start}, ringrazia, e \u2014 se l'incontro riguarda documenti da esaminare \u2014 RIBADISCI che deve inviarli su questa chat PRIMA dell'appuntamento, cos\xEC potranno essere visionati e discussi durante l'incontro; indica che lo studio \xE8 in Via Operai 102, Barcellona P.G. (ME).`;
   }
   if (name === "need_human") {
     out.needsHuman = true;
@@ -25183,7 +25300,22 @@ Slot con data esatta da usare in propose_booking (date=YYYY-MM-DD, start=HH:MM):
   }
   if (name === "ignore_personal") {
     out.personal = true;
-    return "Ok: messaggio personale/non pertinente. NON produrre alcuna risposta.";
+    return "Classificato come personale/non di lavoro. Ora scrivi comunque un BREVE messaggio di cortesia: che il Dott. Branca al momento \xE8 impegnato e ricontatter\xE0 appena libero. Chiudi col recapito di segreteria e la firma. Nient'altro.";
+  }
+  if (name === "note_documents") {
+    const summary = String(input?.summary || "").trim().slice(0, 300);
+    if (!summary) return "Nessun contenuto da annotare.";
+    recordDocNote(phone, summary);
+    const appt = getActiveAppointmentWithEvent(phone);
+    if (appt?.event_id) {
+      try {
+        await appendEventDescription(appt.event_id, `\u{1F4CE} Documenti ricevuti (${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10)}): ${summary}`);
+        markDocNotesAttached(phone);
+      } catch (e) {
+        console.error("[Chatbot] annota documenti su evento:", e.message);
+      }
+    }
+    return "Documentazione annotata come promemoria per l'appuntamento. Conferma al cliente la ricezione, indica che sar\xE0 esaminata prima dell'incontro e RICORDA che i documenti utili vanno inviati su questa chat PRIMA dell'appuntamento.";
   }
   return "Strumento sconosciuto.";
 }
@@ -25224,7 +25356,7 @@ Data odierna: ${todayStr} (${todayISO}). Usa SEMPRE date coerenti con oggi e non
         },
         body: JSON.stringify({
           model: getBotModel(),
-          max_tokens: 1024,
+          max_tokens: 1500,
           system,
           tools: TOOLS,
           messages
@@ -25256,7 +25388,7 @@ Data odierna: ${todayStr} (${todayISO}). Usa SEMPRE date coerenti con oggi e non
     }
     break;
   }
-  if (out.personal) return { kind: "personal", result: null };
+  if (out.personal) return { kind: "personal", result: out.draftText ? out : null };
   if (!out.draftText) return null;
   return { kind: "work", result: out };
 }
@@ -25318,11 +25450,15 @@ async function approveDraftCore(id, opts) {
   let calendar = null;
   if (d.proposed_event) {
     const ev = d.proposed_event;
+    const docNotes = getUnattachedDocNotes(d.phone);
+    const docBlock = docNotes.length ? `
+
+${formatDocNotes(docNotes)}` : "";
     calendar = await createCalendarEvent({
       title: `[DA CONFERMARE] ${ev.reason} \u2014 ${d.contact_name || d.phone}`,
       description: `Appuntamento proposto dal chatbot WhatsApp.
 Cliente: ${d.contact_name || ""} (${d.phone})
-Motivo: ${ev.reason}
+Motivo: ${ev.reason}${docBlock}
 
 \u26A0\uFE0F Confermare con il cliente.`,
       startDate: `${ev.date}T${ev.start}:00`,
@@ -25337,6 +25473,7 @@ Motivo: ${ev.reason}
       end: ev.end,
       reason: ev.reason
     });
+    if (docNotes.length) markDocNotesAttached(d.phone);
   }
   markDraftSent(id);
   broadcastEvent("message", { type: "sent", phone: d.phone, contactName: d.contact_name, content: finalText, timestamp: now });
@@ -26223,28 +26360,37 @@ Da confermare.`,
           const outcome = await generateDraft(phone, cName);
           if (outcome?.kind === "personal") {
             recordClassification(messageId, phone, day, "personal");
-            console.log(`[Chatbot] Messaggio personale ignorato \u2014 ${cName} (${phone})`);
+            if (outcome.result?.draftText && !courtesySentToday(phone)) {
+              const id = saveDraft({ phone, contactName: cName, incoming: content, result: outcome.result });
+              const r = await approveDraftCore(id, { force: true });
+              if (r.ok) markCourtesySent(phone);
+              broadcastEvent("bot_draft", { id, phone, contactName: cName, needsHuman: false, autoSent: r.ok, personal: true });
+              console.log(`[Chatbot] Cortesia (non-lavoro) ${r.ok ? "inviata" : "NON inviata"} a ${cName} (${phone})`);
+            } else {
+              console.log(`[Chatbot] Messaggio personale \u2014 ${cName} (${phone}) (cortesia gi\xE0 inviata oggi o assente)`);
+            }
           } else if (outcome?.kind === "work" && outcome.result) {
             recordClassification(messageId, phone, day, "work");
-            const id = saveDraft({ phone, contactName: cName, incoming: content, result: outcome.result });
-            if (isAutoSendEnabled() && !outcome.result.needsHuman) {
-              const r = await approveDraftCore(id, { force: true });
-              broadcastEvent("bot_draft", { id, phone, contactName: cName, needsHuman: false, autoSent: r.ok });
-              console.log(`[Chatbot] Auto-risposta a ${cName} (${phone})${r.hadEvent ? " + appuntamento DA CONFERMARE" : ""}`);
-              if (r.ok && shouldNotifyControl()) {
-                try {
-                  await sendTextMessage(
-                    getControlNumber(),
-                    `\u{1F916} Risposta automatica inviata a ${cName} (${phone}):
-\xAB${(outcome.result.draftText || "").slice(0, 300)}\xBB${r.hadEvent ? "\n\u{1F4C5} Appuntamento DA CONFERMARE in agenda." : ""}`
-                  );
-                } catch (e) {
-                  console.error("[Chatbot] notifica auto-risposta:", e.message);
-                }
+            const res2 = outcome.result;
+            const id = saveDraft({ phone, contactName: cName, incoming: content, result: res2 });
+            const isUrgent = res2.needsHuman;
+            const autonomousAppt = !!res2.appointmentFlow && !isUrgent;
+            const globalAuto = isAutoSendEnabled() && !isUrgent;
+            if (autonomousAppt || globalAuto) {
+              const r = await approveDraftCore(id, { force: globalAuto && !autonomousAppt });
+              if (r.ok) {
+                broadcastEvent("bot_draft", { id, phone, contactName: cName, needsHuman: false, autoSent: true });
+                console.log(`[Chatbot] ${autonomousAppt ? "Appuntamento autonomo" : "Auto-risposta"} a ${cName} (${phone})${r.hadEvent ? " + appuntamento DA CONFERMARE" : ""}`);
+              } else if (r.conflict) {
+                broadcastEvent("bot_draft", { id, phone, contactName: cName, needsHuman: false, conflict: true });
+                console.warn(`[Chatbot] Slot in conflitto per ${cName} (${phone}): bozza #${id} resta in attesa di revisione.`);
+              } else {
+                broadcastEvent("bot_draft", { id, phone, contactName: cName, needsHuman: false });
+                console.error(`[Chatbot] Invio bozza #${id} a ${cName} (${phone}) fallito: ${r.message || "errore"}`);
               }
             } else {
-              broadcastEvent("bot_draft", { id, phone, contactName: cName, needsHuman: outcome.result.needsHuman });
-              console.log(`[Chatbot] Bozza #${id} per ${cName} (${phone})${outcome.result.needsHuman ? " [need_human]" : ""}`);
+              broadcastEvent("bot_draft", { id, phone, contactName: cName, needsHuman: res2.needsHuman });
+              console.log(`[Chatbot] Bozza #${id} per ${cName} (${phone})${res2.needsHuman ? " [need_human]" : ""}`);
               if (shouldNotifyControl()) await notifyDraftToControl(id);
             }
           }

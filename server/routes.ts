@@ -39,6 +39,8 @@ import {
   getAppointmentById,
   confirmAppointmentRow,
   cancelAppointmentRow,
+  courtesySentToday,
+  markCourtesySent,
 } from './chatbot.js';
 import { runDailyDigest, getFlowHealth, repairWebhook } from './maintenance.js';
 
@@ -839,28 +841,48 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
           const day = (timestamp || new Date().toISOString()).slice(0, 10);
           const outcome = await generateDraft(phone, cName);
           if (outcome?.kind === 'personal') {
-            // Chat privata (anche da cliente-amico): nessuna bozza, e il messaggio
-            // resta marcato "personale" così il digest non lo riporta.
+            // Messaggio NON di lavoro: resta marcato "personale" così il digest non lo
+            // riporta. Inviamo però un breve messaggio di cortesia (impegnato, ricontatto),
+            // auto e al massimo 1 volta al giorno per contatto, se il modello l'ha prodotto.
             recordClassification(messageId, phone, day, 'personal');
-            console.log(`[Chatbot] Messaggio personale ignorato — ${cName} (${phone})`);
+            if (outcome.result?.draftText && !courtesySentToday(phone)) {
+              const id = saveDraft({ phone, contactName: cName, incoming: content, result: outcome.result });
+              const r = await approveDraftCore(id, { force: true });
+              if (r.ok) markCourtesySent(phone);
+              broadcastEvent('bot_draft', { id, phone, contactName: cName, needsHuman: false, autoSent: r.ok, personal: true });
+              console.log(`[Chatbot] Cortesia (non-lavoro) ${r.ok ? 'inviata' : 'NON inviata'} a ${cName} (${phone})`);
+            } else {
+              console.log(`[Chatbot] Messaggio personale — ${cName} (${phone}) (cortesia già inviata oggi o assente)`);
+            }
           } else if (outcome?.kind === 'work' && outcome.result) {
             recordClassification(messageId, phone, day, 'work');
-            const id = saveDraft({ phone, contactName: cName, incoming: content, result: outcome.result });
-            // Risposta automatica per i non-VIP: se attiva, invia subito SENZA approvazione.
-            // Eccezione: i casi urgenti (need_human) restano sempre bozza per Mariano.
-            if (isAutoSendEnabled() && !outcome.result.needsHuman) {
-              const r = await approveDraftCore(id, { force: true });
-              broadcastEvent('bot_draft', { id, phone, contactName: cName, needsHuman: false, autoSent: r.ok });
-              console.log(`[Chatbot] Auto-risposta a ${cName} (${phone})${r.hadEvent ? ' + appuntamento DA CONFERMARE' : ''}`);
-              if (r.ok && shouldNotifyControl()) {
-                try {
-                  await sendTextMessage(getControlNumber(),
-                    `🤖 Risposta automatica inviata a ${cName} (${phone}):\n«${(outcome.result.draftText || '').slice(0, 300)}»${r.hadEvent ? '\n📅 Appuntamento DA CONFERMARE in agenda.' : ''}`);
-                } catch (e: any) { console.error('[Chatbot] notifica auto-risposta:', e.message); }
+            const res = outcome.result;
+            const id = saveDraft({ phone, contactName: cName, incoming: content, result: res });
+            // Gli APPUNTAMENTI li gestisce il bot in autonomia: se la risposta nasce dal
+            // flusso agenda (disponibilità/proposta/conferma) e NON è un caso urgente, parte
+            // subito senza approvazione (get_availability ha già incrociato l'agenda). Le
+            // altre risposte di merito restano bozza per la revisione, salvo autoSend globale.
+            const isUrgent = res.needsHuman;
+            const autonomousAppt = !!res.appointmentFlow && !isUrgent;
+            const globalAuto = isAutoSendEnabled() && !isUrgent;
+            if (autonomousAppt || globalAuto) {
+              // Appuntamento autonomo: NON forzare, così l'agenda viene ricontrollata e non si
+              // sovrappone a un evento già presente. autoSend globale: comportamento legacy.
+              const r = await approveDraftCore(id, { force: globalAuto && !autonomousAppt });
+              if (r.ok) {
+                broadcastEvent('bot_draft', { id, phone, contactName: cName, needsHuman: false, autoSent: true });
+                console.log(`[Chatbot] ${autonomousAppt ? 'Appuntamento autonomo' : 'Auto-risposta'} a ${cName} (${phone})${r.hadEvent ? ' + appuntamento DA CONFERMARE' : ''}`);
+              } else if (r.conflict) {
+                // Slot occupatosi tra la proposta e l'invio: lascia la bozza in attesa nel Cruscotto.
+                broadcastEvent('bot_draft', { id, phone, contactName: cName, needsHuman: false, conflict: true });
+                console.warn(`[Chatbot] Slot in conflitto per ${cName} (${phone}): bozza #${id} resta in attesa di revisione.`);
+              } else {
+                broadcastEvent('bot_draft', { id, phone, contactName: cName, needsHuman: false });
+                console.error(`[Chatbot] Invio bozza #${id} a ${cName} (${phone}) fallito: ${r.message || 'errore'}`);
               }
             } else {
-              broadcastEvent('bot_draft', { id, phone, contactName: cName, needsHuman: outcome.result.needsHuman });
-              console.log(`[Chatbot] Bozza #${id} per ${cName} (${phone})${outcome.result.needsHuman ? ' [need_human]' : ''}`);
+              broadcastEvent('bot_draft', { id, phone, contactName: cName, needsHuman: res.needsHuman });
+              console.log(`[Chatbot] Bozza #${id} per ${cName} (${phone})${res.needsHuman ? ' [need_human]' : ''}`);
               // Notifica WhatsApp a Mariano (default: solo fuori orario di studio)
               if (shouldNotifyControl()) await notifyDraftToControl(id);
             }

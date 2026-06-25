@@ -320,6 +320,29 @@ export async function updateCalendarEvent(params: {
 }
 
 /**
+ * Aggiunge testo IN CODA alla descrizione di un evento esistente (GET + PATCH), senza
+ * sovrascrivere quanto già presente. Usato per annotare sull'appuntamento i documenti
+ * ricevuti dal cliente dopo la creazione dell'evento.
+ */
+export async function appendEventDescription(eventId: string, text: string, calendarId?: string): Promise<{ success: boolean; error?: string }> {
+  const token = await getGoogleAccessToken();
+  if (!token) return { success: false, error: 'Google OAuth non configurato' };
+  const calId = calendarId || process.env.GOOGLE_CALENDAR_ID || 'primary';
+  try {
+    const getResp = await fetch(
+      `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calId)}/events/${encodeURIComponent(eventId)}`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    let desc = '';
+    if (getResp.ok) { const ev = await getResp.json() as any; desc = ev.description || ''; }
+    const newDesc = desc ? `${desc}\n${text}` : text;
+    return updateCalendarEvent({ eventId, description: newDesc, calendarId: calId });
+  } catch (e: any) {
+    return { success: false, error: e.message };
+  }
+}
+
+/**
  * Crea/aggiorna un evento "tutto il giorno" su Google Calendar.
  * Usato dal digest giornaliero: se eventId è fornito aggiorna (PATCH), altrimenti
  * crea. `date` = YYYY-MM-DD (l'evento copre l'intera giornata, transparent = non

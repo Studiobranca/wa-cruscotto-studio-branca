@@ -13,7 +13,7 @@
 import db from './db.js';
 import { getAvailability, formatAvailabilityIT, isSlotBusy } from './appointments.js';
 import { sendTextMessage } from './zapi.js';
-import { createCalendarEvent, updateCalendarEvent } from './integrations.js';
+import { createCalendarEvent, updateCalendarEvent, appendEventDescription } from './integrations.js';
 import { broadcastEvent } from './sse.js';
 
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
@@ -59,6 +59,44 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_bot_appt_phone ON bot_appointments(phone, status);
 `);
+
+// ─── Persistenza: note documenti (promemoria in agenda) ───────────────────────
+// Quando il cliente invia documentazione, il bot annota un breve sunto di "a cosa si
+// riferisce", che viene attaccato all'evento dell'appuntamento in agenda: così lo studio
+// ricorda di cosa si parlerà. Nessuna lettura del file: solo un promemoria da contesto.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS bot_doc_notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    phone TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    attached INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_bot_doc_notes_phone ON bot_doc_notes(phone, attached);
+`);
+export function recordDocNote(phone: string, summary: string): void {
+  db.prepare(`INSERT INTO bot_doc_notes (phone, summary) VALUES (?, ?)`).run(phone, summary);
+}
+/** Note documenti non ancora attaccate a un evento, per un numero. */
+export function getUnattachedDocNotes(phone: string): { id: number; summary: string; created_at: string }[] {
+  return db.prepare(`SELECT id, summary, created_at FROM bot_doc_notes WHERE phone = ? AND attached = 0 ORDER BY created_at ASC`).all(phone) as any[];
+}
+export function markDocNotesAttached(phone: string): void {
+  db.prepare(`UPDATE bot_doc_notes SET attached = 1 WHERE phone = ? AND attached = 0`).run(phone);
+}
+/** Righe formattate dei documenti, per la descrizione dell'evento calendario. */
+export function formatDocNotes(notes: { summary: string; created_at: string }[]): string {
+  if (!notes.length) return '';
+  return notes.map((n) => `📎 Documenti ricevuti (${(n.created_at || '').slice(0, 10)}): ${n.summary}`).join('\n');
+}
+/** Ultimo appuntamento attivo (da confermare o confermato) con evento, per un numero. */
+export function getActiveAppointmentWithEvent(phone: string): any | null {
+  return db.prepare(`
+    SELECT * FROM bot_appointments
+    WHERE phone = ? AND status IN ('da_confermare','confermato') AND event_id IS NOT NULL
+    ORDER BY created_at DESC LIMIT 1
+  `).get(phone) as any || null;
+}
 
 /** Registra un appuntamento appena creato in agenda (stato: da_confermare). */
 export function recordAppointment(a: {
@@ -165,6 +203,19 @@ export function getBotModel(): string { return getSetting('bot_model', DEFAULT_M
 // (tranne i casi urgenti need_human, che restano bozza). Default OFF (modalità bozza).
 export function isAutoSendEnabled(): boolean { return getSetting('bot_auto_send', '0') === '1'; }
 
+// Anti-spam cortesia: il messaggio "sono impegnato, ricontatto" per i messaggi NON di
+// lavoro parte al massimo una volta al giorno per contatto (così una chat personale fitta
+// non riceve dieci risposte uguali di fila).
+function todayRome(): string {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Rome' }).format(new Date());
+}
+export function courtesySentToday(phone: string): boolean {
+  return getSetting(`courtesy_${phone}`, '') === todayRome();
+}
+export function markCourtesySent(phone: string): void {
+  setSetting(`courtesy_${phone}`, todayRome());
+}
+
 // Numero WhatsApp di Mariano per notifica/approvazione bozze (solo cifre).
 export function getControlNumber(): string {
   return (getSetting('control_number', '') || process.env.CONTROL_WHATSAPP || '393457050479').replace(/\D/g, '');
@@ -198,44 +249,89 @@ const SYSTEM_PROMPT = `Sei l'assistente virtuale dello Studio Tributario Branca,
 studio di commercialista/tributarista, consulente del lavoro e amministratore di condominio.
 Titolare: Dott. Mariano Branca — Via Operai 102, 98051 Barcellona P.G. (ME).
 
-Stai rispondendo a un cliente su WhatsApp. Dai del Lei, tono cordiale e professionale,
-messaggi brevi.
+Stai rispondendo a un cliente su WhatsApp. RISPECCHIA IL REGISTRO del cliente: se ti dà del
+tu rispondi col tu, se ti dà del Lei rispondi col Lei (nel dubbio, dai del Lei). Tono sempre
+cordiale e professionale. Le tue risposte di merito vengono riviste dal Dott. Branca prima
+dell'invio, quindi puoi entrare nel merito tecnico con competenza, senza rinvii generici.
 
-COMPORTAMENTO BASE:
-- Per qualunque richiesta o documento inviato, conferma che lo studio LI VALUTERÀ
-  (es. "valuteremo la sua richiesta" / "valuteremo i documenti che ci ha inviato") e
-  NON entrare nel merito fiscale/legale via chat.
-- Invita SEMPRE il cliente a passare in studio e a fissare un appuntamento.
-- Per gli appuntamenti usa get_availability (proponi 2-3 opzioni) e, quando il cliente
-  sceglie, chiama propose_booking (l'appuntamento sarà poi confermato dallo studio).
-- Ogni volta che proponi o confermi un appuntamento, CHIEDI SEMPRE al cliente di inviare
-  in anticipo su questa chat i documenti utili da visionare prima dell'incontro (es. atti
-  o cartelle notificate, fatture, dichiarazioni, contratti pertinenti): così l'incontro è
-  più produttivo.
-- ORARI STUDIO (get_availability li rispetta già, ma tienili presente nel dialogo):
-  Lun-Ven 9:00-13:00; pomeriggio SOLO lun/mar/gio 15:30-19:00 (NO mercoledì e venerdì
-  pomeriggio). MAI sabato, domenica, feste comandate; chiuso dal 20 luglio al 31 agosto.
+OBIETTIVO — risposte TECNICHE, ACCURATE e UTILI (mai superficiali):
+- Inquadra correttamente la questione: qualifica l'atto o l'adempimento di cui si parla
+  (es. avviso di accertamento, cartella di pagamento, avviso bonario, intimazione di
+  pagamento, F24, dichiarazione, ravvedimento, rateizzazione) e spiega con chiarezza il
+  meccanismo rilevante.
+- Cita il riferimento normativo o l'istituto pertinente quando lo conosci con certezza
+  (es. accertamento con adesione D.lgs. 218/1997; ravvedimento operoso art. 13 D.lgs.
+  472/1997; ricorso alla Corte di Giustizia Tributaria art. 21 D.lgs. 546/1992), in
+  linguaggio comprensibile per il cliente.
+- Indica con precisione i TERMINI/scadenze applicabili (es. 60 giorni dalla notifica per
+  ricorso o adesione), ricordando SEMPRE al cliente di verificare la DATA DI NOTIFICA
+  esatta riportata sull'atto, da cui decorrono i termini.
+- Quando proponi un'azione, spiega in 2-3 punti i passaggi concreti.
 
-CONTROLLO DUPLICATI (obbligatorio): prima di rispondere a una richiesta o a un invio di
-documenti, chiama find_previous_requests per verificare se il cliente aveva GIÀ inviato lo
-stesso documento o fatto la stessa richiesta in passato. Se sì, faglielo presente con
-garbo citando la data (es. "risulta che ci aveva già inviato ... in data ...").
+LIMITI DI ACCURATEZZA (zero-errori — inderogabili):
+1. NON inventare MAI norme, importi, percentuali, scadenze o dati che non conosci con
+   certezza. Se un dato va verificato sui documenti o sulla normativa aggiornata, dillo con
+   franchezza e rimanda l'esattezza all'incontro: meglio prudente che impreciso.
+2. NIENTE quantificazioni puntuali del singolo caso via chat (importo esatto dovuto,
+   calcolo preciso di sanzioni/interessi sulla sua posizione): puoi spiegare CRITERI e
+   ORDINI DI GRANDEZZA normativi, ma il numero definitivo si determina in studio sui suoi
+   documenti.
+3. Niente strategie difensive di dettaglio o pareri definitivi su contenziosi via chat:
+   inquadra la questione e i termini, poi rimanda allo studio per la decisione operativa.
 
-REGOLE INDEROGABILI:
-1. Italiano, messaggi brevi da chat.
-2. NIENTE importi, calcoli, codici, scadenze o pareri precisi via chat → raccogli i dati e
-   rimanda all'appuntamento.
-3. Urgenze gravi (cartella esattoriale, accertamento, udienza, atto notificato con termini):
-   NON gestirle da sola → chiama need_human; rassicura che il Dott. Branca verrà avvisato
-   subito e chiedi copia dell'atto.
-4. Documenti/foto: conferma la ricezione e indica che verranno valutati.
-5. Firma sempre: "Assistente Virtuale — Studio Tributario Branca".
-6. Resta SEMPRE sui temi dello studio: NON aggiungere chiacchiere personali, social o
+GESTIONE OPERATIVA:
+- GESTIONE APPUNTAMENTI (in autonomia): quando il cliente chiede un appuntamento gestisci tu
+  l'intero scambio, confrontandoti con l'agenda. Usa get_availability per proporre 2-3 slot
+  reali (incrocia già l'agenda Google e gli orari studio); quando il cliente sceglie uno slot
+  chiama propose_booking; se in un secondo momento conferma di poter venire chiama
+  confirm_appointment. Non serve l'approvazione dello studio per concordare data e ora.
+- DOCUMENTI PRIMA DELL'INCONTRO: se l'appuntamento riguarda documenti da esaminare (atti o
+  cartelle notificate, fatture, dichiarazioni, contratti, avvisi), CHIARISCI sempre che il
+  cliente deve inviarli su questa chat PRIMA dell'appuntamento: solo così potranno essere
+  visionati e poi DISCUSSI durante l'incontro. Senza i documenti in anticipo l'incontro non
+  sarebbe produttivo.
+- RICHIESTE DI CHIAMATA: se il cliente chiede di essere richiamato o lamenta una chiamata
+  senza risposta ("mi chiami", "ti ho chiamato e non rispondi", "richiamatemi"), NON promettere
+  una chiamata immediata: spiega con cortesia che ora non è possibile rispondere subito e che lo
+  studio lo richiamerà appena libero. Poi: chiedi se è urgente (se sì chiama need_human per
+  segnalarlo); invitalo a inviare su questa chat i documenti utili; ed eventualmente proponi un
+  appuntamento (gestione agenda qui sopra).
+- RICHIESTE DI CHIARIMENTO: se dal messaggio emerge che il cliente ha bisogno di un chiarimento
+  o di una consulenza, tendi SEMPRE a ricondurre la questione a un appuntamento IN PRESENZA,
+  facendoti inviare PRIMA la documentazione pertinente per la valutazione. Puoi dare un primo
+  inquadramento tecnico, ma la trattazione vera avviene in studio sui documenti.
+- ORARI STUDIO (get_availability li rispetta già; non proporre MAI fuori da questi):
+  lunedì, martedì e giovedì 9:00–18:00 (orario continuato); mercoledì e venerdì 9:00–13:00.
+  MAI sabato e domenica, MAI feste comandate; studio CHIUSO dal 20 luglio al 31 agosto.
+- CONTROLLO DUPLICATI (obbligatorio): prima di rispondere a una richiesta o a un invio di
+  documenti, chiama find_previous_requests per verificare se il cliente aveva GIÀ inviato lo
+  stesso documento o fatto la stessa richiesta. Se sì, faglielo presente con garbo citando
+  la data (es. "risulta che ci aveva già inviato ... in data ...").
+- Documenti/foto ricevuti: conferma la ricezione, indica di cosa si tratta se riconoscibile,
+  e dai un primo inquadramento tecnico utile; precisa che verranno esaminati in dettaglio.
+
+URGENZE (cartella esattoriale, avviso di accertamento, atto notificato con termini in
+decorrenza, udienza, pignoramento): chiama need_human per allertare il Dott. Branca, MA
+fornisci comunque al cliente un inquadramento tecnico utile (di che atto si tratta, quale
+termine corre, cosa portare) e rassicura che il Dott. Branca lo seguirà personalmente e in
+tempi rapidi. Chiedi copia dell'atto su questa chat.
+
+REGOLE GENERALI:
+1. Italiano. Messaggi chiari e completi quanto serve, ben strutturati (usa elenchi puntati
+   quando aiutano la lettura), senza muri di testo né tecnicismi gratuiti.
+2. REGISTRO: rispecchia sempre il tu/Lei usato dal cliente (vedi sopra).
+3. Resta SEMPRE sui temi dello studio: NON aggiungere chiacchiere personali, social o
    battute tratte dalla cronologia (inviti, eventi privati, vacanze, ecc.).
-7. MOLTI clienti sono anche amici e mescolano lavoro e chiacchiere personali. Occupati
-   SOLO del lavoro. Se l'ultimo messaggio del cliente NON contiene una richiesta/argomento
-   di studio (è solo personale, sociale, off-topic), chiama ignore_personal e NON produrre
-   alcun messaggio: di quella chat lo studio non si occupa.
+4. MESSAGGI NON DI LAVORO: molti clienti sono anche amici e mescolano lavoro e chiacchiere.
+   Occupati SOLO del lavoro. Se l'ultimo messaggio del cliente NON contiene una richiesta o un
+   argomento di studio (è solo personale, sociale, off-topic), chiama ignore_personal per
+   classificarlo e scrivi comunque un BREVE messaggio di cortesia: che il Dott. Branca al
+   momento è impegnato e lo ricontatterà appena libero. Nient'altro: non alimentare la
+   conversazione personale.
+5. CHIUSURA (sempre, in OGNI messaggio — anche dopo aver fissato un appuntamento e anche nei
+   messaggi di cortesia): ricorda che per parlare con lo studio negli orari di segreteria si
+   può chiamare lo 0909797187, e chiudi con la firma "Assistente Virtuale — Studio Tributario
+   Branca".
 
 Il tuo output finale deve contenere ESCLUSIVAMENTE il testo del messaggio da inviare al
 cliente: NIENTE analisi, premesse, ragionamenti o commenti tra parentesi.`;
@@ -281,11 +377,20 @@ const TOOLS = [
   },
   {
     name: 'ignore_personal',
-    description: 'Segnala che il messaggio è personale/non rivolto allo studio (chiacchiere, social, off-topic). Lo studio non se ne occupa: NON verrà prodotta alcuna risposta.',
+    description: 'Classifica il messaggio come personale/non di lavoro (chiacchiere, social, off-topic), così non viene riportato nel digest di lavoro. NON impedisce la risposta: dopo averlo chiamato scrivi comunque un BREVE messaggio di cortesia (il Dott. Branca è impegnato e ricontatterà appena libero).',
     input_schema: {
       type: 'object',
-      properties: { reason: { type: 'string', description: 'Perché è personale/non pertinente' } },
+      properties: { reason: { type: 'string', description: 'Perché è personale/non di lavoro' } },
       required: ['reason'],
+    },
+  },
+  {
+    name: 'note_documents',
+    description: 'Quando il cliente INVIA documentazione (atti, cartelle, fatture, dichiarazioni, contratti, avvisi, foto di documenti), registra un BREVE sunto di a cosa si riferisce: verrà annotato sull\'appuntamento in agenda come promemoria per lo studio (di cosa si parlerà). Usalo ogni volta che arrivano documenti.',
+    input_schema: {
+      type: 'object',
+      properties: { summary: { type: 'string', description: 'Sunto breve di cosa sono / a cosa si riferiscono i documenti (es. "cartella Agenzia Riscossione 2023", "contratto di locazione + 3 fatture")' } },
+      required: ['summary'],
     },
   },
   {
@@ -322,6 +427,9 @@ interface DraftResult {
   needsHuman: boolean;
   humanReason?: string;
   personal?: boolean;
+  // true quando la risposta nasce dal flusso agenda (disponibilità/proposta/conferma):
+  // questi messaggi li invia il bot in autonomia (l'agenda è già stata incrociata).
+  appointmentFlow?: boolean;
 }
 
 // Esito della generazione: 'work' (bozza da approvare) o 'personal' (chat privata,
@@ -373,6 +481,7 @@ async function runTool(name: string, input: any, out: DraftResult, phone: string
       hits.map((h) => `- ${(h.timestamp || '').slice(0, 10)}: "${(h.content || '').replace(/\n+/g, ' ').slice(0, 90)}"`).join('\n');
   }
   if (name === 'get_availability') {
+    out.appointmentFlow = true;
     const days = Math.min(Math.max(parseInt(input?.days, 10) || 14, 1), 30);
     const { slots, calendarChecked } = await getAvailability(days);
     const txt = formatAvailabilityIT(slots);
@@ -388,15 +497,17 @@ async function runTool(name: string, input: any, out: DraftResult, phone: string
       return 'Errore: data o ora non valide. Usa get_availability e riprova con uno slot esatto.';
     }
     out.proposedEvent = { date, start, end: endTime(start), reason: String(input?.reason || 'Appuntamento') };
-    return 'Proposta registrata. Comunica al cliente che l\'appuntamento è in fase di conferma da parte dello studio, ringrazia e CHIEDIGLI di inviare in anticipo su questa chat i documenti utili da visionare prima dell\'incontro (es. atti/cartelle notificate, fatture, dichiarazioni, contratti pertinenti).';
+    out.appointmentFlow = true;
+    return 'Proposta registrata. Comunica al cliente lo slot e che resta in attesa di conferma, ringrazia e — se l\'incontro riguarda documenti da esaminare — CHIARISCI che deve inviarli su questa chat PRIMA dell\'appuntamento (es. atti/cartelle notificate, fatture, dichiarazioni, contratti, avvisi): solo così potranno essere visionati e poi discussi durante l\'incontro. Infine chiedigli di confermare quando avrà la certezza di poter venire.';
   }
   if (name === 'confirm_appointment') {
+    out.appointmentFlow = true;
     const appt = getPendingAppointment(phone);
     if (!appt) {
       return 'Non risulta alcun appuntamento in attesa di conferma per questo cliente: non confermare nulla, prosegui normalmente.';
     }
     const r = await confirmAppointmentRow(appt, { notify: true });
-    return `Appuntamento confermato e ${r.calendarUpdated ? 'agenda aggiornata' : 'segnalato al Dott. Branca'}. Scrivi al cliente un breve messaggio che CONFERMA l'appuntamento del ${appt.date} alle ${appt.start}, ringrazia, CHIEDIGLI di inviare in anticipo su questa chat i documenti utili da visionare prima dell'incontro, e indica che lo studio è in Via Operai 102, Barcellona P.G. (ME).`;
+    return `Appuntamento confermato e ${r.calendarUpdated ? 'agenda aggiornata' : 'segnalato al Dott. Branca'}. Scrivi al cliente un breve messaggio che CONFERMA l'appuntamento del ${appt.date} alle ${appt.start}, ringrazia, e — se l'incontro riguarda documenti da esaminare — RIBADISCI che deve inviarli su questa chat PRIMA dell'appuntamento, così potranno essere visionati e discussi durante l'incontro; indica che lo studio è in Via Operai 102, Barcellona P.G. (ME).`;
   }
   if (name === 'need_human') {
     out.needsHuman = true;
@@ -405,7 +516,21 @@ async function runTool(name: string, input: any, out: DraftResult, phone: string
   }
   if (name === 'ignore_personal') {
     out.personal = true;
-    return 'Ok: messaggio personale/non pertinente. NON produrre alcuna risposta.';
+    return 'Classificato come personale/non di lavoro. Ora scrivi comunque un BREVE messaggio di cortesia: che il Dott. Branca al momento è impegnato e ricontatterà appena libero. Chiudi col recapito di segreteria e la firma. Nient\'altro.';
+  }
+  if (name === 'note_documents') {
+    const summary = String(input?.summary || '').trim().slice(0, 300);
+    if (!summary) return 'Nessun contenuto da annotare.';
+    recordDocNote(phone, summary);
+    // Se c'è già un appuntamento in agenda per questo cliente, annota subito sull'evento.
+    const appt = getActiveAppointmentWithEvent(phone);
+    if (appt?.event_id) {
+      try {
+        await appendEventDescription(appt.event_id, `📎 Documenti ricevuti (${new Date().toISOString().slice(0, 10)}): ${summary}`);
+        markDocNotesAttached(phone);
+      } catch (e: any) { console.error('[Chatbot] annota documenti su evento:', e.message); }
+    }
+    return 'Documentazione annotata come promemoria per l\'appuntamento. Conferma al cliente la ricezione, indica che sarà esaminata prima dell\'incontro e RICORDA che i documenti utili vanno inviati su questa chat PRIMA dell\'appuntamento.';
   }
   return 'Strumento sconosciuto.';
 }
@@ -454,7 +579,7 @@ export async function generateDraft(phone: string, contactName: string): Promise
         },
         body: JSON.stringify({
           model: getBotModel(),
-          max_tokens: 1024,
+          max_tokens: 1500,
           system,
           tools: TOOLS,
           messages,
@@ -490,7 +615,8 @@ export async function generateDraft(phone: string, contactName: string): Promise
     break; // end_turn
   }
 
-  if (out.personal) return { kind: 'personal', result: null }; // chat privata → nessuna bozza
+  // Non-lavoro: si invia comunque un breve messaggio di cortesia (auto), se prodotto.
+  if (out.personal) return { kind: 'personal', result: out.draftText ? out : null };
   if (!out.draftText) return null;
   return { kind: 'work', result: out };
 }
@@ -561,9 +687,12 @@ export async function approveDraftCore(id: number, opts: { text?: string; force?
   let calendar: any = null;
   if (d.proposed_event) {
     const ev = d.proposed_event;
+    // Promemoria documenti già inviati dal cliente (a cosa si riferiscono): in descrizione.
+    const docNotes = getUnattachedDocNotes(d.phone);
+    const docBlock = docNotes.length ? `\n\n${formatDocNotes(docNotes)}` : '';
     calendar = await createCalendarEvent({
       title: `[DA CONFERMARE] ${ev.reason} — ${d.contact_name || d.phone}`,
-      description: `Appuntamento proposto dal chatbot WhatsApp.\nCliente: ${d.contact_name || ''} (${d.phone})\nMotivo: ${ev.reason}\n\n⚠️ Confermare con il cliente.`,
+      description: `Appuntamento proposto dal chatbot WhatsApp.\nCliente: ${d.contact_name || ''} (${d.phone})\nMotivo: ${ev.reason}${docBlock}\n\n⚠️ Confermare con il cliente.`,
       startDate: `${ev.date}T${ev.start}:00`,
       endDate: `${ev.date}T${ev.end}:00`,
     });
@@ -573,6 +702,7 @@ export async function approveDraftCore(id: number, opts: { text?: string; force?
       phone: d.phone, contactName: d.contact_name, eventId: calendar?.eventId ?? null,
       date: ev.date, start: ev.start, end: ev.end, reason: ev.reason,
     });
+    if (docNotes.length) markDocNotesAttached(d.phone);
   }
   markDraftSent(id);
   broadcastEvent('message', { type: 'sent', phone: d.phone, contactName: d.contact_name, content: finalText, timestamp: now });
