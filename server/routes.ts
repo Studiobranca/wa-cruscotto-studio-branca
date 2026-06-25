@@ -34,6 +34,11 @@ import {
   notifyDraftToControl,
   handleControlCommand,
   approveDraftCore,
+  isAutoSendEnabled,
+  getPendingAppointments,
+  getAppointmentById,
+  confirmAppointmentRow,
+  cancelAppointmentRow,
 } from './chatbot.js';
 import { runDailyDigest, getFlowHealth, repairWebhook } from './maintenance.js';
 
@@ -841,10 +846,24 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
           } else if (outcome?.kind === 'work' && outcome.result) {
             recordClassification(messageId, phone, day, 'work');
             const id = saveDraft({ phone, contactName: cName, incoming: content, result: outcome.result });
-            broadcastEvent('bot_draft', { id, phone, contactName: cName, needsHuman: outcome.result.needsHuman });
-            console.log(`[Chatbot] Bozza #${id} per ${cName} (${phone})${outcome.result.needsHuman ? ' [need_human]' : ''}`);
-            // Notifica WhatsApp a Mariano (default: solo fuori orario di studio)
-            if (shouldNotifyControl()) await notifyDraftToControl(id);
+            // Risposta automatica per i non-VIP: se attiva, invia subito SENZA approvazione.
+            // Eccezione: i casi urgenti (need_human) restano sempre bozza per Mariano.
+            if (isAutoSendEnabled() && !outcome.result.needsHuman) {
+              const r = await approveDraftCore(id, { force: true });
+              broadcastEvent('bot_draft', { id, phone, contactName: cName, needsHuman: false, autoSent: r.ok });
+              console.log(`[Chatbot] Auto-risposta a ${cName} (${phone})${r.hadEvent ? ' + appuntamento DA CONFERMARE' : ''}`);
+              if (r.ok && shouldNotifyControl()) {
+                try {
+                  await sendTextMessage(getControlNumber(),
+                    `🤖 Risposta automatica inviata a ${cName} (${phone}):\n«${(outcome.result.draftText || '').slice(0, 300)}»${r.hadEvent ? '\n📅 Appuntamento DA CONFERMARE in agenda.' : ''}`);
+                } catch (e: any) { console.error('[Chatbot] notifica auto-risposta:', e.message); }
+              }
+            } else {
+              broadcastEvent('bot_draft', { id, phone, contactName: cName, needsHuman: outcome.result.needsHuman });
+              console.log(`[Chatbot] Bozza #${id} per ${cName} (${phone})${outcome.result.needsHuman ? ' [need_human]' : ''}`);
+              // Notifica WhatsApp a Mariano (default: solo fuori orario di studio)
+              if (shouldNotifyControl()) await notifyDraftToControl(id);
+            }
           }
         } catch (botErr: any) {
           console.error('[Chatbot] Error:', botErr.message);
@@ -1209,17 +1228,18 @@ router.get('/bot/drafts', (_req: Request, res: Response) => {
 });
 
 router.get('/bot/config', (_req: Request, res: Response) => {
-  res.json({ enabled: isBotEnabled(), model: getBotModel(), notifyMode: getNotifyMode(), controlNumber: getControlNumber() });
+  res.json({ enabled: isBotEnabled(), model: getBotModel(), notifyMode: getNotifyMode(), controlNumber: getControlNumber(), autoSend: isAutoSendEnabled() });
 });
 
 router.post('/bot/config', (req: Request, res: Response) => {
   try {
-    const { enabled, model, notifyMode, controlNumber } = req.body || {};
+    const { enabled, model, notifyMode, controlNumber, autoSend } = req.body || {};
     if (enabled !== undefined) setBotSetting('bot_enabled', enabled ? '1' : '0');
+    if (autoSend !== undefined) setBotSetting('bot_auto_send', autoSend ? '1' : '0');
     if (model) setBotSetting('bot_model', String(model));
     if (notifyMode && ['off', 'outside_hours', 'always'].includes(notifyMode)) setBotSetting('notify_mode', notifyMode);
     if (controlNumber) setBotSetting('control_number', String(controlNumber).replace(/\D/g, ''));
-    res.json({ enabled: isBotEnabled(), model: getBotModel(), notifyMode: getNotifyMode(), controlNumber: getControlNumber() });
+    res.json({ enabled: isBotEnabled(), model: getBotModel(), notifyMode: getNotifyMode(), controlNumber: getControlNumber(), autoSend: isAutoSendEnabled() });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -1247,6 +1267,42 @@ router.post('/bot/drafts/:id/approve', async (req: Request, res: Response) => {
     res.json({ success: true, calendar: r.calendar });
   } catch (err: any) {
     console.error('[Bot approve] Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── APPUNTAMENTI: lista da confermare + conferma/annulla manuale ─────────────
+router.get('/bot/appointments', (_req: Request, res: Response) => {
+  try {
+    res.json(getPendingAppointments());
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/bot/appointments/:id/confirm', async (req: Request, res: Response) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const appt = getAppointmentById(id);
+    if (!appt) return res.status(404).json({ error: 'Appuntamento non trovato' });
+    if (appt.status !== 'da_confermare') return res.status(400).json({ error: 'Appuntamento già gestito' });
+    const r = await confirmAppointmentRow(appt, { notify: false });
+    res.json({ success: true, calendarUpdated: r.calendarUpdated });
+  } catch (err: any) {
+    console.error('[Bot appointment confirm] Error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.post('/bot/appointments/:id/cancel', async (req: Request, res: Response) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const appt = getAppointmentById(id);
+    if (!appt) return res.status(404).json({ error: 'Appuntamento non trovato' });
+    await cancelAppointmentRow(appt);
+    res.json({ success: true });
+  } catch (err: any) {
+    console.error('[Bot appointment cancel] Error:', err);
     res.status(500).json({ error: err.message });
   }
 });

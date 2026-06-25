@@ -88,6 +88,64 @@ export function markAppointmentConfirmed(id: number): void {
   db.prepare(`UPDATE bot_appointments SET status = 'confermato', confirmed_at = datetime('now') WHERE id = ?`).run(id);
 }
 
+/** Tutti gli appuntamenti in attesa di conferma (per la lista nel Cruscotto). */
+export function getPendingAppointments(): any[] {
+  return db.prepare(`
+    SELECT * FROM bot_appointments WHERE status = 'da_confermare'
+    ORDER BY date ASC, start ASC
+  `).all() as any[];
+}
+
+/** Un appuntamento per id. */
+export function getAppointmentById(id: number): any | null {
+  return db.prepare(`SELECT * FROM bot_appointments WHERE id = ?`).get(id) as any || null;
+}
+
+/**
+ * Conferma un appuntamento (riga bot_appointments): aggiorna l'evento in Google Calendar
+ * (titolo ✅ + verde) e lo segna 'confermato'. È il cuore condiviso tra la conferma
+ * AUTOMATICA (tool confirm_appointment, quando il cliente conferma su WhatsApp) e quella
+ * MANUALE (pulsante nel Cruscotto). Con notify=true avvisa anche il numero di controllo.
+ */
+export async function confirmAppointmentRow(appt: any, opts: { notify?: boolean } = {}): Promise<{ ok: boolean; calendarUpdated: boolean }> {
+  let calOk = false;
+  if (appt.event_id) {
+    const r = await updateCalendarEvent({
+      eventId: appt.event_id,
+      title: `✅ ${appt.reason || 'Appuntamento'} — ${appt.contact_name || appt.phone}`,
+      description: `Appuntamento CONFERMATO.\nCliente: ${appt.contact_name || ''} (${appt.phone})\nMotivo: ${appt.reason || '-'}\nConfermato il ${new Date().toLocaleString('it-IT', { timeZone: 'Europe/Rome' })}.`,
+      colorId: '10', // verde "Basil"
+    });
+    calOk = r.success;
+  }
+  markAppointmentConfirmed(appt.id);
+  if (opts.notify) {
+    const esito = calOk
+      ? 'Agenda aggiornata (evento confermato).'
+      : appt.event_id ? '⚠️ Non sono riuscito ad aggiornare l\'evento in agenda: aggiornalo a mano.'
+        : '⚠️ Aggiorna l\'agenda a mano (evento non tracciato).';
+    try {
+      await sendTextMessage(
+        getControlNumber(),
+        `✅ ${appt.contact_name || appt.phone} ha CONFERMATO l'appuntamento:\n📅 ${appt.date} ore ${appt.start} — ${appt.reason || 'Appuntamento'}\n${esito}`,
+      );
+    } catch (e: any) { console.error('[Chatbot] notifica conferma fallita:', e.message); }
+  }
+  return { ok: true, calendarUpdated: calOk };
+}
+
+/** Annulla un appuntamento: marca l'evento come [ANNULLATO] (grigio) e lo segna 'annullato'. */
+export async function cancelAppointmentRow(appt: any): Promise<void> {
+  if (appt.event_id) {
+    await updateCalendarEvent({
+      eventId: appt.event_id,
+      title: `❌ [ANNULLATO] ${appt.reason || 'Appuntamento'} — ${appt.contact_name || appt.phone}`,
+      colorId: '8', // grafite
+    });
+  }
+  db.prepare(`UPDATE bot_appointments SET status = 'annullato' WHERE id = ?`).run(appt.id);
+}
+
 // ─── Config (app_settings key/value) ─────────────────────────────────────────
 function getSetting(key: string, def: string): string {
   try {
@@ -103,6 +161,9 @@ export function setSetting(key: string, value: string): void {
 }
 export function isBotEnabled(): boolean { return getSetting('bot_enabled', '1') === '1'; }
 export function getBotModel(): string { return getSetting('bot_model', DEFAULT_MODEL); }
+// Risposta automatica per i clienti non-VIP: se attiva il bot INVIA da solo le risposte
+// (tranne i casi urgenti need_human, che restano bozza). Default OFF (modalità bozza).
+export function isAutoSendEnabled(): boolean { return getSetting('bot_auto_send', '0') === '1'; }
 
 // Numero WhatsApp di Mariano per notifica/approvazione bozze (solo cifre).
 export function getControlNumber(): string {
@@ -147,6 +208,10 @@ COMPORTAMENTO BASE:
 - Invita SEMPRE il cliente a passare in studio e a fissare un appuntamento.
 - Per gli appuntamenti usa get_availability (proponi 2-3 opzioni) e, quando il cliente
   sceglie, chiama propose_booking (l'appuntamento sarà poi confermato dallo studio).
+- Ogni volta che proponi o confermi un appuntamento, CHIEDI SEMPRE al cliente di inviare
+  in anticipo su questa chat i documenti utili da visionare prima dell'incontro (es. atti
+  o cartelle notificate, fatture, dichiarazioni, contratti pertinenti): così l'incontro è
+  più produttivo.
 - ORARI STUDIO (get_availability li rispetta già, ma tienili presente nel dialogo):
   Lun-Ven 9:00-13:00; pomeriggio SOLO lun/mar/gio 15:30-19:00 (NO mercoledì e venerdì
   pomeriggio). MAI sabato, domenica, feste comandate; chiuso dal 20 luglio al 31 agosto.
@@ -323,38 +388,15 @@ async function runTool(name: string, input: any, out: DraftResult, phone: string
       return 'Errore: data o ora non valide. Usa get_availability e riprova con uno slot esatto.';
     }
     out.proposedEvent = { date, start, end: endTime(start), reason: String(input?.reason || 'Appuntamento') };
-    return 'Proposta registrata. L\'appuntamento sarà confermato dallo studio: comunica al cliente che è in fase di conferma e ringrazia.';
+    return 'Proposta registrata. Comunica al cliente che l\'appuntamento è in fase di conferma da parte dello studio, ringrazia e CHIEDIGLI di inviare in anticipo su questa chat i documenti utili da visionare prima dell\'incontro (es. atti/cartelle notificate, fatture, dichiarazioni, contratti pertinenti).';
   }
   if (name === 'confirm_appointment') {
     const appt = getPendingAppointment(phone);
     if (!appt) {
       return 'Non risulta alcun appuntamento in attesa di conferma per questo cliente: non confermare nulla, prosegui normalmente.';
     }
-    // Aggiorna l'evento in agenda: "[DA CONFERMARE]" → confermato (verde).
-    let calOk = false;
-    if (appt.event_id) {
-      const r = await updateCalendarEvent({
-        eventId: appt.event_id,
-        title: `✅ ${appt.reason || 'Appuntamento'} — ${appt.contact_name || phone}`,
-        description: `Appuntamento CONFERMATO dal cliente su WhatsApp.\nCliente: ${appt.contact_name || ''} (${phone})\nMotivo: ${appt.reason || '-'}\nConfermato il ${new Date().toLocaleString('it-IT', { timeZone: 'Europe/Rome' })}.`,
-        colorId: '10', // verde "Basil"
-      });
-      calOk = r.success;
-    }
-    markAppointmentConfirmed(appt.id);
-    // Avvisa Mariano sul numero di controllo.
-    const esito = calOk
-      ? 'Agenda aggiornata (evento confermato).'
-      : appt.event_id
-        ? '⚠️ Non sono riuscito ad aggiornare l\'evento in agenda: aggiornalo a mano.'
-        : '⚠️ Aggiorna l\'agenda a mano (evento non tracciato).';
-    try {
-      await sendTextMessage(
-        getControlNumber(),
-        `✅ ${appt.contact_name || phone} ha CONFERMATO l'appuntamento:\n📅 ${appt.date} ore ${appt.start} — ${appt.reason || 'Appuntamento'}\n${esito}`,
-      );
-    } catch (e: any) { console.error('[Chatbot] notifica conferma fallita:', e.message); }
-    return `Appuntamento confermato e ${calOk ? 'agenda aggiornata' : 'segnalato al Dott. Branca'}. Scrivi al cliente un breve messaggio che CONFERMA l'appuntamento del ${appt.date} alle ${appt.start}, ringrazia e indica che lo studio è in Via Operai 102, Barcellona P.G. (ME).`;
+    const r = await confirmAppointmentRow(appt, { notify: true });
+    return `Appuntamento confermato e ${r.calendarUpdated ? 'agenda aggiornata' : 'segnalato al Dott. Branca'}. Scrivi al cliente un breve messaggio che CONFERMA l'appuntamento del ${appt.date} alle ${appt.start}, ringrazia, CHIEDIGLI di inviare in anticipo su questa chat i documenti utili da visionare prima dell'incontro, e indica che lo studio è in Via Operai 102, Barcellona P.G. (ME).`;
   }
   if (name === 'need_human') {
     out.needsHuman = true;

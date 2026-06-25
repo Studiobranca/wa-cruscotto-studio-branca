@@ -24896,6 +24896,57 @@ function getPendingAppointment(phone) {
 function markAppointmentConfirmed(id) {
   db_default.prepare(`UPDATE bot_appointments SET status = 'confermato', confirmed_at = datetime('now') WHERE id = ?`).run(id);
 }
+function getPendingAppointments() {
+  return db_default.prepare(`
+    SELECT * FROM bot_appointments WHERE status = 'da_confermare'
+    ORDER BY date ASC, start ASC
+  `).all();
+}
+function getAppointmentById(id) {
+  return db_default.prepare(`SELECT * FROM bot_appointments WHERE id = ?`).get(id) || null;
+}
+async function confirmAppointmentRow(appt, opts = {}) {
+  let calOk = false;
+  if (appt.event_id) {
+    const r = await updateCalendarEvent({
+      eventId: appt.event_id,
+      title: `\u2705 ${appt.reason || "Appuntamento"} \u2014 ${appt.contact_name || appt.phone}`,
+      description: `Appuntamento CONFERMATO.
+Cliente: ${appt.contact_name || ""} (${appt.phone})
+Motivo: ${appt.reason || "-"}
+Confermato il ${(/* @__PURE__ */ new Date()).toLocaleString("it-IT", { timeZone: "Europe/Rome" })}.`,
+      colorId: "10"
+      // verde "Basil"
+    });
+    calOk = r.success;
+  }
+  markAppointmentConfirmed(appt.id);
+  if (opts.notify) {
+    const esito = calOk ? "Agenda aggiornata (evento confermato)." : appt.event_id ? "\u26A0\uFE0F Non sono riuscito ad aggiornare l'evento in agenda: aggiornalo a mano." : "\u26A0\uFE0F Aggiorna l'agenda a mano (evento non tracciato).";
+    try {
+      await sendTextMessage(
+        getControlNumber(),
+        `\u2705 ${appt.contact_name || appt.phone} ha CONFERMATO l'appuntamento:
+\u{1F4C5} ${appt.date} ore ${appt.start} \u2014 ${appt.reason || "Appuntamento"}
+${esito}`
+      );
+    } catch (e) {
+      console.error("[Chatbot] notifica conferma fallita:", e.message);
+    }
+  }
+  return { ok: true, calendarUpdated: calOk };
+}
+async function cancelAppointmentRow(appt) {
+  if (appt.event_id) {
+    await updateCalendarEvent({
+      eventId: appt.event_id,
+      title: `\u274C [ANNULLATO] ${appt.reason || "Appuntamento"} \u2014 ${appt.contact_name || appt.phone}`,
+      colorId: "8"
+      // grafite
+    });
+  }
+  db_default.prepare(`UPDATE bot_appointments SET status = 'annullato' WHERE id = ?`).run(appt.id);
+}
 function getSetting(key, def) {
   try {
     const row = db_default.prepare(`SELECT value FROM app_settings WHERE key = ?`).get(key);
@@ -24915,6 +24966,9 @@ function isBotEnabled() {
 }
 function getBotModel() {
   return getSetting("bot_model", DEFAULT_MODEL);
+}
+function isAutoSendEnabled() {
+  return getSetting("bot_auto_send", "0") === "1";
 }
 function getControlNumber() {
   return (getSetting("control_number", "") || process.env.CONTROL_WHATSAPP || "393457050479").replace(/\D/g, "");
@@ -24951,6 +25005,10 @@ COMPORTAMENTO BASE:
 - Invita SEMPRE il cliente a passare in studio e a fissare un appuntamento.
 - Per gli appuntamenti usa get_availability (proponi 2-3 opzioni) e, quando il cliente
   sceglie, chiama propose_booking (l'appuntamento sar\xE0 poi confermato dallo studio).
+- Ogni volta che proponi o confermi un appuntamento, CHIEDI SEMPRE al cliente di inviare
+  in anticipo su questa chat i documenti utili da visionare prima dell'incontro (es. atti
+  o cartelle notificate, fatture, dichiarazioni, contratti pertinenti): cos\xEC l'incontro \xE8
+  pi\xF9 produttivo.
 - ORARI STUDIO (get_availability li rispetta gi\xE0, ma tienili presente nel dialogo):
   Lun-Ven 9:00-13:00; pomeriggio SOLO lun/mar/gio 15:30-19:00 (NO mercoled\xEC e venerd\xEC
   pomeriggio). MAI sabato, domenica, feste comandate; chiuso dal 20 luglio al 31 agosto.
@@ -25108,40 +25166,15 @@ Slot con data esatta da usare in propose_booking (date=YYYY-MM-DD, start=HH:MM):
       return "Errore: data o ora non valide. Usa get_availability e riprova con uno slot esatto.";
     }
     out.proposedEvent = { date, start, end: endTime(start), reason: String(input?.reason || "Appuntamento") };
-    return "Proposta registrata. L'appuntamento sar\xE0 confermato dallo studio: comunica al cliente che \xE8 in fase di conferma e ringrazia.";
+    return "Proposta registrata. Comunica al cliente che l'appuntamento \xE8 in fase di conferma da parte dello studio, ringrazia e CHIEDIGLI di inviare in anticipo su questa chat i documenti utili da visionare prima dell'incontro (es. atti/cartelle notificate, fatture, dichiarazioni, contratti pertinenti).";
   }
   if (name === "confirm_appointment") {
     const appt = getPendingAppointment(phone);
     if (!appt) {
       return "Non risulta alcun appuntamento in attesa di conferma per questo cliente: non confermare nulla, prosegui normalmente.";
     }
-    let calOk = false;
-    if (appt.event_id) {
-      const r = await updateCalendarEvent({
-        eventId: appt.event_id,
-        title: `\u2705 ${appt.reason || "Appuntamento"} \u2014 ${appt.contact_name || phone}`,
-        description: `Appuntamento CONFERMATO dal cliente su WhatsApp.
-Cliente: ${appt.contact_name || ""} (${phone})
-Motivo: ${appt.reason || "-"}
-Confermato il ${(/* @__PURE__ */ new Date()).toLocaleString("it-IT", { timeZone: "Europe/Rome" })}.`,
-        colorId: "10"
-        // verde "Basil"
-      });
-      calOk = r.success;
-    }
-    markAppointmentConfirmed(appt.id);
-    const esito = calOk ? "Agenda aggiornata (evento confermato)." : appt.event_id ? "\u26A0\uFE0F Non sono riuscito ad aggiornare l'evento in agenda: aggiornalo a mano." : "\u26A0\uFE0F Aggiorna l'agenda a mano (evento non tracciato).";
-    try {
-      await sendTextMessage(
-        getControlNumber(),
-        `\u2705 ${appt.contact_name || phone} ha CONFERMATO l'appuntamento:
-\u{1F4C5} ${appt.date} ore ${appt.start} \u2014 ${appt.reason || "Appuntamento"}
-${esito}`
-      );
-    } catch (e) {
-      console.error("[Chatbot] notifica conferma fallita:", e.message);
-    }
-    return `Appuntamento confermato e ${calOk ? "agenda aggiornata" : "segnalato al Dott. Branca"}. Scrivi al cliente un breve messaggio che CONFERMA l'appuntamento del ${appt.date} alle ${appt.start}, ringrazia e indica che lo studio \xE8 in Via Operai 102, Barcellona P.G. (ME).`;
+    const r = await confirmAppointmentRow(appt, { notify: true });
+    return `Appuntamento confermato e ${r.calendarUpdated ? "agenda aggiornata" : "segnalato al Dott. Branca"}. Scrivi al cliente un breve messaggio che CONFERMA l'appuntamento del ${appt.date} alle ${appt.start}, ringrazia, CHIEDIGLI di inviare in anticipo su questa chat i documenti utili da visionare prima dell'incontro, e indica che lo studio \xE8 in Via Operai 102, Barcellona P.G. (ME).`;
   }
   if (name === "need_human") {
     out.needsHuman = true;
@@ -26194,9 +26227,26 @@ Da confermare.`,
           } else if (outcome?.kind === "work" && outcome.result) {
             recordClassification(messageId, phone, day, "work");
             const id = saveDraft({ phone, contactName: cName, incoming: content, result: outcome.result });
-            broadcastEvent("bot_draft", { id, phone, contactName: cName, needsHuman: outcome.result.needsHuman });
-            console.log(`[Chatbot] Bozza #${id} per ${cName} (${phone})${outcome.result.needsHuman ? " [need_human]" : ""}`);
-            if (shouldNotifyControl()) await notifyDraftToControl(id);
+            if (isAutoSendEnabled() && !outcome.result.needsHuman) {
+              const r = await approveDraftCore(id, { force: true });
+              broadcastEvent("bot_draft", { id, phone, contactName: cName, needsHuman: false, autoSent: r.ok });
+              console.log(`[Chatbot] Auto-risposta a ${cName} (${phone})${r.hadEvent ? " + appuntamento DA CONFERMARE" : ""}`);
+              if (r.ok && shouldNotifyControl()) {
+                try {
+                  await sendTextMessage(
+                    getControlNumber(),
+                    `\u{1F916} Risposta automatica inviata a ${cName} (${phone}):
+\xAB${(outcome.result.draftText || "").slice(0, 300)}\xBB${r.hadEvent ? "\n\u{1F4C5} Appuntamento DA CONFERMARE in agenda." : ""}`
+                  );
+                } catch (e) {
+                  console.error("[Chatbot] notifica auto-risposta:", e.message);
+                }
+              }
+            } else {
+              broadcastEvent("bot_draft", { id, phone, contactName: cName, needsHuman: outcome.result.needsHuman });
+              console.log(`[Chatbot] Bozza #${id} per ${cName} (${phone})${outcome.result.needsHuman ? " [need_human]" : ""}`);
+              if (shouldNotifyControl()) await notifyDraftToControl(id);
+            }
           }
         } catch (botErr) {
           console.error("[Chatbot] Error:", botErr.message);
@@ -26484,16 +26534,17 @@ router.get("/bot/drafts", (_req, res) => {
   }
 });
 router.get("/bot/config", (_req, res) => {
-  res.json({ enabled: isBotEnabled(), model: getBotModel(), notifyMode: getNotifyMode(), controlNumber: getControlNumber() });
+  res.json({ enabled: isBotEnabled(), model: getBotModel(), notifyMode: getNotifyMode(), controlNumber: getControlNumber(), autoSend: isAutoSendEnabled() });
 });
 router.post("/bot/config", (req, res) => {
   try {
-    const { enabled, model, notifyMode, controlNumber } = req.body || {};
+    const { enabled, model, notifyMode, controlNumber, autoSend } = req.body || {};
     if (enabled !== void 0) setSetting("bot_enabled", enabled ? "1" : "0");
+    if (autoSend !== void 0) setSetting("bot_auto_send", autoSend ? "1" : "0");
     if (model) setSetting("bot_model", String(model));
     if (notifyMode && ["off", "outside_hours", "always"].includes(notifyMode)) setSetting("notify_mode", notifyMode);
     if (controlNumber) setSetting("control_number", String(controlNumber).replace(/\D/g, ""));
-    res.json({ enabled: isBotEnabled(), model: getBotModel(), notifyMode: getNotifyMode(), controlNumber: getControlNumber() });
+    res.json({ enabled: isBotEnabled(), model: getBotModel(), notifyMode: getNotifyMode(), controlNumber: getControlNumber(), autoSend: isAutoSendEnabled() });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -26519,6 +26570,38 @@ router.post("/bot/drafts/:id/approve", async (req, res) => {
     res.json({ success: true, calendar: r.calendar });
   } catch (err) {
     console.error("[Bot approve] Error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+router.get("/bot/appointments", (_req, res) => {
+  try {
+    res.json(getPendingAppointments());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.post("/bot/appointments/:id/confirm", async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const appt = getAppointmentById(id);
+    if (!appt) return res.status(404).json({ error: "Appuntamento non trovato" });
+    if (appt.status !== "da_confermare") return res.status(400).json({ error: "Appuntamento gi\xE0 gestito" });
+    const r = await confirmAppointmentRow(appt, { notify: false });
+    res.json({ success: true, calendarUpdated: r.calendarUpdated });
+  } catch (err) {
+    console.error("[Bot appointment confirm] Error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+router.post("/bot/appointments/:id/cancel", async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const appt = getAppointmentById(id);
+    if (!appt) return res.status(404).json({ error: "Appuntamento non trovato" });
+    await cancelAppointmentRow(appt);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("[Bot appointment cancel] Error:", err);
     res.status(500).json({ error: err.message });
   }
 });
