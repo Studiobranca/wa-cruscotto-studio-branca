@@ -13,7 +13,7 @@
 import db from './db.js';
 import { getAvailability, formatAvailabilityIT, isSlotBusy } from './appointments.js';
 import { sendTextMessage } from './zapi.js';
-import { createCalendarEvent } from './integrations.js';
+import { createCalendarEvent, updateCalendarEvent } from './integrations.js';
 import { broadcastEvent } from './sse.js';
 
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
@@ -38,6 +38,55 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_bot_drafts_status ON bot_drafts(status);
 `);
+
+// ─── Persistenza: appuntamenti tracciati (per conferma cliente) ───────────────
+// Ogni appuntamento creato all'approvazione di una bozza viene registrato qui con
+// l'eventId di Google Calendar, così quando il cliente CONFERMA su WhatsApp si può
+// ritrovare l'evento e aggiornarlo (da "[DA CONFERMARE]" a confermato + verde).
+db.exec(`
+  CREATE TABLE IF NOT EXISTS bot_appointments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    phone TEXT NOT NULL,
+    contact_name TEXT,
+    event_id TEXT,                  -- id evento Google Calendar (NULL se Google non configurato)
+    date TEXT NOT NULL,             -- YYYY-MM-DD
+    start TEXT NOT NULL,            -- HH:MM
+    end TEXT,                       -- HH:MM
+    reason TEXT,
+    status TEXT DEFAULT 'da_confermare',  -- da_confermare | confermato | annullato
+    created_at TEXT DEFAULT (datetime('now')),
+    confirmed_at TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_bot_appt_phone ON bot_appointments(phone, status);
+`);
+
+/** Registra un appuntamento appena creato in agenda (stato: da_confermare). */
+export function recordAppointment(a: {
+  phone: string; contactName?: string | null; eventId?: string | null;
+  date: string; start: string; end?: string | null; reason?: string | null;
+}): number {
+  // Evita doppioni: annulla un'eventuale proposta pendente identica per lo stesso cliente.
+  db.prepare(`UPDATE bot_appointments SET status = 'annullato' WHERE phone = ? AND status = 'da_confermare'`).run(a.phone);
+  const info = db.prepare(`
+    INSERT INTO bot_appointments (phone, contact_name, event_id, date, start, end, reason, status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'da_confermare')
+  `).run(a.phone, a.contactName || null, a.eventId || null, a.date, a.start, a.end || null, a.reason || null);
+  return Number(info.lastInsertRowid);
+}
+
+/** Ultimo appuntamento in attesa di conferma per un numero (o null). */
+export function getPendingAppointment(phone: string): any | null {
+  return db.prepare(`
+    SELECT * FROM bot_appointments
+    WHERE phone = ? AND status = 'da_confermare'
+    ORDER BY created_at DESC LIMIT 1
+  `).get(phone) as any || null;
+}
+
+/** Segna un appuntamento come confermato dal cliente. */
+export function markAppointmentConfirmed(id: number): void {
+  db.prepare(`UPDATE bot_appointments SET status = 'confermato', confirmed_at = datetime('now') WHERE id = ?`).run(id);
+}
 
 // ─── Config (app_settings key/value) ─────────────────────────────────────────
 function getSetting(key: string, def: string): string {
@@ -146,6 +195,14 @@ const TOOLS = [
         reason: { type: 'string', description: 'Motivo/oggetto dell\'appuntamento' },
       },
       required: ['date', 'start', 'reason'],
+    },
+  },
+  {
+    name: 'confirm_appointment',
+    description: 'Conferma DEFINITIVAMENTE l\'appuntamento che era "da confermare" per questo cliente, perché il cliente ha appena confermato di poter venire. Aggiorna l\'agenda dello studio (evento da "[DA CONFERMARE]" a confermato) e avvisa il Dott. Branca. Chiamalo SOLO se nel system risulta un appuntamento in attesa di conferma e il cliente lo ha confermato; NON usarlo se il cliente chiede di spostare o disdire.',
+    input_schema: {
+      type: 'object',
+      properties: {},
     },
   },
   {
@@ -268,6 +325,37 @@ async function runTool(name: string, input: any, out: DraftResult, phone: string
     out.proposedEvent = { date, start, end: endTime(start), reason: String(input?.reason || 'Appuntamento') };
     return 'Proposta registrata. L\'appuntamento sarà confermato dallo studio: comunica al cliente che è in fase di conferma e ringrazia.';
   }
+  if (name === 'confirm_appointment') {
+    const appt = getPendingAppointment(phone);
+    if (!appt) {
+      return 'Non risulta alcun appuntamento in attesa di conferma per questo cliente: non confermare nulla, prosegui normalmente.';
+    }
+    // Aggiorna l'evento in agenda: "[DA CONFERMARE]" → confermato (verde).
+    let calOk = false;
+    if (appt.event_id) {
+      const r = await updateCalendarEvent({
+        eventId: appt.event_id,
+        title: `✅ ${appt.reason || 'Appuntamento'} — ${appt.contact_name || phone}`,
+        description: `Appuntamento CONFERMATO dal cliente su WhatsApp.\nCliente: ${appt.contact_name || ''} (${phone})\nMotivo: ${appt.reason || '-'}\nConfermato il ${new Date().toLocaleString('it-IT', { timeZone: 'Europe/Rome' })}.`,
+        colorId: '10', // verde "Basil"
+      });
+      calOk = r.success;
+    }
+    markAppointmentConfirmed(appt.id);
+    // Avvisa Mariano sul numero di controllo.
+    const esito = calOk
+      ? 'Agenda aggiornata (evento confermato).'
+      : appt.event_id
+        ? '⚠️ Non sono riuscito ad aggiornare l\'evento in agenda: aggiornalo a mano.'
+        : '⚠️ Aggiorna l\'agenda a mano (evento non tracciato).';
+    try {
+      await sendTextMessage(
+        getControlNumber(),
+        `✅ ${appt.contact_name || phone} ha CONFERMATO l'appuntamento:\n📅 ${appt.date} ore ${appt.start} — ${appt.reason || 'Appuntamento'}\n${esito}`,
+      );
+    } catch (e: any) { console.error('[Chatbot] notifica conferma fallita:', e.message); }
+    return `Appuntamento confermato e ${calOk ? 'agenda aggiornata' : 'segnalato al Dott. Branca'}. Scrivi al cliente un breve messaggio che CONFERMA l'appuntamento del ${appt.date} alle ${appt.start}, ringrazia e indica che lo studio è in Via Operai 102, Barcellona P.G. (ME).`;
+  }
   if (name === 'need_human') {
     out.needsHuman = true;
     out.humanReason = String(input?.reason || '');
@@ -300,7 +388,17 @@ export async function generateDraft(phone: string, contactName: string): Promise
     weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Europe/Rome',
   });
   const todayISO = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Rome' }).format(new Date());
-  const system = `${SYSTEM_PROMPT}\n\nData odierna: ${todayStr} (${todayISO}). Usa SEMPRE date coerenti con oggi e non inventare l'anno.`;
+
+  // Se per questo cliente c'è un appuntamento "da confermare", informane il modello:
+  // se il cliente lo conferma deve chiamare confirm_appointment (aggiorna l'agenda).
+  const pendingAppt = getPendingAppointment(phone);
+  const apptBlock = pendingAppt
+    ? `\n\nAPPUNTAMENTO IN ATTESA DI CONFERMA per questo cliente: ${pendingAppt.date} alle ${pendingAppt.start}${pendingAppt.reason ? ` (${pendingAppt.reason})` : ''}.
+- Se nell'ULTIMO messaggio il cliente CONFERMA che può venire (es. "confermo", "sì va bene", "ci sono", "perfetto", "ok per quel giorno"), chiama confirm_appointment e poi conferma con garbo.
+- Se invece chiede di SPOSTARE l'orario, usa get_availability per riproporre nuovi slot; se vuole DISDIRE o è incerto, NON chiamare confirm_appointment.`
+    : '';
+
+  const system = `${SYSTEM_PROMPT}\n\nData odierna: ${todayStr} (${todayISO}). Usa SEMPRE date coerenti con oggi e non inventare l'anno.${apptBlock}`;
 
   for (let loop = 0; loop < MAX_TOOL_LOOPS; loop++) {
     let data: any;
@@ -426,6 +524,12 @@ export async function approveDraftCore(id: number, opts: { text?: string; force?
       description: `Appuntamento proposto dal chatbot WhatsApp.\nCliente: ${d.contact_name || ''} (${d.phone})\nMotivo: ${ev.reason}\n\n⚠️ Confermare con il cliente.`,
       startDate: `${ev.date}T${ev.start}:00`,
       endDate: `${ev.date}T${ev.end}:00`,
+    });
+    // Traccia l'appuntamento (con eventId) così la conferma del cliente potrà
+    // ritrovare e aggiornare l'evento in agenda.
+    recordAppointment({
+      phone: d.phone, contactName: d.contact_name, eventId: calendar?.eventId ?? null,
+      date: ev.date, start: ev.start, end: ev.end, reason: ev.reason,
     });
   }
   markDraftSent(id);

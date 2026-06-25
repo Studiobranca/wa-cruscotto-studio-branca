@@ -117,13 +117,13 @@ export default function BotDrafts() {
           </label>
         </div>
         <div style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid #eee', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10, flexWrap: 'wrap' }}>
-          <div style={{ fontSize: 13, color: '#555' }}>
+          <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>
             Avvisami su WhatsApp{config?.controlNumber ? ` (${config.controlNumber})` : ''}
           </div>
           <select
             value={config?.notifyMode ?? 'always'}
             onChange={(e) => setNotify.mutate(e.target.value)}
-            style={{ padding: '6px 10px', borderRadius: 8, border: '1px solid #ddd', fontSize: 13 }}>
+            style={{ padding: '6px 10px', borderRadius: 8, border: '1px solid var(--border)', fontSize: 13, background: 'var(--bg3)', color: 'var(--text)' }}>
             <option value="always">Sempre</option>
             <option value="outside_hours">Solo fuori orario (sere/weekend)</option>
             <option value="off">Mai (solo Cruscotto)</option>
@@ -157,7 +157,7 @@ export default function BotDrafts() {
                   </div>
                 )}
 
-                <div style={{ fontSize: 12, color: '#777', marginBottom: 8, fontStyle: 'italic' }}>
+                <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 8, fontStyle: 'italic' }}>
                   Cliente: “{d.incoming_excerpt}”
                 </div>
 
@@ -178,7 +178,8 @@ export default function BotDrafts() {
                   rows={Math.min(8, Math.max(3, Math.ceil(text.length / 50)))}
                   style={{
                     width: '100%', boxSizing: 'border-box', padding: 10, borderRadius: 10,
-                    border: '1px solid #ddd', fontSize: 14, fontFamily: 'inherit', resize: 'vertical',
+                    border: '1px solid var(--border)', fontSize: 14, fontFamily: 'inherit', resize: 'vertical',
+                    background: 'var(--bg3)', color: 'var(--text)',
                   }}
                 />
 

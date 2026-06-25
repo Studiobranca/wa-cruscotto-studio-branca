@@ -24612,6 +24612,37 @@ async function createCalendarEvent(params) {
     return { success: false, error: e.message };
   }
 }
+async function updateCalendarEvent(params) {
+  const token = await getGoogleAccessToken2();
+  if (!token) return { success: false, error: "Google OAuth non configurato" };
+  const calId = params.calendarId || process.env.GOOGLE_CALENDAR_ID || "primary";
+  const body = {};
+  if (params.title !== void 0) body.summary = params.title;
+  if (params.description !== void 0) body.description = params.description;
+  if (params.colorId !== void 0) body.colorId = params.colorId;
+  if (params.startDate) body.start = { dateTime: params.startDate, timeZone: "Europe/Rome" };
+  if (params.endDate) body.end = { dateTime: params.endDate, timeZone: "Europe/Rome" };
+  try {
+    const resp = await fetch(
+      `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calId)}/events/${encodeURIComponent(params.eventId)}`,
+      {
+        method: "PATCH",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      }
+    );
+    if (resp.ok) {
+      logIntegration({ integration: "google_calendar", action: "update_event", status: "success", detail: `Evento ${params.eventId} aggiornato` });
+      return { success: true };
+    }
+    const err = await resp.text();
+    logIntegration({ integration: "google_calendar", action: "update_event", status: "error", detail: `HTTP ${resp.status}: ${err.substring(0, 100)}` });
+    return { success: false, error: `HTTP ${resp.status}` };
+  } catch (e) {
+    logIntegration({ integration: "google_calendar", action: "update_event", status: "error", detail: e.message });
+    return { success: false, error: e.message };
+  }
+}
 async function upsertAllDayEvent(params) {
   const token = await getGoogleAccessToken2();
   if (!token) return { success: false, error: "Google OAuth non configurato" };
@@ -24831,6 +24862,40 @@ db_default.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_bot_drafts_status ON bot_drafts(status);
 `);
+db_default.exec(`
+  CREATE TABLE IF NOT EXISTS bot_appointments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    phone TEXT NOT NULL,
+    contact_name TEXT,
+    event_id TEXT,                  -- id evento Google Calendar (NULL se Google non configurato)
+    date TEXT NOT NULL,             -- YYYY-MM-DD
+    start TEXT NOT NULL,            -- HH:MM
+    end TEXT,                       -- HH:MM
+    reason TEXT,
+    status TEXT DEFAULT 'da_confermare',  -- da_confermare | confermato | annullato
+    created_at TEXT DEFAULT (datetime('now')),
+    confirmed_at TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_bot_appt_phone ON bot_appointments(phone, status);
+`);
+function recordAppointment(a) {
+  db_default.prepare(`UPDATE bot_appointments SET status = 'annullato' WHERE phone = ? AND status = 'da_confermare'`).run(a.phone);
+  const info = db_default.prepare(`
+    INSERT INTO bot_appointments (phone, contact_name, event_id, date, start, end, reason, status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'da_confermare')
+  `).run(a.phone, a.contactName || null, a.eventId || null, a.date, a.start, a.end || null, a.reason || null);
+  return Number(info.lastInsertRowid);
+}
+function getPendingAppointment(phone) {
+  return db_default.prepare(`
+    SELECT * FROM bot_appointments
+    WHERE phone = ? AND status = 'da_confermare'
+    ORDER BY created_at DESC LIMIT 1
+  `).get(phone) || null;
+}
+function markAppointmentConfirmed(id) {
+  db_default.prepare(`UPDATE bot_appointments SET status = 'confermato', confirmed_at = datetime('now') WHERE id = ?`).run(id);
+}
 function getSetting(key, def) {
   try {
     const row = db_default.prepare(`SELECT value FROM app_settings WHERE key = ?`).get(key);
@@ -24936,6 +25001,14 @@ var TOOLS = [
     }
   },
   {
+    name: "confirm_appointment",
+    description: `Conferma DEFINITIVAMENTE l'appuntamento che era "da confermare" per questo cliente, perch\xE9 il cliente ha appena confermato di poter venire. Aggiorna l'agenda dello studio (evento da "[DA CONFERMARE]" a confermato) e avvisa il Dott. Branca. Chiamalo SOLO se nel system risulta un appuntamento in attesa di conferma e il cliente lo ha confermato; NON usarlo se il cliente chiede di spostare o disdire.`,
+    input_schema: {
+      type: "object",
+      properties: {}
+    }
+  },
+  {
     name: "need_human",
     description: "Segnala che la richiesta \xE8 urgente o complessa e deve gestirla direttamente il Dott. Branca (no risposta automatica risolutiva).",
     input_schema: {
@@ -25037,6 +25110,39 @@ Slot con data esatta da usare in propose_booking (date=YYYY-MM-DD, start=HH:MM):
     out.proposedEvent = { date, start, end: endTime(start), reason: String(input?.reason || "Appuntamento") };
     return "Proposta registrata. L'appuntamento sar\xE0 confermato dallo studio: comunica al cliente che \xE8 in fase di conferma e ringrazia.";
   }
+  if (name === "confirm_appointment") {
+    const appt = getPendingAppointment(phone);
+    if (!appt) {
+      return "Non risulta alcun appuntamento in attesa di conferma per questo cliente: non confermare nulla, prosegui normalmente.";
+    }
+    let calOk = false;
+    if (appt.event_id) {
+      const r = await updateCalendarEvent({
+        eventId: appt.event_id,
+        title: `\u2705 ${appt.reason || "Appuntamento"} \u2014 ${appt.contact_name || phone}`,
+        description: `Appuntamento CONFERMATO dal cliente su WhatsApp.
+Cliente: ${appt.contact_name || ""} (${phone})
+Motivo: ${appt.reason || "-"}
+Confermato il ${(/* @__PURE__ */ new Date()).toLocaleString("it-IT", { timeZone: "Europe/Rome" })}.`,
+        colorId: "10"
+        // verde "Basil"
+      });
+      calOk = r.success;
+    }
+    markAppointmentConfirmed(appt.id);
+    const esito = calOk ? "Agenda aggiornata (evento confermato)." : appt.event_id ? "\u26A0\uFE0F Non sono riuscito ad aggiornare l'evento in agenda: aggiornalo a mano." : "\u26A0\uFE0F Aggiorna l'agenda a mano (evento non tracciato).";
+    try {
+      await sendTextMessage(
+        getControlNumber(),
+        `\u2705 ${appt.contact_name || phone} ha CONFERMATO l'appuntamento:
+\u{1F4C5} ${appt.date} ore ${appt.start} \u2014 ${appt.reason || "Appuntamento"}
+${esito}`
+      );
+    } catch (e) {
+      console.error("[Chatbot] notifica conferma fallita:", e.message);
+    }
+    return `Appuntamento confermato e ${calOk ? "agenda aggiornata" : "segnalato al Dott. Branca"}. Scrivi al cliente un breve messaggio che CONFERMA l'appuntamento del ${appt.date} alle ${appt.start}, ringrazia e indica che lo studio \xE8 in Via Operai 102, Barcellona P.G. (ME).`;
+  }
   if (name === "need_human") {
     out.needsHuman = true;
     out.humanReason = String(input?.reason || "");
@@ -25064,9 +25170,15 @@ async function generateDraft(phone, contactName) {
     timeZone: "Europe/Rome"
   });
   const todayISO = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Rome" }).format(/* @__PURE__ */ new Date());
+  const pendingAppt = getPendingAppointment(phone);
+  const apptBlock = pendingAppt ? `
+
+APPUNTAMENTO IN ATTESA DI CONFERMA per questo cliente: ${pendingAppt.date} alle ${pendingAppt.start}${pendingAppt.reason ? ` (${pendingAppt.reason})` : ""}.
+- Se nell'ULTIMO messaggio il cliente CONFERMA che pu\xF2 venire (es. "confermo", "s\xEC va bene", "ci sono", "perfetto", "ok per quel giorno"), chiama confirm_appointment e poi conferma con garbo.
+- Se invece chiede di SPOSTARE l'orario, usa get_availability per riproporre nuovi slot; se vuole DISDIRE o \xE8 incerto, NON chiamare confirm_appointment.` : "";
   const system = `${SYSTEM_PROMPT}
 
-Data odierna: ${todayStr} (${todayISO}). Usa SEMPRE date coerenti con oggi e non inventare l'anno.`;
+Data odierna: ${todayStr} (${todayISO}). Usa SEMPRE date coerenti con oggi e non inventare l'anno.${apptBlock}`;
   for (let loop = 0; loop < MAX_TOOL_LOOPS; loop++) {
     let data;
     try {
@@ -25182,6 +25294,15 @@ Motivo: ${ev.reason}
 \u26A0\uFE0F Confermare con il cliente.`,
       startDate: `${ev.date}T${ev.start}:00`,
       endDate: `${ev.date}T${ev.end}:00`
+    });
+    recordAppointment({
+      phone: d.phone,
+      contactName: d.contact_name,
+      eventId: calendar?.eventId ?? null,
+      date: ev.date,
+      start: ev.start,
+      end: ev.end,
+      reason: ev.reason
     });
   }
   markDraftSent(id);
