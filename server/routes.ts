@@ -41,6 +41,7 @@ import {
   cancelAppointmentRow,
   courtesySentToday,
   markCourtesySent,
+  notifyUrgentByEmail,
 } from './chatbot.js';
 import { runDailyDigest, getFlowHealth, repairWebhook } from './maintenance.js';
 
@@ -883,7 +884,9 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
             } else {
               broadcastEvent('bot_draft', { id, phone, contactName: cName, needsHuman: res.needsHuman });
               console.log(`[Chatbot] Bozza #${id} per ${cName} (${phone})${res.needsHuman ? ' [need_human]' : ''}`);
-              // Notifica WhatsApp a Mariano (default: solo fuori orario di studio)
+              // Urgenze: alert EMAIL a Mariano (canale affidabile, sempre attivo).
+              if (res.needsHuman) await notifyUrgentByEmail(id);
+              // Notifica WhatsApp a Mariano (inaffidabile: numero controllo == device).
               if (shouldNotifyControl()) await notifyDraftToControl(id);
             }
           }

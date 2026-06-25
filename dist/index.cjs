@@ -25519,6 +25519,50 @@ Bozza:
     console.error("[Chatbot] notifica WhatsApp fallita:", e.message);
   }
 }
+var BREVO_URL = "https://api.brevo.com/v3/smtp/email";
+var ALERT_SENDER = { email: "studiobranca.mariano@gmail.com", name: "Bot WhatsApp \u2014 Studio Branca" };
+function getAlertEmail() {
+  return process.env.ALERT_EMAIL || "studiobranca.mariano@gmail.com";
+}
+async function sendBrevoEmail(subject, html) {
+  const key = process.env.BREVO_API_KEY;
+  if (!key) {
+    console.warn("[Email] BREVO_API_KEY non configurata: alert email saltato.");
+    return false;
+  }
+  try {
+    const resp = await fetch(BREVO_URL, {
+      method: "POST",
+      headers: { "api-key": key, "content-type": "application/json" },
+      body: JSON.stringify({ sender: ALERT_SENDER, to: [{ email: getAlertEmail() }], subject, htmlContent: html })
+    });
+    if (!resp.ok) {
+      console.error("[Email] Brevo HTTP", resp.status, (await resp.text()).slice(0, 200));
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.error("[Email] invio fallito:", e.message);
+    return false;
+  }
+}
+async function notifyUrgentByEmail(id) {
+  const d = getDraft(id);
+  if (!d) return;
+  const base = process.env.PUBLIC_BASE_URL || "https://wa-cruscotto-v2-production.up.railway.app";
+  const esc = (s) => String(s ?? "").replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" })[c]);
+  const subject = `\u{1F534} URGENTE \u2014 bozza #${d.id} \u2014 ${d.contact_name || d.phone}`;
+  const html = `
+    <h2 style="color:#b00020;margin:0 0 8px">Richiesta urgente sul WhatsApp dello studio</h2>
+    <p><b>Cliente:</b> ${esc(d.contact_name || d.phone)} (${esc(d.phone)})</p>
+    ${d.incoming_excerpt ? `<p><b>Messaggio:</b><br>${esc(d.incoming_excerpt)}</p>` : ""}
+    <p><b>Bozza predisposta dal bot (da approvare):</b></p>
+    <blockquote style="border-left:3px solid #b00020;margin:0;padding:4px 12px;color:#333">${esc(d.draft_text).replace(/\n/g, "<br>")}</blockquote>
+    <p>\u{1F449} Apri il Cruscotto per approvare o rifiutare: <a href="${base}/bot">${base}/bot</a></p>
+    <hr><p style="color:#888;font-size:12px">Alert automatico \u2014 bozza <code>need_human</code> del bot WhatsApp.</p>`;
+  const ok = await sendBrevoEmail(subject, html);
+  console.log(`[Email] Alert urgente bozza #${id} \u2192 ${getAlertEmail()}: ${ok ? "inviato" : "FALLITO"}`);
+}
 async function handleControlCommand(text) {
   const m = (text || "").trim().match(/^(ok|sì|si|approva|invia|conferma|no|rifiuta|scarta)\s+#?(\d+)\s*([\s\S]*)$/i);
   if (!m) return null;
@@ -26411,6 +26455,7 @@ Da confermare.`,
             } else {
               broadcastEvent("bot_draft", { id, phone, contactName: cName, needsHuman: res2.needsHuman });
               console.log(`[Chatbot] Bozza #${id} per ${cName} (${phone})${res2.needsHuman ? " [need_human]" : ""}`);
+              if (res2.needsHuman) await notifyUrgentByEmail(id);
               if (shouldNotifyControl()) await notifyDraftToControl(id);
             }
           }
