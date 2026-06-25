@@ -20,7 +20,7 @@ const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
 const ANTHROPIC_VERSION = '2023-06-01';
 const DEFAULT_MODEL = 'claude-sonnet-4-6';
 const MAX_TOOL_LOOPS = 4;
-const HISTORY_LIMIT = 20;
+const HISTORY_LIMIT = 30;
 
 // ─── Persistenza: tabella bozze (idempotente) ────────────────────────────────
 db.exec(`
@@ -254,6 +254,12 @@ tu rispondi col tu, se ti dà del Lei rispondi col Lei (nel dubbio, dai del Lei)
 cordiale e professionale. Le tue risposte di merito vengono riviste dal Dott. Branca prima
 dell'invio, quindi puoi entrare nel merito tecnico con competenza, senza rinvii generici.
 
+LEGGI SEMPRE TUTTA la conversazione recente prima di rispondere: tra un messaggio e l'altro il
+Dott. Branca può intervenire e rispondere DI PERSONA al cliente (i suoi messaggi compaiono come
+[STUDIO]). Tienine conto: non ripetere e non contraddire quanto lo studio ha già detto o fatto,
+e prosegui in modo coerente. Se il Dott. Branca ha GIÀ gestito o risposto all'ultima richiesta e
+non serve aggiungere altro, chiama already_handled (NON inviare alcun messaggio).
+
 OBIETTIVO — risposte TECNICHE, ACCURATE e UTILI (mai superficiali):
 - Inquadra correttamente la questione: qualifica l'atto o l'adempimento di cui si parla
   (es. avviso di accertamento, cartella di pagamento, avviso bonario, intimazione di
@@ -394,6 +400,15 @@ const TOOLS = [
     },
   },
   {
+    name: 'already_handled',
+    description: 'Usa questo SOLO quando dalla conversazione risulta che il Dott. Branca (messaggi [STUDIO]) ha GIÀ risposto o gestito di persona l\'ultima richiesta del cliente e non serve aggiungere altro: NON verrà inviato alcun messaggio (niente bozza, niente cortesia).',
+    input_schema: {
+      type: 'object',
+      properties: { reason: { type: 'string', description: 'Cosa ha già fatto/detto lo studio di persona' } },
+      required: ['reason'],
+    },
+  },
+  {
     name: 'find_previous_requests',
     description: 'Cerca nello storico dei messaggi del cliente se aveva già inviato lo stesso documento o fatto la stessa richiesta in passato. Usalo SEMPRE prima di rispondere a una richiesta/invio documenti.',
     input_schema: {
@@ -418,7 +433,7 @@ function buildTranscript(phone: string, contactName: string): string {
     const who = r.direction === 'sent' ? 'STUDIO' : 'CLIENTE';
     return `[${who}] ${(r.content || '').replace(/\n+/g, ' ').trim()}`;
   });
-  return `Conversazione WhatsApp con ${contactName} (${phone}):\n\n${lines.join('\n')}\n\nGenera la prossima risposta dello STUDIO.`;
+  return `Conversazione WhatsApp con ${contactName} (${phone}):\n\n${lines.join('\n')}\n\nLeggi TUTTA la conversazione qui sopra: i messaggi [STUDIO] includono anche eventuali risposte DIRETTE del Dott. Branca. Genera la prossima risposta dello STUDIO tenendone conto: non ripetere né contraddire quanto già detto/fatto.`;
 }
 
 interface DraftResult {
@@ -430,6 +445,8 @@ interface DraftResult {
   // true quando la risposta nasce dal flusso agenda (disponibilità/proposta/conferma):
   // questi messaggi li invia il bot in autonomia (l'agenda è già stata incrociata).
   appointmentFlow?: boolean;
+  // true quando il Dott. Branca ha già gestito di persona l'ultima richiesta → nessun messaggio.
+  handled?: boolean;
 }
 
 // Esito della generazione: 'work' (bozza da approvare) o 'personal' (chat privata,
@@ -532,6 +549,10 @@ async function runTool(name: string, input: any, out: DraftResult, phone: string
     }
     return 'Documentazione annotata come promemoria per l\'appuntamento. Conferma al cliente la ricezione, indica che sarà esaminata prima dell\'incontro e RICORDA che i documenti utili vanno inviati su questa chat PRIMA dell\'appuntamento.';
   }
+  if (name === 'already_handled') {
+    out.handled = true;
+    return 'Ok: il Dott. Branca ha già gestito la richiesta di persona. NON produrre alcun messaggio.';
+  }
   return 'Strumento sconosciuto.';
 }
 
@@ -615,6 +636,8 @@ export async function generateDraft(phone: string, contactName: string): Promise
     break; // end_turn
   }
 
+  // Il Dott. Branca ha già gestito di persona: nessuna azione, nessun messaggio.
+  if (out.handled) return null;
   // Non-lavoro: si invia comunque un breve messaggio di cortesia (auto), se prodotto.
   if (out.personal) return { kind: 'personal', result: out.draftText ? out : null };
   if (!out.draftText) return null;

@@ -24867,7 +24867,7 @@ var ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
 var ANTHROPIC_VERSION = "2023-06-01";
 var DEFAULT_MODEL = "claude-sonnet-4-6";
 var MAX_TOOL_LOOPS = 4;
-var HISTORY_LIMIT = 20;
+var HISTORY_LIMIT = 30;
 db_default.exec(`
   CREATE TABLE IF NOT EXISTS bot_drafts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -25060,6 +25060,12 @@ tu rispondi col tu, se ti d\xE0 del Lei rispondi col Lei (nel dubbio, dai del Le
 cordiale e professionale. Le tue risposte di merito vengono riviste dal Dott. Branca prima
 dell'invio, quindi puoi entrare nel merito tecnico con competenza, senza rinvii generici.
 
+LEGGI SEMPRE TUTTA la conversazione recente prima di rispondere: tra un messaggio e l'altro il
+Dott. Branca pu\xF2 intervenire e rispondere DI PERSONA al cliente (i suoi messaggi compaiono come
+[STUDIO]). Tienine conto: non ripetere e non contraddire quanto lo studio ha gi\xE0 detto o fatto,
+e prosegui in modo coerente. Se il Dott. Branca ha GI\xC0 gestito o risposto all'ultima richiesta e
+non serve aggiungere altro, chiama already_handled (NON inviare alcun messaggio).
+
 OBIETTIVO \u2014 risposte TECNICHE, ACCURATE e UTILI (mai superficiali):
 - Inquadra correttamente la questione: qualifica l'atto o l'adempimento di cui si parla
   (es. avviso di accertamento, cartella di pagamento, avviso bonario, intimazione di
@@ -25199,6 +25205,15 @@ var TOOLS = [
     }
   },
   {
+    name: "already_handled",
+    description: "Usa questo SOLO quando dalla conversazione risulta che il Dott. Branca (messaggi [STUDIO]) ha GI\xC0 risposto o gestito di persona l'ultima richiesta del cliente e non serve aggiungere altro: NON verr\xE0 inviato alcun messaggio (niente bozza, niente cortesia).",
+    input_schema: {
+      type: "object",
+      properties: { reason: { type: "string", description: "Cosa ha gi\xE0 fatto/detto lo studio di persona" } },
+      required: ["reason"]
+    }
+  },
+  {
     name: "find_previous_requests",
     description: "Cerca nello storico dei messaggi del cliente se aveva gi\xE0 inviato lo stesso documento o fatto la stessa richiesta in passato. Usalo SEMPRE prima di rispondere a una richiesta/invio documenti.",
     input_schema: {
@@ -25225,7 +25240,7 @@ function buildTranscript(phone, contactName) {
 
 ${lines.join("\n")}
 
-Genera la prossima risposta dello STUDIO.`;
+Leggi TUTTA la conversazione qui sopra: i messaggi [STUDIO] includono anche eventuali risposte DIRETTE del Dott. Branca. Genera la prossima risposta dello STUDIO tenendone conto: non ripetere n\xE9 contraddire quanto gi\xE0 detto/fatto.`;
 }
 db_default.exec(`
   CREATE TABLE IF NOT EXISTS bot_msg_class (
@@ -25317,6 +25332,10 @@ Slot con data esatta da usare in propose_booking (date=YYYY-MM-DD, start=HH:MM):
     }
     return "Documentazione annotata come promemoria per l'appuntamento. Conferma al cliente la ricezione, indica che sar\xE0 esaminata prima dell'incontro e RICORDA che i documenti utili vanno inviati su questa chat PRIMA dell'appuntamento.";
   }
+  if (name === "already_handled") {
+    out.handled = true;
+    return "Ok: il Dott. Branca ha gi\xE0 gestito la richiesta di persona. NON produrre alcun messaggio.";
+  }
   return "Strumento sconosciuto.";
 }
 async function generateDraft(phone, contactName) {
@@ -25388,6 +25407,7 @@ Data odierna: ${todayStr} (${todayISO}). Usa SEMPRE date coerenti con oggi e non
     }
     break;
   }
+  if (out.handled) return null;
   if (out.personal) return { kind: "personal", result: out.draftText ? out : null };
   if (!out.draftText) return null;
   return { kind: "work", result: out };
