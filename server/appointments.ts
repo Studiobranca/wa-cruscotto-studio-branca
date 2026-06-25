@@ -2,9 +2,10 @@
  * Disponibilità appuntamenti — Studio Tributario Branca
  *
  * Calcola gli slot liberi incrociando l'orario studio con Google Calendar
- * (freeBusy). Regole fisse concordate:
- *  - mattina 9:00–13:00 (lun–ven), pomeriggio 15:00–18:00 (lun, mar, gio)
- *  - ESCLUSI: mercoledì pomeriggio, venerdì pomeriggio, sabato, domenica
+ * (freeBusy). Regole fisse concordate (ricevimento Dott. Branca, salvo appuntamenti):
+ *  - lun, mar, gio: 9:00–18:00 a orario continuato
+ *  - mer, ven: 9:00–13:00 (solo mattina)
+ *  - ESCLUSI: sabato, domenica
  *  - ESCLUSE: feste comandate italiane (incl. lunedì dell'Angelo)
  *  - ESCLUSA: chiusura estiva 20 luglio – 31 agosto (ogni anno)
  */
@@ -67,10 +68,11 @@ interface Slot { date: string; start: string; end: string; dow: number; }
 function daySlots(ds: string, dow: number): Slot[] {
   if (dow === 0 || dow === 6) return [];          // domenica, sabato
   if (isHoliday(ds) || isSummerClosure(ds)) return [];
+  // Lun(1), Mar(2), Gio(4): orario continuato 9:00–18:00. Mer(3) e Ven(5): solo 9:00–13:00.
+  const fullDay = dow === 1 || dow === 2 || dow === 4;
+  const lastHour = fullDay ? 18 : 13;
   const out: Slot[] = [];
-  for (let h = 9; h < 13; h++) out.push({ date: ds, start: `${String(h).padStart(2, '0')}:00`, end: `${String(h + 1).padStart(2, '0')}:00`, dow });
-  const afternoonOk = dow === 1 || dow === 2 || dow === 4; // lun, mar, gio
-  if (afternoonOk) for (let h = 15; h < 18; h++) out.push({ date: ds, start: `${String(h).padStart(2, '0')}:00`, end: `${String(h + 1).padStart(2, '0')}:00`, dow });
+  for (let h = 9; h < lastHour; h++) out.push({ date: ds, start: `${String(h).padStart(2, '0')}:00`, end: `${String(h + 1).padStart(2, '0')}:00`, dow });
   return out;
 }
 
