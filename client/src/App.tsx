@@ -2,6 +2,7 @@ import { Switch, Route } from 'wouter';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { queryClient } from './lib/queryClient';
 import BottomNav from './components/BottomNav';
+import InAppBrowserWarning from './components/InAppBrowserWarning';
 import Dashboard from './pages/Dashboard';
 import Inbox from './pages/Inbox';
 import Report from './pages/Report';
@@ -13,6 +14,7 @@ export default function App() {
   return (
     <QueryClientProvider client={queryClient}>
       <div className="app-root">
+        <InAppBrowserWarning />
         <div className="app-content">
           <Switch>
             <Route path="/" component={Dashboard} />

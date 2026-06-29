@@ -254,11 +254,15 @@ tu rispondi col tu, se ti dà del Lei rispondi col Lei (nel dubbio, dai del Lei)
 cordiale e professionale. Le tue risposte di merito vengono riviste dal Dott. Branca prima
 dell'invio, quindi puoi entrare nel merito tecnico con competenza, senza rinvii generici.
 
-LEGGI SEMPRE TUTTA la conversazione recente prima di rispondere: tra un messaggio e l'altro il
-Dott. Branca può intervenire e rispondere DI PERSONA al cliente (i suoi messaggi compaiono come
-[STUDIO]). Tienine conto: non ripetere e non contraddire quanto lo studio ha già detto o fatto,
-e prosegui in modo coerente. Se il Dott. Branca ha GIÀ gestito o risposto all'ultima richiesta e
-non serve aggiungere altro, chiama already_handled (NON inviare alcun messaggio).
+PRIORITÀ DI LETTURA — rispondi innanzitutto al MESSAGGIO/I PIÙ RECENTE/I DEL CLIENTE (la sezione
+marcata come tale nel transcript): è quello il punto di partenza della tua risposta, non lo
+storico. Consulta lo STORICO PRECEDENTE solo per: (a) non ripetere o contraddire quanto il
+Dott. Branca ha già detto/fatto DI PERSONA (i suoi messaggi compaiono come [STUDIO]); (b) capire
+a cosa si riferisce il cliente quando il messaggio più recente è ambiguo, breve, o INSISTE su
+qualcosa già discusso (ripete la stessa domanda, dice "come detto", "ancora non mi risponde",
+ecc.) — solo in questi casi vai ad analizzare le conversazioni antecedenti per ricostruire il
+contesto esatto. Se il Dott. Branca ha GIÀ gestito o risposto all'ultima richiesta e non serve
+aggiungere altro, chiama already_handled (NON inviare alcun messaggio).
 
 OBIETTIVO — risposte TECNICHE, ACCURATE e UTILI (mai superficiali):
 - Inquadra correttamente la questione: qualifica l'atto o l'adempimento di cui si parla
@@ -429,11 +433,24 @@ function buildTranscript(phone: string, contactName: string): string {
     LIMIT ?
   `).all(phone, HISTORY_LIMIT) as any[];
   rows.reverse();
-  const lines = rows.map((r) => {
-    const who = r.direction === 'sent' ? 'STUDIO' : 'CLIENTE';
-    return `[${who}] ${(r.content || '').replace(/\n+/g, ' ').trim()}`;
-  });
-  return `Conversazione WhatsApp con ${contactName} (${phone}):\n\n${lines.join('\n')}\n\nLeggi TUTTA la conversazione qui sopra: i messaggi [STUDIO] includono anche eventuali risposte DIRETTE del Dott. Branca. Genera la prossima risposta dello STUDIO tenendone conto: non ripetere né contraddire quanto già detto/fatto.`;
+  const lineOf = (r: any) => `[${r.direction === 'sent' ? 'STUDIO' : 'CLIENTE'}] ${(r.content || '').replace(/\n+/g, ' ').trim()}`;
+
+  // Isola l'ultimo blocco continuo di messaggi CLIENTE (spesso il cliente scrive più
+  // messaggi di fila — testo, poi una foto, poi un'altra riga — prima che si risponda):
+  // è quello il "messaggio più recente" a cui rispondere, il resto è solo storico/contesto.
+  let splitIdx = rows.length;
+  for (let i = rows.length - 1; i >= 0; i--) {
+    if (rows[i].direction === 'received') splitIdx = i; else break;
+  }
+  const storico = rows.slice(0, splitIdx).map(lineOf);
+  const recenti = rows.slice(splitIdx).map(lineOf);
+
+  const storicoBlock = storico.length
+    ? `STORICO PRECEDENTE (solo per contesto/continuità — non è la base della risposta):\n${storico.join('\n')}\n\n`
+    : '';
+  const recentiBlock = recenti.length ? recenti.join('\n') : '(nessun nuovo messaggio del cliente)';
+
+  return `Conversazione WhatsApp con ${contactName} (${phone}):\n\n${storicoBlock}MESSAGGIO/I PIÙ RECENTE/I DEL CLIENTE — rispondi PRINCIPALMENTE a questo:\n${recentiBlock}\n\nGenera la prossima risposta dello STUDIO basandoti innanzitutto sul blocco più recente qui sopra; usa lo storico solo per non ripetere/contraddire quanto già detto/fatto, o se il messaggio più recente è ambiguo o insiste su qualcosa già discusso.`;
 }
 
 interface DraftResult {

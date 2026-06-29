@@ -25060,11 +25060,15 @@ tu rispondi col tu, se ti d\xE0 del Lei rispondi col Lei (nel dubbio, dai del Le
 cordiale e professionale. Le tue risposte di merito vengono riviste dal Dott. Branca prima
 dell'invio, quindi puoi entrare nel merito tecnico con competenza, senza rinvii generici.
 
-LEGGI SEMPRE TUTTA la conversazione recente prima di rispondere: tra un messaggio e l'altro il
-Dott. Branca pu\xF2 intervenire e rispondere DI PERSONA al cliente (i suoi messaggi compaiono come
-[STUDIO]). Tienine conto: non ripetere e non contraddire quanto lo studio ha gi\xE0 detto o fatto,
-e prosegui in modo coerente. Se il Dott. Branca ha GI\xC0 gestito o risposto all'ultima richiesta e
-non serve aggiungere altro, chiama already_handled (NON inviare alcun messaggio).
+PRIORIT\xC0 DI LETTURA \u2014 rispondi innanzitutto al MESSAGGIO/I PI\xD9 RECENTE/I DEL CLIENTE (la sezione
+marcata come tale nel transcript): \xE8 quello il punto di partenza della tua risposta, non lo
+storico. Consulta lo STORICO PRECEDENTE solo per: (a) non ripetere o contraddire quanto il
+Dott. Branca ha gi\xE0 detto/fatto DI PERSONA (i suoi messaggi compaiono come [STUDIO]); (b) capire
+a cosa si riferisce il cliente quando il messaggio pi\xF9 recente \xE8 ambiguo, breve, o INSISTE su
+qualcosa gi\xE0 discusso (ripete la stessa domanda, dice "come detto", "ancora non mi risponde",
+ecc.) \u2014 solo in questi casi vai ad analizzare le conversazioni antecedenti per ricostruire il
+contesto esatto. Se il Dott. Branca ha GI\xC0 gestito o risposto all'ultima richiesta e non serve
+aggiungere altro, chiama already_handled (NON inviare alcun messaggio).
 
 OBIETTIVO \u2014 risposte TECNICHE, ACCURATE e UTILI (mai superficiali):
 - Inquadra correttamente la questione: qualifica l'atto o l'adempimento di cui si parla
@@ -25232,15 +25236,25 @@ function buildTranscript(phone, contactName) {
     LIMIT ?
   `).all(phone, HISTORY_LIMIT);
   rows.reverse();
-  const lines = rows.map((r) => {
-    const who = r.direction === "sent" ? "STUDIO" : "CLIENTE";
-    return `[${who}] ${(r.content || "").replace(/\n+/g, " ").trim()}`;
-  });
+  const lineOf = (r) => `[${r.direction === "sent" ? "STUDIO" : "CLIENTE"}] ${(r.content || "").replace(/\n+/g, " ").trim()}`;
+  let splitIdx = rows.length;
+  for (let i = rows.length - 1; i >= 0; i--) {
+    if (rows[i].direction === "received") splitIdx = i;
+    else break;
+  }
+  const storico = rows.slice(0, splitIdx).map(lineOf);
+  const recenti = rows.slice(splitIdx).map(lineOf);
+  const storicoBlock = storico.length ? `STORICO PRECEDENTE (solo per contesto/continuit\xE0 \u2014 non \xE8 la base della risposta):
+${storico.join("\n")}
+
+` : "";
+  const recentiBlock = recenti.length ? recenti.join("\n") : "(nessun nuovo messaggio del cliente)";
   return `Conversazione WhatsApp con ${contactName} (${phone}):
 
-${lines.join("\n")}
+${storicoBlock}MESSAGGIO/I PI\xD9 RECENTE/I DEL CLIENTE \u2014 rispondi PRINCIPALMENTE a questo:
+${recentiBlock}
 
-Leggi TUTTA la conversazione qui sopra: i messaggi [STUDIO] includono anche eventuali risposte DIRETTE del Dott. Branca. Genera la prossima risposta dello STUDIO tenendone conto: non ripetere n\xE9 contraddire quanto gi\xE0 detto/fatto.`;
+Genera la prossima risposta dello STUDIO basandoti innanzitutto sul blocco pi\xF9 recente qui sopra; usa lo storico solo per non ripetere/contraddire quanto gi\xE0 detto/fatto, o se il messaggio pi\xF9 recente \xE8 ambiguo o insiste su qualcosa gi\xE0 discusso.`;
 }
 db_default.exec(`
   CREATE TABLE IF NOT EXISTS bot_msg_class (
