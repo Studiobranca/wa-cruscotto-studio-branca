@@ -130,11 +130,39 @@ export async function repairWebhook(): Promise<{ ok: boolean; previous: string |
   return { ok, previous, set: WEBHOOK_URL };
 }
 
+function inRepairCooldown(): boolean {
+  const last = getSetting('last_webhook_repair');
+  return !!(last && (Date.now() - Date.parse(last)) / 60000 < REPAIR_COOLDOWN_MIN);
+}
+
 async function watchdogTick(): Promise<void> {
   const h = getFlowHealth();
+
+  // (A) Controllo PRESENZA del webhook — gira 24/7, INDIPENDENTE dall'orario.
+  // Se il webhook ricevuti registrato su Z-API manca o è diverso da quello
+  // atteso, lo ri-registra subito (rispettando il cooldown). Così una caduta
+  // serale/weekend/fuori orario non resta morta fino al rientro in studio.
+  try {
+    const current = await getReceivedWebhook();
+    const missing = !current || current !== WEBHOOK_URL;
+    console.log(`[Watchdog] Webhook check: registrato=${current ?? 'null'} atteso=${WEBHOOK_URL} → ${missing ? 'MANCANTE/DIVERSO' : 'OK'}`);
+    if (missing) {
+      if (inRepairCooldown()) {
+        console.warn('[Watchdog] Webhook mancante/diverso ma in cooldown → riparazione rimandata.');
+      } else {
+        console.warn('[Watchdog] Webhook ricevuti mancante/diverso → riparazione (anche fuori orario).');
+        await repairWebhook();
+        return; // repairWebhook aggiorna il cooldown: niente doppia riparazione nello stesso tick
+      }
+    }
+  } catch (e: any) {
+    console.error('[Watchdog] Webhook check fallito:', e.message);
+  }
+
+  // (B) Watchdog "stale" messaggi — INVARIATO: solo in orario lavorativo,
+  // come segnale aggiuntivo di flusso fermo (usato anche per le notifiche).
   if (!h.stale) return;
-  const last = getSetting('last_webhook_repair');
-  if (last && (Date.now() - Date.parse(last)) / 60000 < REPAIR_COOLDOWN_MIN) return; // cooldown
+  if (inRepairCooldown()) return;
   console.warn(`[Watchdog] Flusso messaggi fermo da ${h.lastAgeMin} min in orario lavorativo → riparazione webhook`);
   await repairWebhook();
 }

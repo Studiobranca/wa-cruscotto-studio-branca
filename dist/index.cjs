@@ -24075,8 +24075,8 @@ async function sendTextMessage(phone, message) {
 }
 async function getReceivedWebhook() {
   try {
-    const r = await zapiGet("webhooks");
-    return r?.value ?? r?.delivery ?? r?.received ?? null;
+    const r = await zapiGet("me");
+    return r?.receivedCallbackUrl ?? null;
   } catch {
     return null;
   }
@@ -24084,6 +24084,7 @@ async function getReceivedWebhook() {
 async function setReceivedWebhook(url) {
   try {
     await zapiPut("update-webhook-received", { value: url, notifySentByMe: true });
+    await zapiPut("update-notify-sent-by-me", { notifySentByMe: true });
     return true;
   } catch (e) {
     console.error("[ZAPI] setReceivedWebhook fallito:", e.message);
@@ -25704,11 +25705,30 @@ async function repairWebhook() {
   console.log(`[Watchdog] Riparazione webhook: ${ok ? "OK" : "FALLITA"} \u2192 ${WEBHOOK_URL} (precedente: ${previous})`);
   return { ok, previous, set: WEBHOOK_URL };
 }
+function inRepairCooldown() {
+  const last = getSetting2("last_webhook_repair");
+  return !!(last && (Date.now() - Date.parse(last)) / 6e4 < REPAIR_COOLDOWN_MIN);
+}
 async function watchdogTick() {
   const h = getFlowHealth();
+  try {
+    const current = await getReceivedWebhook();
+    const missing = !current || current !== WEBHOOK_URL;
+    console.log(`[Watchdog] Webhook check: registrato=${current ?? "null"} atteso=${WEBHOOK_URL} \u2192 ${missing ? "MANCANTE/DIVERSO" : "OK"}`);
+    if (missing) {
+      if (inRepairCooldown()) {
+        console.warn("[Watchdog] Webhook mancante/diverso ma in cooldown \u2192 riparazione rimandata.");
+      } else {
+        console.warn("[Watchdog] Webhook ricevuti mancante/diverso \u2192 riparazione (anche fuori orario).");
+        await repairWebhook();
+        return;
+      }
+    }
+  } catch (e) {
+    console.error("[Watchdog] Webhook check fallito:", e.message);
+  }
   if (!h.stale) return;
-  const last = getSetting2("last_webhook_repair");
-  if (last && (Date.now() - Date.parse(last)) / 6e4 < REPAIR_COOLDOWN_MIN) return;
+  if (inRepairCooldown()) return;
   console.warn(`[Watchdog] Flusso messaggi fermo da ${h.lastAgeMin} min in orario lavorativo \u2192 riparazione webhook`);
   await repairWebhook();
 }
@@ -25755,7 +25775,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.9.1", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.9.3", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/debug/laura", (_req, res) => {
   try {

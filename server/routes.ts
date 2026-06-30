@@ -67,7 +67,7 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.9.1', built: new Date().toISOString() });
+  res.json({ version: '2.9.3', built: new Date().toISOString() });
 });
 
 // ─── Debug ───────────────────────────────────────────────────────────────────
