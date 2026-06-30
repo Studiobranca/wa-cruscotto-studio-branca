@@ -24023,6 +24023,7 @@ __export(zapi_exports, {
   ZAPI_CLIENT_TOKEN: () => ZAPI_CLIENT_TOKEN,
   ZAPI_INSTANCE: () => ZAPI_INSTANCE,
   ZAPI_TOKEN: () => ZAPI_TOKEN,
+  getDevicePhone: () => getDevicePhone,
   getReceivedWebhook: () => getReceivedWebhook,
   sendTextMessage: () => sendTextMessage,
   setReceivedWebhook: () => setReceivedWebhook,
@@ -24070,7 +24071,31 @@ async function zapiPut(endpoint, body) {
   }
   return response.json();
 }
+async function getDevicePhone() {
+  if (_devicePhone && Date.now() - _devicePhoneAt < DEVICE_PHONE_TTL_MS) return _devicePhone;
+  try {
+    const r = await zapiGet("me");
+    const p = String(r?.phone ?? r?.connectedPhone ?? "").replace(/\D/g, "");
+    if (p) {
+      _devicePhone = p;
+      _devicePhoneAt = Date.now();
+    }
+    return _devicePhone;
+  } catch {
+    return _devicePhone;
+  }
+}
 async function sendTextMessage(phone, message) {
+  const target = String(phone || "").replace(/\D/g, "");
+  if (!target) {
+    console.error("[ZAPI] Invio bloccato: destinatario vuoto.");
+    return { skipped: true, reason: "empty-recipient" };
+  }
+  const dev = await getDevicePhone();
+  if (dev && (target === dev || target.endsWith(dev) || dev.endsWith(target))) {
+    console.warn(`[ZAPI] \u{1F6E1}\uFE0F Invio BLOCCATO a s\xE9 stessi (${target} == device ${dev}). Messaggio NON inviato. Estratto: "${message.slice(0, 80)}"`);
+    return { skipped: true, reason: "self-send-blocked", target };
+  }
   return zapiPost("send-text", { phone, message });
 }
 async function getReceivedWebhook() {
@@ -24148,7 +24173,7 @@ async function syncContacts() {
   console.log(`[ZAPI] Synced ${totalSynced} contacts`);
   return totalSynced;
 }
-var ZAPI_INSTANCE, ZAPI_TOKEN, ZAPI_CLIENT_TOKEN, ZAPI_BASE, zapiHeaders;
+var ZAPI_INSTANCE, ZAPI_TOKEN, ZAPI_CLIENT_TOKEN, ZAPI_BASE, zapiHeaders, _devicePhone, _devicePhoneAt, DEVICE_PHONE_TTL_MS;
 var init_zapi = __esm({
   "server/zapi.ts"() {
     "use strict";
@@ -24160,6 +24185,9 @@ var init_zapi = __esm({
       "Content-Type": "application/json",
       "client-token": ZAPI_CLIENT_TOKEN
     };
+    _devicePhone = null;
+    _devicePhoneAt = 0;
+    DEVICE_PHONE_TTL_MS = 60 * 60 * 1e3;
   }
 });
 
@@ -25020,6 +25048,7 @@ function getBotModel() {
   return getSetting("bot_model", DEFAULT_MODEL);
 }
 function isAutoSendEnabled() {
+  if (process.env.BOT_ALLOW_AUTOSEND !== "1") return false;
   return getSetting("bot_auto_send", "0") === "1";
 }
 function todayRome() {
@@ -25775,7 +25804,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.9.3", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.9.4", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/debug/laura", (_req, res) => {
   try {
@@ -26784,11 +26813,19 @@ router.post("/bot/config", (req, res) => {
   try {
     const { enabled, model, notifyMode, controlNumber, autoSend } = req.body || {};
     if (enabled !== void 0) setSetting("bot_enabled", enabled ? "1" : "0");
-    if (autoSend !== void 0) setSetting("bot_auto_send", autoSend ? "1" : "0");
+    let autoSendRejected = false;
+    if (autoSend !== void 0) {
+      if (autoSend && process.env.BOT_ALLOW_AUTOSEND !== "1") {
+        autoSendRejected = true;
+        setSetting("bot_auto_send", "0");
+      } else {
+        setSetting("bot_auto_send", autoSend ? "1" : "0");
+      }
+    }
     if (model) setSetting("bot_model", String(model));
     if (notifyMode && ["off", "outside_hours", "always"].includes(notifyMode)) setSetting("notify_mode", notifyMode);
     if (controlNumber) setSetting("control_number", String(controlNumber).replace(/\D/g, ""));
-    res.json({ enabled: isBotEnabled(), model: getBotModel(), notifyMode: getNotifyMode(), controlNumber: getControlNumber(), autoSend: isAutoSendEnabled() });
+    res.json({ enabled: isBotEnabled(), model: getBotModel(), notifyMode: getNotifyMode(), controlNumber: getControlNumber(), autoSend: isAutoSendEnabled(), ...autoSendRejected ? { autoSendRejected: true, reason: "autoSend bloccato: imposta BOT_ALLOW_AUTOSEND=1 su Railway per abilitarlo" } : {} });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

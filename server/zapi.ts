@@ -50,7 +50,34 @@ export async function zapiPut(endpoint: string, body: any): Promise<any> {
   return response.json();
 }
 
+// ─── Numero del dispositivo (cache) ──────────────────────────────────────────
+// Il numero WhatsApp dell'istanza Z-API. Serve al guard anti-auto-invio sotto.
+let _devicePhone: string | null = null;
+let _devicePhoneAt = 0;
+const DEVICE_PHONE_TTL_MS = 60 * 60 * 1000; // 1h
+export async function getDevicePhone(): Promise<string | null> {
+  if (_devicePhone && Date.now() - _devicePhoneAt < DEVICE_PHONE_TTL_MS) return _devicePhone;
+  try {
+    const r = await zapiGet('me');
+    const p = String(r?.phone ?? r?.connectedPhone ?? '').replace(/\D/g, '');
+    if (p) { _devicePhone = p; _devicePhoneAt = Date.now(); }
+    return _devicePhone;
+  } catch { return _devicePhone; }
+}
+
+// ─── BLINDATURA: invio testo con guard anti-auto-invio a sé stessi ───────────
+// Punto di uscita UNICO di ogni messaggio WhatsApp. Blocca STRUTTURALMENTE
+// qualsiasi invio al numero STESSO del dispositivo (caso "numero di controllo ==
+// numero device": le notifiche di controllo private finirebbero sulla linea dello
+// Studio). Indipendente da qualsiasi impostazione del Cruscotto: vale sempre.
 export async function sendTextMessage(phone: string, message: string): Promise<any> {
+  const target = String(phone || '').replace(/\D/g, '');
+  if (!target) { console.error('[ZAPI] Invio bloccato: destinatario vuoto.'); return { skipped: true, reason: 'empty-recipient' }; }
+  const dev = await getDevicePhone();
+  if (dev && (target === dev || target.endsWith(dev) || dev.endsWith(target))) {
+    console.warn(`[ZAPI] 🛡️ Invio BLOCCATO a sé stessi (${target} == device ${dev}). Messaggio NON inviato. Estratto: "${message.slice(0, 80)}"`);
+    return { skipped: true, reason: 'self-send-blocked', target };
+  }
   return zapiPost('send-text', { phone, message });
 }
 

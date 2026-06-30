@@ -67,7 +67,7 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.9.3', built: new Date().toISOString() });
+  res.json({ version: '2.9.4', built: new Date().toISOString() });
 });
 
 // ─── Debug ───────────────────────────────────────────────────────────────────
@@ -1259,11 +1259,22 @@ router.post('/bot/config', (req: Request, res: Response) => {
   try {
     const { enabled, model, notifyMode, controlNumber, autoSend } = req.body || {};
     if (enabled !== undefined) setBotSetting('bot_enabled', enabled ? '1' : '0');
-    if (autoSend !== undefined) setBotSetting('bot_auto_send', autoSend ? '1' : '0');
+    // BLINDATURA: l'auto-invio si può attivare SOLO se l'env BOT_ALLOW_AUTOSEND=1
+    // è presente su Railway. Una richiesta che prova ad accenderlo senza il lucchetto
+    // viene ignorata (resta '0') e segnalata, così l'interfaccia non illude.
+    let autoSendRejected = false;
+    if (autoSend !== undefined) {
+      if (autoSend && process.env.BOT_ALLOW_AUTOSEND !== '1') {
+        autoSendRejected = true;
+        setBotSetting('bot_auto_send', '0');
+      } else {
+        setBotSetting('bot_auto_send', autoSend ? '1' : '0');
+      }
+    }
     if (model) setBotSetting('bot_model', String(model));
     if (notifyMode && ['off', 'outside_hours', 'always'].includes(notifyMode)) setBotSetting('notify_mode', notifyMode);
     if (controlNumber) setBotSetting('control_number', String(controlNumber).replace(/\D/g, ''));
-    res.json({ enabled: isBotEnabled(), model: getBotModel(), notifyMode: getNotifyMode(), controlNumber: getControlNumber(), autoSend: isAutoSendEnabled() });
+    res.json({ enabled: isBotEnabled(), model: getBotModel(), notifyMode: getNotifyMode(), controlNumber: getControlNumber(), autoSend: isAutoSendEnabled(), ...(autoSendRejected ? { autoSendRejected: true, reason: 'autoSend bloccato: imposta BOT_ALLOW_AUTOSEND=1 su Railway per abilitarlo' } : {}) });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

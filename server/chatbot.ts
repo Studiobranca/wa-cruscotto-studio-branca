@@ -201,7 +201,17 @@ export function isBotEnabled(): boolean { return getSetting('bot_enabled', '1') 
 export function getBotModel(): string { return getSetting('bot_model', DEFAULT_MODEL); }
 // Risposta automatica per i clienti non-VIP: se attiva il bot INVIA da solo le risposte
 // (tranne i casi urgenti need_human, che restano bozza). Default OFF (modalità bozza).
-export function isAutoSendEnabled(): boolean { return getSetting('bot_auto_send', '0') === '1'; }
+// BLINDATURA: l'auto-invio delle risposte ai clienti è BLOCCATO per default.
+// Non basta il toggle del Cruscotto (che resta solo "intenzione"): per attivarlo
+// davvero serve DELIBERATAMENTE l'env BOT_ALLOW_AUTOSEND=1 su Railway. Così un
+// click distratto nell'interfaccia o una regressione di un commit non possono
+// far ripartire le risposte automatiche ai clienti. Finché l'env non è '1', il
+// bot prepara SOLO bozze da approvare. (Vale insieme al guard di sendTextMessage:
+// se numero controllo == device, comunque nulla parte verso la propria linea.)
+export function isAutoSendEnabled(): boolean {
+  if (process.env.BOT_ALLOW_AUTOSEND !== '1') return false;
+  return getSetting('bot_auto_send', '0') === '1';
+}
 
 // Anti-spam cortesia: il messaggio "sono impegnato, ricontatto" per i messaggi NON di
 // lavoro parte al massimo una volta al giorno per contatto (così una chat personale fitta
