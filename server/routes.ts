@@ -36,6 +36,7 @@ import {
   approveDraftCore,
   isAutoSendEnabled,
   isAutoAppointmentsEnabled,
+  waCommandsEnabled,
   getPendingAppointments,
   getAppointmentById,
   confirmAppointmentRow,
@@ -68,7 +69,7 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.9.9', built: new Date().toISOString() });
+  res.json({ version: '2.9.10', built: new Date().toISOString() });
 });
 
 // ─── Posta in arrivo (IMAP, sola lettura) ────────────────────────────────────
@@ -1282,7 +1283,7 @@ router.get('/bot/drafts', (_req: Request, res: Response) => {
 });
 
 router.get('/bot/config', (_req: Request, res: Response) => {
-  res.json({ enabled: isBotEnabled(), model: getBotModel(), notifyMode: getNotifyMode(), controlNumber: getControlNumber(), autoSend: isAutoSendEnabled() });
+  res.json({ enabled: isBotEnabled(), model: getBotModel(), notifyMode: getNotifyMode(), controlNumber: getControlNumber(), autoSend: isAutoSendEnabled(), waCommands: waCommandsEnabled() });
 });
 
 router.post('/bot/config', (req: Request, res: Response) => {
@@ -1304,7 +1305,9 @@ router.post('/bot/config', (req: Request, res: Response) => {
     if (model) setBotSetting('bot_model', String(model));
     if (notifyMode && ['off', 'outside_hours', 'always'].includes(notifyMode)) setBotSetting('notify_mode', notifyMode);
     if (controlNumber) setBotSetting('control_number', String(controlNumber).replace(/\D/g, ''));
-    res.json({ enabled: isBotEnabled(), model: getBotModel(), notifyMode: getNotifyMode(), controlNumber: getControlNumber(), autoSend: isAutoSendEnabled(), ...(autoSendRejected ? { autoSendRejected: true, reason: 'autoSend bloccato: imposta BOT_ALLOW_AUTOSEND=1 su Railway per abilitarlo' } : {}) });
+    const { waCommands } = req.body || {};
+    if (waCommands !== undefined) setBotSetting('wa_commands', waCommands ? '1' : '0');
+    res.json({ enabled: isBotEnabled(), model: getBotModel(), notifyMode: getNotifyMode(), controlNumber: getControlNumber(), autoSend: isAutoSendEnabled(), waCommands: waCommandsEnabled(), ...(autoSendRejected ? { autoSendRejected: true, reason: 'autoSend bloccato: imposta BOT_ALLOW_AUTOSEND=1 su Railway per abilitarlo' } : {}) });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

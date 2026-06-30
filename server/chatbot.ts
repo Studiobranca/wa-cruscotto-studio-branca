@@ -236,6 +236,14 @@ export function isAutoAppointmentsEnabled(): boolean {
   return getSetting('bot_auto_appointments', '1') === '1';
 }
 
+// Approvazione bozze via comando WhatsApp ("OK <id>" / "NO <id>"). Interruttore di
+// SICUREZZA: se il numero di controllo fosse esposto a un'auto-risposta AI, i comandi
+// potrebbero approvare bozze da soli → si può spegnere qui (default ON). Si gestisce
+// comunque sempre dal Cruscotto.
+export function waCommandsEnabled(): boolean {
+  return getSetting('wa_commands', '1') === '1';
+}
+
 // Anti-spam cortesia: il messaggio "sono impegnato, ricontatto" per i messaggi NON di
 // lavoro parte al massimo una volta al giorno per contatto (così una chat personale fitta
 // non riceve dieci risposte uguali di fila).
@@ -888,14 +896,21 @@ export async function notifyUrgentByEmail(id: number): Promise<void> {
 }
 
 // ─── Comandi di approvazione via WhatsApp (risposte di Mariano) ──────────────
-// Riconosce: "OK 4", "SI 4", "NO 4", "OK 4 <nuovo testo>", "OK 4 FORZA".
-// Ritorna il testo di risposta da inviare a Mariano, o null se non è un comando.
+// SOLO comandi RIGIDI: "OK <id>", "OK <id> FORZA", "NO <id>" (ed equivalenti).
+// ⚠️ SICUREZZA (rev. 30/06/2026): RIMOSSA la sostituzione-testo "OK <id> <testo>".
+// Prima, una risposta come "OK 369 La bozza è chiara…" veniva interpretata come
+// approvazione CON testo sostitutivo e spediva quel testo al cliente. Con un'AI che
+// risponde sul numero di controllo questo causava auto-approvazioni e invii errati.
+// Ora QUALSIASI testo extra (diverso da FORZA) → NON è un comando (ignorato). Le
+// modifiche di testo si fanno SOLO dal Cruscotto. Gate generale: waCommandsEnabled().
 export async function handleControlCommand(text: string): Promise<string | null> {
-  const m = (text || '').trim().match(/^(ok|sì|si|approva|invia|conferma|no|rifiuta|scarta)\s+#?(\d+)\s*([\s\S]*)$/i);
+  if (!waCommandsEnabled()) return null;
+  // Comando valido SOLO se è esattamente il verbo + id (+ eventuale FORZA), nient'altro.
+  const m = (text || '').trim().match(/^(ok|sì|si|approva|invia|conferma|no|rifiuta|scarta)\s+#?(\d+)(?:\s+(forza))?\s*$/i);
   if (!m) return null;
   const verb = m[1].toLowerCase();
   const id = parseInt(m[2], 10);
-  const rest = (m[3] || '').trim();
+  const force = !!m[3];
   const isReject = ['no', 'rifiuta', 'scarta'].includes(verb);
 
   const d = getDraft(id);
@@ -904,9 +919,7 @@ export async function handleControlCommand(text: string): Promise<string | null>
 
   if (isReject) { markDraftRejected(id); return `🗑️ Bozza #${id} (${d.contact_name || d.phone}) rifiutata.`; }
 
-  const force = /^(forza|conferma)$/i.test(rest);
-  const edited = (!force && rest) ? rest : undefined;
-  const r = await approveDraftCore(id, { text: edited, force });
+  const r = await approveDraftCore(id, { force });
   if (r.conflict) return `⚠️ ${r.message}\nRispondi "OK ${id} FORZA" per confermare comunque l'appuntamento.`;
   if (!r.ok) return `❌ ${r.message}`;
   return `✅ Inviato a ${r.contactName || d.phone}.${r.hadEvent ? ' Appuntamento [DA CONFERMARE] in agenda.' : ''}`;

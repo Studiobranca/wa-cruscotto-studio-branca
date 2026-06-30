@@ -113,15 +113,32 @@ const WORK_KW = [
   'documenti', 'documentazione', 'consulenza',
 ];
 
-function classify(subject: string, fromAddr: string, body: string): string {
+// Mittente automatico/commerciale/bulk → MAI un cliente (anche se l'oggetto contiene
+// parole come "fattura"/"ordine": le email commerciali le usano di continuo).
+function isAutomatedSender(fromAddr: string): boolean {
   const f = (fromAddr || '').toLowerCase();
+  const local = f.split('@')[0] || '';
+  const domain = f.split('@')[1] || '';
+  const AUTO_LOCAL = /^(no[-_.]?reply|noreply|do[-_.]?not[-_.]?reply|donotreply|newsletter|mailing|mailer|notif|notifiche?|notification|marketing|promo|promozioni|news|alert|alerts|automated|bounce|postmaster|daemon|no-?responder|account|accounts|billing|support|hello|team|nepa)$/;
+  const AUTO_DOMAIN = /(^|\.)(email|mail|mailer|news|em|e|sendgrid|mailchimp|mandrillapp|amazonses|sendinblue|brevo|mailjet|sparkpostmail|cmail|rsys|exct|sailthru|hubspotemail|mktomail)\./;
+  return AUTO_LOCAL.test(local) || AUTO_DOMAIN.test(domain);
+}
+
+function classify(subject: string, fromAddr: string, body: string): string {
+  if (isAutomatedSender(fromAddr)) return 'automatica';
   const hay = `${subject} ${body}`.toLowerCase();
-  if (/no[-_.]?reply|newsletter|mailing|mailchimp|sendgrid|do[-_.]?not[-_.]?reply|notifiche?@|marketing@|^info@(?!.*studio)/.test(f)) {
-    // mittente tipicamente automatico → 'automatica' salvo che parli chiaramente di lavoro
-    if (!WORK_KW.some((k) => hay.includes(k))) return 'automatica';
-  }
   if (WORK_KW.some((k) => hay.includes(k))) return 'lavoro';
   return 'altro';
+}
+
+// Stessa email arrivata su entrambe le caselle (Tiscali + iCloud): evita doppia
+// notifica/risposta. true se esiste già una riga PRECEDENTE con lo stesso message_id.
+function isDuplicateMessage(messageId: string | null, currentId: number): boolean {
+  if (!messageId) return false;
+  try {
+    const row = db.prepare(`SELECT 1 FROM incoming_emails WHERE message_id = ? AND id < ? LIMIT 1`).get(messageId, currentId);
+    return !!row;
+  } catch { return false; }
 }
 
 function matchClient(fromName: string): string | null {
@@ -167,8 +184,10 @@ async function maybeAutoReply(acc: MailAccount, row: {
 }): Promise<string | null> {
   if (!autoReplyEnabled()) return null;
   if (row.category !== 'lavoro') return null;
+  if (isDuplicateMessage(row.message_id, row.id)) return null;    // stessa email sull'altra casella
   const fromAddr = (row.from_addr || '').toLowerCase();
   if (!fromAddr || ownAddresses().has(fromAddr)) return null;     // mai a noi stessi
+  if (isAutomatedSender(fromAddr)) return null;                   // mai a mittenti automatici
   // SOLO email recenti → niente risposte al pregresso in inbox al primo giro.
   const ageMin = (Date.now() - Date.parse(row.email_date)) / 60000;
   if (!(ageMin >= 0) || ageMin > replyMaxAgeMin()) return null;
@@ -209,11 +228,13 @@ async function maybeAutoReply(acc: MailAccount, row: {
 /** Avvisa il numero di controllo (Cruscotto) dell'arrivo di una email di un cliente.
  *  Solo email di LAVORO o da contatti noti, e solo RECENTI (anti-spam sul pregresso). */
 async function notifyControlNewEmail(row: {
-  account: string; from_addr: string; from_name: string; subject: string; snippet: string;
-  category: string; matched_client: string | null; email_date: string;
+  id: number; message_id: string | null; account: string; from_addr: string; from_name: string;
+  subject: string; snippet: string; category: string; matched_client: string | null; email_date: string;
 }, autoReplied: string | null): Promise<void> {
+  if (isAutomatedSender(row.from_addr)) return;                   // mai avvisi per mittenti automatici
   const isClient = row.category === 'lavoro' || !!row.matched_client;
   if (!isClient) return;
+  if (isDuplicateMessage(row.message_id, row.id)) return;         // stessa email sull'altra casella
   const ageMin = (Date.now() - Date.parse(row.email_date)) / 60000;
   if (!(ageMin >= 0) || ageMin > notifyMaxAgeMin()) return;       // niente avvisi sul pregresso
   const control = getControlNumber();
@@ -274,6 +295,7 @@ async function pollAccount(acc: MailAccount): Promise<number> {
           });
           // Avviso sul numero di controllo dell'arrivo di una email cliente.
           await notifyControlNewEmail({
+            id: Number(info.lastInsertRowid), message_id: parsed.messageId || null,
             account: acc.name, from_addr: fromAddr, from_name: fromName, subject,
             snippet, category, matched_client: matched, email_date: emailDate,
           }, replied);

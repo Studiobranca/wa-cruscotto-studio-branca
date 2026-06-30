@@ -24985,6 +24985,9 @@ function isAutoSendEnabled() {
 function isAutoAppointmentsEnabled() {
   return getSetting("bot_auto_appointments", "1") === "1";
 }
+function waCommandsEnabled() {
+  return getSetting("wa_commands", "1") === "1";
+}
 function todayRome() {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Rome" }).format(/* @__PURE__ */ new Date());
 }
@@ -25378,11 +25381,12 @@ async function notifyUrgentByEmail(id) {
   console.log(`[Email] Alert urgente bozza #${id} \u2192 ${getAlertEmail()}: ${ok ? "inviato" : "FALLITO"}`);
 }
 async function handleControlCommand(text) {
-  const m = (text || "").trim().match(/^(ok|sì|si|approva|invia|conferma|no|rifiuta|scarta)\s+#?(\d+)\s*([\s\S]*)$/i);
+  if (!waCommandsEnabled()) return null;
+  const m = (text || "").trim().match(/^(ok|sì|si|approva|invia|conferma|no|rifiuta|scarta)\s+#?(\d+)(?:\s+(forza))?\s*$/i);
   if (!m) return null;
   const verb = m[1].toLowerCase();
   const id = parseInt(m[2], 10);
-  const rest = (m[3] || "").trim();
+  const force = !!m[3];
   const isReject = ["no", "rifiuta", "scarta"].includes(verb);
   const d = getDraft(id);
   if (!d) return `\u2753 Bozza #${id} non trovata.`;
@@ -25391,9 +25395,7 @@ async function handleControlCommand(text) {
     markDraftRejected(id);
     return `\u{1F5D1}\uFE0F Bozza #${id} (${d.contact_name || d.phone}) rifiutata.`;
   }
-  const force = /^(forza|conferma)$/i.test(rest);
-  const edited = !force && rest ? rest : void 0;
-  const r = await approveDraftCore(id, { text: edited, force });
+  const r = await approveDraftCore(id, { force });
   if (r.conflict) return `\u26A0\uFE0F ${r.message}
 Rispondi "OK ${id} FORZA" per confermare comunque l'appuntamento.`;
   if (!r.ok) return `\u274C ${r.message}`;
@@ -99527,14 +99529,28 @@ function replyMaxAgeMin() {
 function notifyMaxAgeMin() {
   return parseInt(process.env.EMAIL_NOTIFY_MAX_AGE_MIN || "180", 10);
 }
-function classify(subject, fromAddr, body) {
+function isAutomatedSender(fromAddr) {
   const f = (fromAddr || "").toLowerCase();
+  const local = f.split("@")[0] || "";
+  const domain = f.split("@")[1] || "";
+  const AUTO_LOCAL = /^(no[-_.]?reply|noreply|do[-_.]?not[-_.]?reply|donotreply|newsletter|mailing|mailer|notif|notifiche?|notification|marketing|promo|promozioni|news|alert|alerts|automated|bounce|postmaster|daemon|no-?responder|account|accounts|billing|support|hello|team|nepa)$/;
+  const AUTO_DOMAIN = /(^|\.)(email|mail|mailer|news|em|e|sendgrid|mailchimp|mandrillapp|amazonses|sendinblue|brevo|mailjet|sparkpostmail|cmail|rsys|exct|sailthru|hubspotemail|mktomail)\./;
+  return AUTO_LOCAL.test(local) || AUTO_DOMAIN.test(domain);
+}
+function classify(subject, fromAddr, body) {
+  if (isAutomatedSender(fromAddr)) return "automatica";
   const hay = `${subject} ${body}`.toLowerCase();
-  if (/no[-_.]?reply|newsletter|mailing|mailchimp|sendgrid|do[-_.]?not[-_.]?reply|notifiche?@|marketing@|^info@(?!.*studio)/.test(f)) {
-    if (!WORK_KW.some((k) => hay.includes(k))) return "automatica";
-  }
   if (WORK_KW.some((k) => hay.includes(k))) return "lavoro";
   return "altro";
+}
+function isDuplicateMessage(messageId, currentId) {
+  if (!messageId) return false;
+  try {
+    const row = db.prepare(`SELECT 1 FROM incoming_emails WHERE message_id = ? AND id < ? LIMIT 1`).get(messageId, currentId);
+    return !!row;
+  } catch {
+    return false;
+  }
 }
 function matchClient(fromName) {
   const n = (fromName || "").trim();
@@ -99573,8 +99589,10 @@ async function sendReply(acc, to, subject, body, inReplyTo) {
 async function maybeAutoReply(acc, row) {
   if (!autoReplyEnabled()) return null;
   if (row.category !== "lavoro") return null;
+  if (isDuplicateMessage(row.message_id, row.id)) return null;
   const fromAddr = (row.from_addr || "").toLowerCase();
   if (!fromAddr || ownAddresses().has(fromAddr)) return null;
+  if (isAutomatedSender(fromAddr)) return null;
   const ageMin = (Date.now() - Date.parse(row.email_date)) / 6e4;
   if (!(ageMin >= 0) || ageMin > replyMaxAgeMin()) return null;
   const key = `email:${fromAddr}`;
@@ -99611,8 +99629,10 @@ ${row.body}`;
   }
 }
 async function notifyControlNewEmail(row, autoReplied) {
+  if (isAutomatedSender(row.from_addr)) return;
   const isClient = row.category === "lavoro" || !!row.matched_client;
   if (!isClient) return;
+  if (isDuplicateMessage(row.message_id, row.id)) return;
   const ageMin = (Date.now() - Date.parse(row.email_date)) / 6e4;
   if (!(ageMin >= 0) || ageMin > notifyMaxAgeMin()) return;
   const control = getControlNumber();
@@ -99682,6 +99702,8 @@ async function pollAccount(acc) {
             message_id: parsed.messageId || null
           });
           await notifyControlNewEmail({
+            id: Number(info.lastInsertRowid),
+            message_id: parsed.messageId || null,
             account: acc.name,
             from_addr: fromAddr,
             from_name: fromName,
@@ -100083,7 +100105,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.9.9", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.9.10", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/emails", async (req, res) => {
   try {
@@ -101114,7 +101136,7 @@ router.get("/bot/drafts", (_req, res) => {
   }
 });
 router.get("/bot/config", (_req, res) => {
-  res.json({ enabled: isBotEnabled(), model: getBotModel(), notifyMode: getNotifyMode(), controlNumber: getControlNumber(), autoSend: isAutoSendEnabled() });
+  res.json({ enabled: isBotEnabled(), model: getBotModel(), notifyMode: getNotifyMode(), controlNumber: getControlNumber(), autoSend: isAutoSendEnabled(), waCommands: waCommandsEnabled() });
 });
 router.post("/bot/config", (req, res) => {
   try {
@@ -101132,7 +101154,9 @@ router.post("/bot/config", (req, res) => {
     if (model) setSetting("bot_model", String(model));
     if (notifyMode && ["off", "outside_hours", "always"].includes(notifyMode)) setSetting("notify_mode", notifyMode);
     if (controlNumber) setSetting("control_number", String(controlNumber).replace(/\D/g, ""));
-    res.json({ enabled: isBotEnabled(), model: getBotModel(), notifyMode: getNotifyMode(), controlNumber: getControlNumber(), autoSend: isAutoSendEnabled(), ...autoSendRejected ? { autoSendRejected: true, reason: "autoSend bloccato: imposta BOT_ALLOW_AUTOSEND=1 su Railway per abilitarlo" } : {} });
+    const { waCommands } = req.body || {};
+    if (waCommands !== void 0) setSetting("wa_commands", waCommands ? "1" : "0");
+    res.json({ enabled: isBotEnabled(), model: getBotModel(), notifyMode: getNotifyMode(), controlNumber: getControlNumber(), autoSend: isAutoSendEnabled(), waCommands: waCommandsEnabled(), ...autoSendRejected ? { autoSendRejected: true, reason: "autoSend bloccato: imposta BOT_ALLOW_AUTOSEND=1 su Railway per abilitarlo" } : {} });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
