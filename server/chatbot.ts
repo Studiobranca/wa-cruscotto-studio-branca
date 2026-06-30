@@ -863,6 +863,10 @@ const ALERT_SENDER = { email: 'studiobranca.mariano@gmail.com', name: 'Bot Whats
 export function getAlertEmail(): string {
   return process.env.ALERT_EMAIL || 'studiobranca.mariano@gmail.com';
 }
+/** Invio email di servizio a Mariano (riuso del canale Brevo affidabile). */
+export async function sendStudioAlertEmail(subject: string, html: string): Promise<boolean> {
+  return sendBrevoEmail(subject, html);
+}
 async function sendBrevoEmail(subject: string, html: string): Promise<boolean> {
   const key = process.env.BREVO_API_KEY;
   if (!key) { console.warn('[Email] BREVO_API_KEY non configurata: alert email saltato.'); return false; }

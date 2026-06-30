@@ -25341,6 +25341,9 @@ Bozza:
 function getAlertEmail() {
   return process.env.ALERT_EMAIL || "studiobranca.mariano@gmail.com";
 }
+async function sendStudioAlertEmail(subject, html) {
+  return sendBrevoEmail(subject, html);
+}
 async function sendBrevoEmail(subject, html) {
   const key = process.env.BREVO_API_KEY;
   if (!key) {
@@ -100062,6 +100065,71 @@ async function watchdogTick() {
   console.warn(`[Watchdog] Flusso messaggi fermo da ${h.lastAgeMin} min in orario lavorativo \u2192 riparazione webhook`);
   await repairWebhook();
 }
+async function runSelfCheck() {
+  const items = [];
+  try {
+    const current = await getReceivedWebhook();
+    if (current === WEBHOOK_URL) items.push({ name: "webhook", status: "ok", detail: "registrato" });
+    else if (inRepairCooldown()) items.push({ name: "webhook", status: "warn", detail: `diverso (${current ?? "null"}) ma in cooldown` });
+    else {
+      const r = await repairWebhook();
+      items.push({ name: "webhook", status: r.ok ? "fixed" : "error", detail: r.ok ? "ri-registrato" : "riparazione fallita" });
+    }
+  } catch (e) {
+    items.push({ name: "webhook", status: "error", detail: e.message });
+  }
+  if (getSetting2("bot_auto_send") === "1" && process.env.BOT_ALLOW_AUTOSEND !== "1") {
+    setSetting2("bot_auto_send", "0");
+    items.push({ name: "autoSend", status: "fixed", detail: "era ON senza BOT_ALLOW_AUTOSEND \u2192 forzato OFF" });
+  } else items.push({ name: "autoSend", status: "ok", detail: isAutoSendEnabled() ? "ON (env autorizzata)" : "OFF" });
+  try {
+    const control = getControlNumber();
+    const device = await getDevicePhone() || "";
+    if (!control) items.push({ name: "controlNumber", status: "warn", detail: "non impostato" });
+    else if (device && control === device) items.push({ name: "controlNumber", status: "warn", detail: `coincide col device ${device} (rischio auto-notifica)` });
+    else items.push({ name: "controlNumber", status: "ok", detail: `${control} (device ${device || "?"})` });
+  } catch (e) {
+    items.push({ name: "controlNumber", status: "error", detail: e.message });
+  }
+  items.push({ name: "waCommands", status: "ok", detail: waCommandsEnabled() ? "ON" : "OFF (approvazione da Cruscotto)" });
+  items.push({ name: "bot", status: isBotEnabled() ? "ok" : "warn", detail: isBotEnabled() ? "abilitato" : "DISABILITATO" });
+  try {
+    const mail = await Promise.resolve().then(() => (init_email(), email_exports));
+    const st = mail.getEmailStatus();
+    if (!st.configured?.length) items.push({ name: "email", status: "ok", detail: "non configurata" });
+    else if (st.lastPoll && st.lastPoll.ok === false) items.push({ name: "email", status: "error", detail: `ultimo poll KO: ${st.lastPoll.error || "?"}` });
+    else items.push({ name: "email", status: "ok", detail: `${st.configured.length} caselle, ultimo poll ${st.lastPoll?.ok ? "OK" : "n/d"}` });
+  } catch (e) {
+    items.push({ name: "email", status: "warn", detail: `modulo non valutabile: ${e.message}` });
+  }
+  const at = (/* @__PURE__ */ new Date()).toISOString();
+  const issues = items.filter((i) => i.status !== "ok").length;
+  setSetting2("selfcheck_last", JSON.stringify({ at, items, issues }));
+  console.log(`[SelfCheck] ${at} \u2014 ${issues} anomalie/correzioni: ${items.map((i) => `${i.name}:${i.status}`).join(" ")}`);
+  const notable = items.filter((i) => i.status !== "ok");
+  if (notable.length) {
+    const rows = items.map((i) => {
+      const ic = i.status === "ok" ? "\u2705" : i.status === "fixed" ? "\u{1F527}" : i.status === "warn" ? "\u26A0\uFE0F" : "\u274C";
+      return `<tr><td>${ic} <b>${i.name}</b></td><td>${i.detail}</td></tr>`;
+    }).join("");
+    const html = `<h2>Autocheck Cruscotto \u2014 ${at.slice(0, 16).replace("T", " ")}</h2>
+      <p>${notable.length} voce/i da segnalare (le correzioni automatiche sono marcate \u{1F527}).</p>
+      <table cellpadding="6" style="border-collapse:collapse">${rows}</table>
+      <p style="color:#888;font-size:12px">Controllo automatico notturno (nessun costo AI).</p>`;
+    try {
+      await sendStudioAlertEmail(`\u{1FA7A} Autocheck Cruscotto: ${notable.length} segnalazioni`, html);
+    } catch {
+    }
+  }
+  return { at, items, issues };
+}
+function getLastSelfCheck() {
+  try {
+    return JSON.parse(getSetting2("selfcheck_last") || "null");
+  } catch {
+    return null;
+  }
+}
 function startMaintenance() {
   setTimeout(async () => {
     try {
@@ -100077,6 +100145,10 @@ function startMaintenance() {
       if (hour >= 20 && getSetting2(`digest_done_${iso}`) !== "1") {
         const r = await runDailyDigest(iso);
         console.log(`[Digest] ${iso}: ${r.ok ? `evento aggiornato (${r.total} msg)` : `errore: ${r.error}`}`);
+      }
+      if (hour >= 3 && hour < 6 && getSetting2(`selfcheck_done_${iso}`) !== "1") {
+        setSetting2(`selfcheck_done_${iso}`, "1");
+        await runSelfCheck();
       }
       await watchdogTick();
     } catch (e) {
@@ -100105,7 +100177,17 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.9.11", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.9.12", built: (/* @__PURE__ */ new Date()).toISOString() });
+});
+router.get("/selftest", (_req, res) => {
+  res.json(getLastSelfCheck() || { note: "mai eseguito" });
+});
+router.post("/selftest", async (_req, res) => {
+  try {
+    res.json(await runSelfCheck());
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 router.get("/emails", async (req, res) => {
   try {

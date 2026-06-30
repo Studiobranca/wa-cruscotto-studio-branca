@@ -14,9 +14,9 @@
 
 import db from './db.js';
 import { upsertAllDayEvent } from './integrations.js';
-import { setReceivedWebhook, getReceivedWebhook } from './zapi.js';
+import { setReceivedWebhook, getReceivedWebhook, getDevicePhone } from './zapi.js';
 import { broadcastEvent } from './sse.js';
-import { getControlNumber } from './chatbot.js';
+import { getControlNumber, getAlertEmail, sendStudioAlertEmail, isAutoSendEnabled, waCommandsEnabled, isBotEnabled } from './chatbot.js';
 
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://wa-cruscotto-v2-production.up.railway.app';
 const WEBHOOK_URL = `${PUBLIC_BASE_URL}/api/webhook/message`;
@@ -167,6 +167,78 @@ async function watchdogTick(): Promise<void> {
   await repairWebhook();
 }
 
+// ═══ 3) AUTOCHECK GIORNALIERO + AUTOCORREZIONE ═══════════════════════════════
+// Controlli STRUTTURALI (nessuna chiamata AI → costo zero, eseguito di notte).
+// Verifica gli invarianti di sicurezza e ripara ciò che è sicuro riparare; manda
+// un'email di riepilogo SOLO se ha trovato/corretto qualcosa (niente rumore quotidiano).
+interface CheckItem { name: string; status: 'ok' | 'fixed' | 'warn' | 'error'; detail: string; }
+
+export async function runSelfCheck(): Promise<{ at: string; items: CheckItem[]; issues: number }> {
+  const items: CheckItem[] = [];
+
+  // 1) Webhook di ricezione registrato e corretto → ripara se manca/diverso.
+  try {
+    const current = await getReceivedWebhook();
+    if (current === WEBHOOK_URL) items.push({ name: 'webhook', status: 'ok', detail: 'registrato' });
+    else if (inRepairCooldown()) items.push({ name: 'webhook', status: 'warn', detail: `diverso (${current ?? 'null'}) ma in cooldown` });
+    else { const r = await repairWebhook(); items.push({ name: 'webhook', status: r.ok ? 'fixed' : 'error', detail: r.ok ? 'ri-registrato' : 'riparazione fallita' }); }
+  } catch (e: any) { items.push({ name: 'webhook', status: 'error', detail: e.message }); }
+
+  // 2) auto-invio ai clienti LOCKATO: se è acceso senza l'env autorizzativa, forzalo OFF.
+  if (getSetting('bot_auto_send') === '1' && process.env.BOT_ALLOW_AUTOSEND !== '1') {
+    setSetting('bot_auto_send', '0');
+    items.push({ name: 'autoSend', status: 'fixed', detail: 'era ON senza BOT_ALLOW_AUTOSEND → forzato OFF' });
+  } else items.push({ name: 'autoSend', status: 'ok', detail: isAutoSendEnabled() ? 'ON (env autorizzata)' : 'OFF' });
+
+  // 3) numero di controllo ≠ numero del dispositivo (altrimenti notifiche su sé stessi).
+  try {
+    const control = getControlNumber();
+    const device = (await getDevicePhone()) || '';
+    if (!control) items.push({ name: 'controlNumber', status: 'warn', detail: 'non impostato' });
+    else if (device && (control === device)) items.push({ name: 'controlNumber', status: 'warn', detail: `coincide col device ${device} (rischio auto-notifica)` });
+    else items.push({ name: 'controlNumber', status: 'ok', detail: `${control} (device ${device || '?'})` });
+  } catch (e: any) { items.push({ name: 'controlNumber', status: 'error', detail: e.message }); }
+
+  // 4) comandi WhatsApp: stato (off = approvazione solo da Cruscotto, scelto per sicurezza).
+  items.push({ name: 'waCommands', status: 'ok', detail: waCommandsEnabled() ? 'ON' : 'OFF (approvazione da Cruscotto)' });
+
+  // 5) bot abilitato.
+  items.push({ name: 'bot', status: isBotEnabled() ? 'ok' : 'warn', detail: isBotEnabled() ? 'abilitato' : 'DISABILITATO' });
+
+  // 6) email: se configurata, l'ultimo poll deve essere riuscito.
+  try {
+    const mail = await import('./email.js');
+    const st: any = mail.getEmailStatus();
+    if (!st.configured?.length) items.push({ name: 'email', status: 'ok', detail: 'non configurata' });
+    else if (st.lastPoll && st.lastPoll.ok === false) items.push({ name: 'email', status: 'error', detail: `ultimo poll KO: ${st.lastPoll.error || '?'}` });
+    else items.push({ name: 'email', status: 'ok', detail: `${st.configured.length} caselle, ultimo poll ${st.lastPoll?.ok ? 'OK' : 'n/d'}` });
+  } catch (e: any) { items.push({ name: 'email', status: 'warn', detail: `modulo non valutabile: ${e.message}` }); }
+
+  const at = new Date().toISOString();
+  const issues = items.filter((i) => i.status !== 'ok').length;
+  setSetting('selfcheck_last', JSON.stringify({ at, items, issues }));
+  console.log(`[SelfCheck] ${at} — ${issues} anomalie/correzioni: ${items.map((i) => `${i.name}:${i.status}`).join(' ')}`);
+
+  // Email di riepilogo SOLO se c'è qualcosa di rilevante (fixed/warn/error).
+  const notable = items.filter((i) => i.status !== 'ok');
+  if (notable.length) {
+    const rows = items.map((i) => {
+      const ic = i.status === 'ok' ? '✅' : i.status === 'fixed' ? '🔧' : i.status === 'warn' ? '⚠️' : '❌';
+      return `<tr><td>${ic} <b>${i.name}</b></td><td>${i.detail}</td></tr>`;
+    }).join('');
+    const html = `<h2>Autocheck Cruscotto — ${at.slice(0, 16).replace('T', ' ')}</h2>
+      <p>${notable.length} voce/i da segnalare (le correzioni automatiche sono marcate 🔧).</p>
+      <table cellpadding="6" style="border-collapse:collapse">${rows}</table>
+      <p style="color:#888;font-size:12px">Controllo automatico notturno (nessun costo AI).</p>`;
+    try { await sendStudioAlertEmail(`🩺 Autocheck Cruscotto: ${notable.length} segnalazioni`, html); } catch {}
+  }
+  return { at, items, issues };
+}
+
+export function getLastSelfCheck(): any {
+  try { return JSON.parse(getSetting('selfcheck_last') || 'null'); } catch { return null; }
+}
+
 // ─── Scheduler interno ───────────────────────────────────────────────────────
 export function startMaintenance(): void {
   // All'avvio: assicura che il webhook Z-API sia registrato con notifySentByMe,
@@ -185,6 +257,12 @@ export function startMaintenance(): void {
       if (hour >= 20 && getSetting(`digest_done_${iso}`) !== '1') {
         const r = await runDailyDigest(iso);
         console.log(`[Digest] ${iso}: ${r.ok ? `evento aggiornato (${r.total} msg)` : `errore: ${r.error}`}`);
+      }
+      // Autocheck giornaliero + autocorrezione: notte (03:00 Rome), 1×/giorno.
+      // Di notte i job sono fermi → sicuro riparare; controlli strutturali = costo AI nullo.
+      if (hour >= 3 && hour < 6 && getSetting(`selfcheck_done_${iso}`) !== '1') {
+        setSetting(`selfcheck_done_${iso}`, '1');
+        await runSelfCheck();
       }
       // Watchdog flusso messaggi
       await watchdogTick();

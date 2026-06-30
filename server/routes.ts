@@ -45,7 +45,7 @@ import {
   markCourtesySent,
   notifyUrgentByEmail,
 } from './chatbot.js';
-import { runDailyDigest, getFlowHealth, repairWebhook } from './maintenance.js';
+import { runDailyDigest, getFlowHealth, repairWebhook, runSelfCheck, getLastSelfCheck } from './maintenance.js';
 
 const router = Router();
 
@@ -69,7 +69,16 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.9.11', built: new Date().toISOString() });
+  res.json({ version: '2.9.12', built: new Date().toISOString() });
+});
+
+// ─── Autocheck (self-test + autocorrezione) ──────────────────────────────────
+router.get('/selftest', (_req: Request, res: Response) => {
+  res.json(getLastSelfCheck() || { note: 'mai eseguito' });
+});
+router.post('/selftest', async (_req: Request, res: Response) => {
+  try { res.json(await runSelfCheck()); }
+  catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 // ─── Posta in arrivo (IMAP, sola lettura) ────────────────────────────────────
