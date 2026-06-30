@@ -69,7 +69,7 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.9.10', built: new Date().toISOString() });
+  res.json({ version: '2.9.11', built: new Date().toISOString() });
 });
 
 // ─── Posta in arrivo (IMAP, sola lettura) ────────────────────────────────────
@@ -580,6 +580,10 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
     const messageId = body.messageId || body.id || `wh_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const isGroup = body.isGroup === true || (phone && phone.includes('@g.us'));
     const fromMe = body.fromMe === true;
+    // Il NUMERO DI CONTROLLO (es. con AI auto-risposta) è solo un canale di notifica:
+    // i suoi messaggi in arrivo NON vanno trattati come cliente (niente integrazioni,
+    // niente bozze, niente auto-reply) → evita eventi/Notion fantasma e loop.
+    const isControl = !!phone && phone.replace(/\D/g, '') === getControlNumber();
     const msgType = (body.type || '').toLowerCase();
     // Riconoscimento audio: tipo OPPURE presenza del campo body.audio
     const audioUrl = body.audio?.audioUrl || body.audio?.url || body.audio?.mediaUrl || null;
@@ -708,7 +712,7 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
     // Auto-reply: prima le regole keyword (progetto iniziale), poi il messaggio
     // fisso per conversazione come fallback. Entrambe scattano SOLO se il
     // contatto ha l'auto-risposta attiva (auto_reply_enabled).
-    if (!fromMe) {
+    if (!fromMe && !isControl) {
       const conv = db.prepare(`SELECT auto_reply_enabled, auto_reply_message FROM conversations WHERE phone = ?`).get(phone) as any;
       if (conv?.auto_reply_enabled) {
         let replyText: string | null = null;
@@ -769,7 +773,7 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
     });
 
     // ─── INTEGRAZIONI AUTOMATICHE (async, non bloccante) ────────────────────
-    if (!fromMe && !isGroup && content && content.trim().length > 2) {
+    if (!fromMe && !isGroup && !isControl && content && content.trim().length > 2) {
       setImmediate(async () => {
         try {
           const intEnabled = db.prepare(`SELECT value FROM app_settings WHERE key = 'integrations_enabled'`).get() as any;
@@ -857,11 +861,11 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
       }
     }
 
-    if (!fromMe && !isGroup && content && content.trim().length > 2 && isBotEnabled()) {
+    if (!fromMe && !isGroup && !isControl && content && content.trim().length > 2 && isBotEnabled()) {
       setImmediate(async () => {
         try {
           // Mai generare bozze per il numero di controllo (Mariano stesso).
-          if (phone === getControlNumber()) return;
+          if (isControl || phone === getControlNumber()) return;
           const c = db.prepare(`SELECT contact_name, priority FROM conversations WHERE phone = ?`).get(phone) as any;
           const pr = (c?.priority || 'none');
           if (pr === 'vip' || pr === 'high') return; // viplist → gestisce Mariano

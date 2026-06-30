@@ -100105,7 +100105,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.9.10", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.9.11", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/emails", async (req, res) => {
   try {
@@ -100553,6 +100553,7 @@ router.post("/webhook/message", async (req, res) => {
     const messageId = body.messageId || body.id || `wh_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const isGroup = body.isGroup === true || phone && phone.includes("@g.us");
     const fromMe = body.fromMe === true;
+    const isControl = !!phone && phone.replace(/\D/g, "") === getControlNumber();
     const msgType = (body.type || "").toLowerCase();
     const audioUrl = body.audio?.audioUrl || body.audio?.url || body.audio?.mediaUrl || null;
     const isAudio = msgType === "audio" || msgType === "ptt" || msgType === "audiomessage" || !!audioUrl;
@@ -100665,7 +100666,7 @@ _(Originale: ${textToTranslate})_`;
       direction,
       direction
     );
-    if (!fromMe) {
+    if (!fromMe && !isControl) {
       const conv = db_default.prepare(`SELECT auto_reply_enabled, auto_reply_message FROM conversations WHERE phone = ?`).get(phone);
       if (conv?.auto_reply_enabled) {
         let replyText = null;
@@ -100722,7 +100723,7 @@ _(Originale: ${textToTranslate})_`;
       isAudio,
       priority: convForSSE?.priority || "none"
     });
-    if (!fromMe && !isGroup && content && content.trim().length > 2) {
+    if (!fromMe && !isGroup && !isControl && content && content.trim().length > 2) {
       setImmediate(async () => {
         try {
           const intEnabled = db_default.prepare(`SELECT value FROM app_settings WHERE key = 'integrations_enabled'`).get();
@@ -100803,10 +100804,10 @@ Da confermare.`,
         });
       }
     }
-    if (!fromMe && !isGroup && content && content.trim().length > 2 && isBotEnabled()) {
+    if (!fromMe && !isGroup && !isControl && content && content.trim().length > 2 && isBotEnabled()) {
       setImmediate(async () => {
         try {
-          if (phone === getControlNumber()) return;
+          if (isControl || phone === getControlNumber()) return;
           const c = db_default.prepare(`SELECT contact_name, priority FROM conversations WHERE phone = ?`).get(phone);
           const pr = c?.priority || "none";
           if (pr === "vip" || pr === "high") return;
