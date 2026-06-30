@@ -51,7 +51,7 @@ for (const col of ['replied INTEGER DEFAULT 0', 'reply_text TEXT', 'reply_at TEX
 
 interface MailAccount {
   name: string; host: string; port: number; user: string; pass: string;
-  smtpHost: string; smtpPort: number; smtpSecure: boolean;
+  smtpHost: string; smtpPort: number; smtpSecure: boolean; smtpCiphers?: string;
 }
 
 function accounts(): MailAccount[] {
@@ -66,6 +66,9 @@ function accounts(): MailAccount[] {
       smtpHost: process.env.EMAIL_TISCALI_SMTP_HOST || 'smtp.tiscali.it',
       smtpPort: parseInt(process.env.EMAIL_TISCALI_SMTP_PORT || '465', 10),
       smtpSecure: (process.env.EMAIL_TISCALI_SMTP_SECURE || '1') === '1',
+      // Tiscali usa parametri DH datati che l'OpenSSL moderno rifiuta ("dh key too small"):
+      // si abbassa il security level dei cifrari per quella sola connessione SMTP.
+      smtpCiphers: process.env.EMAIL_TISCALI_SMTP_CIPHERS || 'DEFAULT@SECLEVEL=1',
     });
   }
   if (process.env.EMAIL_ICLOUD_PASS) {
@@ -78,6 +81,7 @@ function accounts(): MailAccount[] {
       smtpHost: process.env.EMAIL_ICLOUD_SMTP_HOST || 'smtp.mail.me.com',
       smtpPort: parseInt(process.env.EMAIL_ICLOUD_SMTP_PORT || '587', 10),
       smtpSecure: (process.env.EMAIL_ICLOUD_SMTP_SECURE || '0') === '1', // 587 = STARTTLS
+      smtpCiphers: process.env.EMAIL_ICLOUD_SMTP_CIPHERS, // default OK per iCloud
     });
   }
   return out;
@@ -138,6 +142,7 @@ function transporterFor(acc: MailAccount) {
     host: acc.smtpHost, port: acc.smtpPort, secure: acc.smtpSecure,
     auth: { user: acc.user, pass: acc.pass },
     requireTLS: !acc.smtpSecure,
+    ...(acc.smtpCiphers ? { tls: { ciphers: acc.smtpCiphers } } : {}),
   });
 }
 
