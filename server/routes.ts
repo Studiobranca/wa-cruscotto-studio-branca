@@ -846,33 +846,32 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
             // riporta. Inviamo però un breve messaggio di cortesia (impegnato, ricontatto),
             // auto e al massimo 1 volta al giorno per contatto, se il modello l'ha prodotto.
             recordClassification(messageId, phone, day, 'personal');
-            if (outcome.result?.draftText && !courtesySentToday(phone)) {
+            // Messaggio di cortesia auto SOLO se autoSend è attivo. Con autoSend OFF
+            // (default) il bot NON scrive nulla di propria iniziativa ai clienti.
+            if (isAutoSendEnabled() && outcome.result?.draftText && !courtesySentToday(phone)) {
               const id = saveDraft({ phone, contactName: cName, incoming: content, result: outcome.result });
               const r = await approveDraftCore(id, { force: true });
               if (r.ok) markCourtesySent(phone);
               broadcastEvent('bot_draft', { id, phone, contactName: cName, needsHuman: false, autoSent: r.ok, personal: true });
               console.log(`[Chatbot] Cortesia (non-lavoro) ${r.ok ? 'inviata' : 'NON inviata'} a ${cName} (${phone})`);
             } else {
-              console.log(`[Chatbot] Messaggio personale — ${cName} (${phone}) (cortesia già inviata oggi o assente)`);
+              console.log(`[Chatbot] Messaggio personale — ${cName} (${phone}) (nessun invio: autoSend off o cortesia già inviata)`);
             }
           } else if (outcome?.kind === 'work' && outcome.result) {
             recordClassification(messageId, phone, day, 'work');
             const res = outcome.result;
             const id = saveDraft({ phone, contactName: cName, incoming: content, result: res });
-            // Gli APPUNTAMENTI li gestisce il bot in autonomia: se la risposta nasce dal
-            // flusso agenda (disponibilità/proposta/conferma) e NON è un caso urgente, parte
-            // subito senza approvazione (get_availability ha già incrociato l'agenda). Le
-            // altre risposte di merito restano bozza per la revisione, salvo autoSend globale.
+            // Nessun invio autonomo: TUTTE le risposte di merito (appuntamenti compresi)
+            // restano BOZZA in attesa di approvazione nel Cruscotto, a meno che autoSend
+            // globale sia attivo. Con autoSend OFF il bot non scrive mai da solo ai clienti.
             const isUrgent = res.needsHuman;
-            const autonomousAppt = !!res.appointmentFlow && !isUrgent;
             const globalAuto = isAutoSendEnabled() && !isUrgent;
-            if (autonomousAppt || globalAuto) {
-              // Appuntamento autonomo: NON forzare, così l'agenda viene ricontrollata e non si
-              // sovrappone a un evento già presente. autoSend globale: comportamento legacy.
-              const r = await approveDraftCore(id, { force: globalAuto && !autonomousAppt });
+            if (globalAuto) {
+              // autoSend globale attivo: invio automatico (force) della risposta.
+              const r = await approveDraftCore(id, { force: true });
               if (r.ok) {
                 broadcastEvent('bot_draft', { id, phone, contactName: cName, needsHuman: false, autoSent: true });
-                console.log(`[Chatbot] ${autonomousAppt ? 'Appuntamento autonomo' : 'Auto-risposta'} a ${cName} (${phone})${r.hadEvent ? ' + appuntamento DA CONFERMARE' : ''}`);
+                console.log(`[Chatbot] Auto-risposta a ${cName} (${phone})${r.hadEvent ? ' + appuntamento DA CONFERMARE' : ''}`);
               } else if (r.conflict) {
                 // Slot occupatosi tra la proposta e l'invio: lascia la bozza in attesa nel Cruscotto.
                 broadcastEvent('bot_draft', { id, phone, contactName: cName, needsHuman: false, conflict: true });

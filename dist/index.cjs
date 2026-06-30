@@ -26458,27 +26458,26 @@ Da confermare.`,
           const outcome = await generateDraft(phone, cName);
           if (outcome?.kind === "personal") {
             recordClassification(messageId, phone, day, "personal");
-            if (outcome.result?.draftText && !courtesySentToday(phone)) {
+            if (isAutoSendEnabled() && outcome.result?.draftText && !courtesySentToday(phone)) {
               const id = saveDraft({ phone, contactName: cName, incoming: content, result: outcome.result });
               const r = await approveDraftCore(id, { force: true });
               if (r.ok) markCourtesySent(phone);
               broadcastEvent("bot_draft", { id, phone, contactName: cName, needsHuman: false, autoSent: r.ok, personal: true });
               console.log(`[Chatbot] Cortesia (non-lavoro) ${r.ok ? "inviata" : "NON inviata"} a ${cName} (${phone})`);
             } else {
-              console.log(`[Chatbot] Messaggio personale \u2014 ${cName} (${phone}) (cortesia gi\xE0 inviata oggi o assente)`);
+              console.log(`[Chatbot] Messaggio personale \u2014 ${cName} (${phone}) (nessun invio: autoSend off o cortesia gi\xE0 inviata)`);
             }
           } else if (outcome?.kind === "work" && outcome.result) {
             recordClassification(messageId, phone, day, "work");
             const res2 = outcome.result;
             const id = saveDraft({ phone, contactName: cName, incoming: content, result: res2 });
             const isUrgent = res2.needsHuman;
-            const autonomousAppt = !!res2.appointmentFlow && !isUrgent;
             const globalAuto = isAutoSendEnabled() && !isUrgent;
-            if (autonomousAppt || globalAuto) {
-              const r = await approveDraftCore(id, { force: globalAuto && !autonomousAppt });
+            if (globalAuto) {
+              const r = await approveDraftCore(id, { force: true });
               if (r.ok) {
                 broadcastEvent("bot_draft", { id, phone, contactName: cName, needsHuman: false, autoSent: true });
-                console.log(`[Chatbot] ${autonomousAppt ? "Appuntamento autonomo" : "Auto-risposta"} a ${cName} (${phone})${r.hadEvent ? " + appuntamento DA CONFERMARE" : ""}`);
+                console.log(`[Chatbot] Auto-risposta a ${cName} (${phone})${r.hadEvent ? " + appuntamento DA CONFERMARE" : ""}`);
               } else if (r.conflict) {
                 broadcastEvent("bot_draft", { id, phone, contactName: cName, needsHuman: false, conflict: true });
                 console.warn(`[Chatbot] Slot in conflitto per ${cName} (${phone}): bozza #${id} resta in attesa di revisione.`);
