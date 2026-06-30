@@ -9,6 +9,7 @@ import Report from './pages/Report';
 import Settings from './pages/Settings';
 import Integrations from './pages/Integrations';
 import BotDrafts from './pages/BotDrafts';
+import Email from './pages/Email';
 
 export default function App() {
   return (
@@ -23,6 +24,7 @@ export default function App() {
             <Route path="/settings" component={Settings} />
             <Route path="/integrations" component={Integrations} />
             <Route path="/bot" component={BotDrafts} />
+            <Route path="/email" component={Email} />
           </Switch>
         </div>
         <BottomNav />

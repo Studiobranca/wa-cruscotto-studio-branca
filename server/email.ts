@@ -43,6 +43,14 @@ db.exec(`
   );
   CREATE UNIQUE INDEX IF NOT EXISTS idx_incoming_emails_uid ON incoming_emails(account, uid);
   CREATE INDEX IF NOT EXISTS idx_incoming_emails_cat ON incoming_emails(category, email_date);
+
+  -- Whitelist clienti: indirizzi o domini noti come CLIENTI dello studio. Un mittente
+  -- in whitelist è SEMPRE 'lavoro' (cliente), a prescindere dalle parole chiave.
+  CREATE TABLE IF NOT EXISTS email_clients (
+    value TEXT PRIMARY KEY,   -- indirizzo completo (mario@x.it) o dominio (@studioX.it)
+    name TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
 `);
 // Migrazione idempotente: aggiunge le colonne reply su DB già esistenti (v2.9.6).
 for (const col of ['replied INTEGER DEFAULT 0', 'reply_text TEXT', 'reply_at TEXT']) {
@@ -124,7 +132,32 @@ function isAutomatedSender(fromAddr: string): boolean {
   return AUTO_LOCAL.test(local) || AUTO_DOMAIN.test(domain);
 }
 
+// ─── Whitelist clienti ────────────────────────────────────────────────────────
+export function listClients(): { value: string; name: string | null; created_at: string }[] {
+  try { return db.prepare(`SELECT value, name, created_at FROM email_clients ORDER BY value`).all() as any[]; }
+  catch { return []; }
+}
+export function addClient(value: string, name?: string): void {
+  const v = (value || '').trim().toLowerCase();
+  if (!v) return;
+  db.prepare(`INSERT INTO email_clients (value, name) VALUES (?, ?) ON CONFLICT(value) DO UPDATE SET name = COALESCE(excluded.name, email_clients.name)`).run(v, name || null);
+}
+export function removeClient(value: string): void {
+  db.prepare(`DELETE FROM email_clients WHERE value = ?`).run((value || '').trim().toLowerCase());
+}
+/** Il mittente è un cliente noto? Match per indirizzo completo o per dominio. */
+function whitelistedClient(fromAddr: string): { match: boolean; name: string | null } {
+  const f = (fromAddr || '').toLowerCase();
+  if (!f) return { match: false, name: null };
+  const domain = '@' + (f.split('@')[1] || '');
+  try {
+    const row = db.prepare(`SELECT name FROM email_clients WHERE value = ? OR value = ? LIMIT 1`).get(f, domain) as any;
+    return { match: !!row, name: row?.name ?? null };
+  } catch { return { match: false, name: null }; }
+}
+
 function classify(subject: string, fromAddr: string, body: string): string {
+  if (whitelistedClient(fromAddr).match) return 'lavoro';   // cliente noto → sempre lavoro
   if (isAutomatedSender(fromAddr)) return 'automatica';
   const hay = `${subject} ${body}`.toLowerCase();
   if (WORK_KW.some((k) => hay.includes(k))) return 'lavoro';
@@ -279,7 +312,7 @@ async function pollAccount(acc: MailAccount): Promise<number> {
           const text = (parsed.text || '').replace(/\s+/g, ' ').trim();
           const snippet = text.slice(0, 240);
           const category = classify(subject, fromAddr, text);
-          const matched = matchClient(fromName);
+          const matched = whitelistedClient(fromAddr).name || matchClient(fromName);
           const emailDate = (parsed.date || new Date()).toISOString();
           const info = db.prepare(`
             INSERT OR IGNORE INTO incoming_emails
@@ -336,6 +369,16 @@ export function getRecentEmails(limit = 100, category?: string): any[] {
 
 export function markEmailSeen(id: number): void {
   db.prepare(`UPDATE incoming_emails SET seen = 1 WHERE id = ?`).run(id);
+}
+
+/** Segna l'email (e il suo mittente) come CLIENTE: whitelist + riclassifica le sue email. */
+export function markEmailAsClient(id: number): boolean {
+  const row = db.prepare(`SELECT from_addr, from_name FROM incoming_emails WHERE id = ?`).get(id) as any;
+  if (!row?.from_addr) return false;
+  addClient(row.from_addr, row.from_name || null);
+  db.prepare(`UPDATE incoming_emails SET category = 'lavoro', matched_client = COALESCE(matched_client, ?) WHERE lower(from_addr) = lower(?)`)
+    .run(row.from_name || null, row.from_addr);
+  return true;
 }
 
 async function pollAll(): Promise<void> {

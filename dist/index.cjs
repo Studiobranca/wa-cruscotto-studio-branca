@@ -99481,9 +99481,13 @@ var require_nodemailer = __commonJS({
 // server/email.ts
 var email_exports = {};
 __export(email_exports, {
+  addClient: () => addClient,
   getEmailStatus: () => getEmailStatus,
   getRecentEmails: () => getRecentEmails,
+  listClients: () => listClients,
+  markEmailAsClient: () => markEmailAsClient,
   markEmailSeen: () => markEmailSeen,
+  removeClient: () => removeClient,
   startEmailPoller: () => startEmailPoller
 });
 function accounts() {
@@ -99540,7 +99544,34 @@ function isAutomatedSender(fromAddr) {
   const AUTO_DOMAIN = /(^|\.)(email|mail|mailer|news|em|e|sendgrid|mailchimp|mandrillapp|amazonses|sendinblue|brevo|mailjet|sparkpostmail|cmail|rsys|exct|sailthru|hubspotemail|mktomail)\./;
   return AUTO_LOCAL.test(local) || AUTO_DOMAIN.test(domain);
 }
+function listClients() {
+  try {
+    return db.prepare(`SELECT value, name, created_at FROM email_clients ORDER BY value`).all();
+  } catch {
+    return [];
+  }
+}
+function addClient(value, name) {
+  const v = (value || "").trim().toLowerCase();
+  if (!v) return;
+  db.prepare(`INSERT INTO email_clients (value, name) VALUES (?, ?) ON CONFLICT(value) DO UPDATE SET name = COALESCE(excluded.name, email_clients.name)`).run(v, name || null);
+}
+function removeClient(value) {
+  db.prepare(`DELETE FROM email_clients WHERE value = ?`).run((value || "").trim().toLowerCase());
+}
+function whitelistedClient(fromAddr) {
+  const f = (fromAddr || "").toLowerCase();
+  if (!f) return { match: false, name: null };
+  const domain = "@" + (f.split("@")[1] || "");
+  try {
+    const row = db.prepare(`SELECT name FROM email_clients WHERE value = ? OR value = ? LIMIT 1`).get(f, domain);
+    return { match: !!row, name: row?.name ?? null };
+  } catch {
+    return { match: false, name: null };
+  }
+}
 function classify(subject, fromAddr, body) {
+  if (whitelistedClient(fromAddr).match) return "lavoro";
   if (isAutomatedSender(fromAddr)) return "automatica";
   const hay = `${subject} ${body}`.toLowerCase();
   if (WORK_KW.some((k) => hay.includes(k))) return "lavoro";
@@ -99686,7 +99717,7 @@ async function pollAccount(acc) {
           const text = (parsed.text || "").replace(/\s+/g, " ").trim();
           const snippet = text.slice(0, 240);
           const category = classify(subject, fromAddr, text);
-          const matched = matchClient(fromName);
+          const matched = whitelistedClient(fromAddr).name || matchClient(fromName);
           const emailDate = (parsed.date || /* @__PURE__ */ new Date()).toISOString();
           const info = db.prepare(`
             INSERT OR IGNORE INTO incoming_emails
@@ -99749,6 +99780,13 @@ function getRecentEmails(limit = 100, category) {
 function markEmailSeen(id) {
   db.prepare(`UPDATE incoming_emails SET seen = 1 WHERE id = ?`).run(id);
 }
+function markEmailAsClient(id) {
+  const row = db.prepare(`SELECT from_addr, from_name FROM incoming_emails WHERE id = ?`).get(id);
+  if (!row?.from_addr) return false;
+  addClient(row.from_addr, row.from_name || null);
+  db.prepare(`UPDATE incoming_emails SET category = 'lavoro', matched_client = COALESCE(matched_client, ?) WHERE lower(from_addr) = lower(?)`).run(row.from_name || null, row.from_addr);
+  return true;
+}
 async function pollAll() {
   const accs = accounts();
   if (!accs.length) return;
@@ -99809,6 +99847,14 @@ var init_email = __esm({
   );
   CREATE UNIQUE INDEX IF NOT EXISTS idx_incoming_emails_uid ON incoming_emails(account, uid);
   CREATE INDEX IF NOT EXISTS idx_incoming_emails_cat ON incoming_emails(category, email_date);
+
+  -- Whitelist clienti: indirizzi o domini noti come CLIENTI dello studio. Un mittente
+  -- in whitelist \xE8 SEMPRE 'lavoro' (cliente), a prescindere dalle parole chiave.
+  CREATE TABLE IF NOT EXISTS email_clients (
+    value TEXT PRIMARY KEY,   -- indirizzo completo (mario@x.it) o dominio (@studioX.it)
+    name TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
 `);
     for (const col of ["replied INTEGER DEFAULT 0", "reply_text TEXT", "reply_at TEXT"]) {
       try {
@@ -100177,7 +100223,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.9.12", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.9.13", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/selftest", (_req, res) => {
   res.json(getLastSelfCheck() || { note: "mai eseguito" });
@@ -100212,6 +100258,43 @@ router.post("/emails/:id/seen", async (req, res) => {
     const m = await Promise.resolve().then(() => (init_email(), email_exports));
     m.markEmailSeen(parseInt(req.params.id, 10));
     res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+router.get("/emails/clients", async (_req, res) => {
+  try {
+    const m = await Promise.resolve().then(() => (init_email(), email_exports));
+    res.json({ clients: m.listClients() });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+router.post("/emails/clients", async (req, res) => {
+  try {
+    const m = await Promise.resolve().then(() => (init_email(), email_exports));
+    const { value, name } = req.body || {};
+    if (!value) return res.status(400).json({ error: "value richiesto" });
+    m.addClient(String(value), name ? String(name) : void 0);
+    res.json({ ok: true, clients: m.listClients() });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+router.delete("/emails/clients/:value", async (req, res) => {
+  try {
+    const m = await Promise.resolve().then(() => (init_email(), email_exports));
+    m.removeClient(decodeURIComponent(req.params.value));
+    res.json({ ok: true, clients: m.listClients() });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+router.post("/emails/:id/mark-client", async (req, res) => {
+  try {
+    const m = await Promise.resolve().then(() => (init_email(), email_exports));
+    const ok = m.markEmailAsClient(parseInt(req.params.id, 10));
+    res.json({ ok });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

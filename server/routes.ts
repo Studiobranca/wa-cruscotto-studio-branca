@@ -69,7 +69,7 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.9.12', built: new Date().toISOString() });
+  res.json({ version: '2.9.13', built: new Date().toISOString() });
 });
 
 // ─── Autocheck (self-test + autocorrezione) ──────────────────────────────────
@@ -103,6 +103,32 @@ router.post('/emails/:id/seen', async (req: Request, res: Response) => {
     const m = await import('./email.js');
     m.markEmailSeen(parseInt(req.params.id, 10));
     res.json({ ok: true });
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+// Whitelist clienti email
+router.get('/emails/clients', async (_req: Request, res: Response) => {
+  try { const m = await import('./email.js'); res.json({ clients: m.listClients() }); }
+  catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+router.post('/emails/clients', async (req: Request, res: Response) => {
+  try {
+    const m = await import('./email.js');
+    const { value, name } = req.body || {};
+    if (!value) return res.status(400).json({ error: 'value richiesto' });
+    m.addClient(String(value), name ? String(name) : undefined);
+    res.json({ ok: true, clients: m.listClients() });
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+router.delete('/emails/clients/:value', async (req: Request, res: Response) => {
+  try { const m = await import('./email.js'); m.removeClient(decodeURIComponent(req.params.value)); res.json({ ok: true, clients: m.listClients() }); }
+  catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+// Segna una email come "cliente": aggiunge il mittente alla whitelist e riclassifica la riga.
+router.post('/emails/:id/mark-client', async (req: Request, res: Response) => {
+  try {
+    const m = await import('./email.js');
+    const ok = m.markEmailAsClient(parseInt(req.params.id, 10));
+    res.json({ ok });
   } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
