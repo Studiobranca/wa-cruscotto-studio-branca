@@ -68,7 +68,32 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.9.5', built: new Date().toISOString() });
+  res.json({ version: '2.9.6', built: new Date().toISOString() });
+});
+
+// ─── Posta in arrivo (IMAP, sola lettura) ────────────────────────────────────
+// Import LAZY del modulo email: imapflow resta fuori dal percorso di caricamento
+// critico; se manca o fallisce, queste rotte rispondono errore ma il resto vive.
+router.get('/emails', async (req: Request, res: Response) => {
+  try {
+    const m = await import('./email.js');
+    const limit = parseInt(String(req.query.limit || '100'), 10) || 100;
+    const category = req.query.category ? String(req.query.category) : undefined;
+    res.json({ emails: m.getRecentEmails(limit, category) });
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+router.get('/emails/status', async (_req: Request, res: Response) => {
+  try {
+    const m = await import('./email.js');
+    res.json(m.getEmailStatus());
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+router.post('/emails/:id/seen', async (req: Request, res: Response) => {
+  try {
+    const m = await import('./email.js');
+    m.markEmailSeen(parseInt(req.params.id, 10));
+    res.json({ ok: true });
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 // ─── Debug ───────────────────────────────────────────────────────────────────
