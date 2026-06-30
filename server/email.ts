@@ -19,7 +19,8 @@ import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import nodemailer from 'nodemailer';
 import { db } from './db.js';
-import { generateReplyCore, materializeProposedEvent } from './chatbot.js';
+import { generateReplyCore, materializeProposedEvent, getControlNumber } from './chatbot.js';
+import { sendTextMessage } from './zapi.js';
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS incoming_emails (
@@ -92,6 +93,11 @@ function autoReplyEnabled(): boolean {
 function replyMaxAgeMin(): number {
   return parseInt(process.env.EMAIL_REPLY_MAX_AGE_MIN || '120', 10);
 }
+// Notifica al numero di controllo per le email di clienti recenti (anti-spam sul
+// pregresso: al primo giro non avvisa per la posta vecchia già in inbox).
+function notifyMaxAgeMin(): number {
+  return parseInt(process.env.EMAIL_NOTIFY_MAX_AGE_MIN || '180', 10);
+}
 
 const WORK_KW = [
   '730', 'dichiarazione', 'iva', 'irpef', 'ires', 'irap', 'unico', 'scadenza', 'fattura',
@@ -148,18 +154,19 @@ async function sendReply(acc: MailAccount, to: string, subject: string, body: st
   });
 }
 
-/** Genera e (se appuntamento/documenti) INVIA la risposta automatica a una email di lavoro. */
+/** Genera e (se appuntamento/documenti) INVIA la risposta automatica a una email di lavoro.
+ *  Ritorna una breve etichetta dell'azione svolta ('appuntamento'|'documenti') o null. */
 async function maybeAutoReply(acc: MailAccount, row: {
   id: number; from_addr: string; from_name: string; subject: string; body: string;
   category: string; email_date: string; message_id: string | null;
-}): Promise<void> {
-  if (!autoReplyEnabled()) return;
-  if (row.category !== 'lavoro') return;
+}): Promise<string | null> {
+  if (!autoReplyEnabled()) return null;
+  if (row.category !== 'lavoro') return null;
   const fromAddr = (row.from_addr || '').toLowerCase();
-  if (!fromAddr || ownAddresses().has(fromAddr)) return;          // mai a noi stessi
+  if (!fromAddr || ownAddresses().has(fromAddr)) return null;     // mai a noi stessi
   // SOLO email recenti → niente risposte al pregresso in inbox al primo giro.
   const ageMin = (Date.now() - Date.parse(row.email_date)) / 60000;
-  if (!(ageMin >= 0) || ageMin > replyMaxAgeMin()) return;
+  if (!(ageMin >= 0) || ageMin > replyMaxAgeMin()) return null;
 
   const key = `email:${fromAddr}`;
   const content = `Email dal cliente ${row.from_name || fromAddr} <${fromAddr}>\nOggetto: ${row.subject}\n\n${row.body}`;
@@ -168,15 +175,15 @@ async function maybeAutoReply(acc: MailAccount, row: {
     outcome = await generateReplyCore(key, row.from_name || fromAddr, content, 'email');
   } catch (e: any) {
     console.error('[Email] generazione risposta fallita:', e.message);
-    return;
+    return null;
   }
-  if (!outcome || outcome.kind !== 'work' || !outcome.result) return;
+  if (!outcome || outcome.kind !== 'work' || !outcome.result) return null;
   const res = outcome.result;
-  if (res.needsHuman) return;                                     // urgenze → smistamento, non auto
+  if (res.needsHuman) return null;                                // urgenze → smistamento, non auto
   const isAppt = !!res.appointmentFlow || !!res.proposedEvent;
   const isDoc = !!res.docNoted;
-  if (!isAppt && !isDoc) return;                                  // merito generico → smistamento
-  if (!res.draftText) return;
+  if (!isAppt && !isDoc) return null;                             // merito generico → smistamento
+  if (!res.draftText) return null;
 
   try {
     if (res.proposedEvent) {
@@ -185,10 +192,39 @@ async function maybeAutoReply(acc: MailAccount, row: {
     await sendReply(acc, fromAddr, row.subject, res.draftText, row.message_id || undefined);
     db.prepare(`UPDATE incoming_emails SET replied = 1, reply_text = ?, reply_at = datetime('now') WHERE id = ?`)
       .run(res.draftText, row.id);
-    console.log(`[Email] Risposta automatica (${isAppt ? 'appuntamento' : 'documenti'}) inviata a ${fromAddr}.`);
+    const label = isAppt ? 'appuntamento' : 'documenti';
+    console.log(`[Email] Risposta automatica (${label}) inviata a ${fromAddr}.`);
+    return label;
   } catch (e: any) {
     console.error('[Email] invio risposta fallito:', e.message);
+    return null;
   }
+}
+
+/** Avvisa il numero di controllo (Cruscotto) dell'arrivo di una email di un cliente.
+ *  Solo email di LAVORO o da contatti noti, e solo RECENTI (anti-spam sul pregresso). */
+async function notifyControlNewEmail(row: {
+  account: string; from_addr: string; from_name: string; subject: string; snippet: string;
+  category: string; matched_client: string | null; email_date: string;
+}, autoReplied: string | null): Promise<void> {
+  const isClient = row.category === 'lavoro' || !!row.matched_client;
+  if (!isClient) return;
+  const ageMin = (Date.now() - Date.parse(row.email_date)) / 60000;
+  if (!(ageMin >= 0) || ageMin > notifyMaxAgeMin()) return;       // niente avvisi sul pregresso
+  const control = getControlNumber();
+  if (!control) return;
+  const who = row.matched_client ? `${row.from_name} [cliente: ${row.matched_client}]` : row.from_name;
+  const parts = [
+    `📧 Nuova email cliente (${row.account})`,
+    `Da: ${who} <${row.from_addr}>`,
+    `Oggetto: ${row.subject}`,
+  ];
+  if (row.snippet) parts.push(`\n"${row.snippet.slice(0, 200)}"`);
+  parts.push(autoReplied
+    ? `\n✅ Risposta automatica inviata (${autoReplied}).`
+    : `\nℹ️ In attesa di gestione (apri il Cruscotto › Email).`);
+  try { await sendTextMessage(control, parts.join('\n')); }
+  catch (e: any) { console.error('[Email] notifica controllo fallita:', e.message); }
 }
 
 async function pollAccount(acc: MailAccount): Promise<number> {
@@ -226,11 +262,16 @@ async function pollAccount(acc: MailAccount): Promise<number> {
           `).run(acc.name, msg.uid, parsed.messageId || null, fromAddr, fromName, subject, snippet, emailDate, category, matched);
           stored++;
           // Risposta automatica (appuntamenti/documenti) per le email di lavoro recenti.
-          await maybeAutoReply(acc, {
+          const replied = await maybeAutoReply(acc, {
             id: Number(info.lastInsertRowid), from_addr: fromAddr, from_name: fromName,
             subject, body: text.slice(0, 4000), category, email_date: emailDate,
             message_id: parsed.messageId || null,
           });
+          // Avviso sul numero di controllo dell'arrivo di una email cliente.
+          await notifyControlNewEmail({
+            account: acc.name, from_addr: fromAddr, from_name: fromName, subject,
+            snippet, category, matched_client: matched, email_date: emailDate,
+          }, replied);
         } catch (e: any) {
           console.error(`[Email] parse ${acc.name}:`, e.message);
         }
@@ -252,6 +293,8 @@ export function getEmailStatus() {
     configured: accounts().map((a) => ({ name: a.name, user: a.user })),
     autoReply: autoReplyEnabled(),
     replyMaxAgeMin: replyMaxAgeMin(),
+    notifyMaxAgeMin: notifyMaxAgeMin(),
+    controlNumber: getControlNumber(),
     lastPoll,
   };
 }

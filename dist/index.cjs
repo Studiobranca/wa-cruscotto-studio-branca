@@ -25089,7 +25089,7 @@ Slot con data esatta da usare in propose_booking (date=YYYY-MM-DD, start=HH:MM):
     }
     out.proposedEvent = { date, start, end: endTime(start), reason: String(input?.reason || "Appuntamento") };
     out.appointmentFlow = true;
-    return "Proposta registrata. Comunica al cliente lo slot e che resta in attesa di conferma, ringrazia e \u2014 se l'incontro riguarda documenti da esaminare \u2014 CHIARISCI che deve inviarli su questa chat PRIMA dell'appuntamento (es. atti/cartelle notificate, fatture, dichiarazioni, contratti, avvisi): solo cos\xEC potranno essere visionati e poi discussi durante l'incontro. Infine chiedigli di confermare quando avr\xE0 la certezza di poter venire.";
+    return "Proposta registrata. Comunica al cliente lo slot e che resta in attesa di conferma, ringrazia e \u2014 se l'incontro riguarda documenti da esaminare \u2014 CHIARISCI che deve inviarli PRIMA dell'appuntamento (es. atti/cartelle notificate, fatture, dichiarazioni, contratti, avvisi), su questa chat WhatsApp OPPURE via email a studiobranca@tiscali.it o studiobranca@icloud.com: solo cos\xEC potranno essere visionati e poi discussi durante l'incontro. Infine chiedigli di confermare quando avr\xE0 la certezza di poter venire.";
   }
   if (name === "confirm_appointment") {
     out.appointmentFlow = true;
@@ -25098,7 +25098,7 @@ Slot con data esatta da usare in propose_booking (date=YYYY-MM-DD, start=HH:MM):
       return "Non risulta alcun appuntamento in attesa di conferma per questo cliente: non confermare nulla, prosegui normalmente.";
     }
     const r = await confirmAppointmentRow(appt, { notify: true });
-    return `Appuntamento confermato e ${r.calendarUpdated ? "agenda aggiornata" : "segnalato al Dott. Branca"}. Scrivi al cliente un breve messaggio che CONFERMA l'appuntamento del ${appt.date} alle ${appt.start}, ringrazia, e \u2014 se l'incontro riguarda documenti da esaminare \u2014 RIBADISCI che deve inviarli su questa chat PRIMA dell'appuntamento, cos\xEC potranno essere visionati e discussi durante l'incontro; indica che lo studio \xE8 in Via Operai 102, Barcellona P.G. (ME).`;
+    return `Appuntamento confermato e ${r.calendarUpdated ? "agenda aggiornata" : "segnalato al Dott. Branca"}. Scrivi al cliente un breve messaggio che CONFERMA l'appuntamento del ${appt.date} alle ${appt.start}, ringrazia, e \u2014 se l'incontro riguarda documenti da esaminare \u2014 RIBADISCI che deve inviarli PRIMA dell'appuntamento (su questa chat WhatsApp oppure via email a studiobranca@tiscali.it o studiobranca@icloud.com), cos\xEC potranno essere visionati e discussi durante l'incontro; indica che lo studio \xE8 in Via Operai 102, Barcellona P.G. (ME).`;
   }
   if (name === "need_human") {
     out.needsHuman = true;
@@ -25123,7 +25123,7 @@ Slot con data esatta da usare in propose_booking (date=YYYY-MM-DD, start=HH:MM):
         console.error("[Chatbot] annota documenti su evento:", e.message);
       }
     }
-    return "Documentazione annotata come promemoria per l'appuntamento. Conferma al cliente la ricezione, indica che sar\xE0 esaminata prima dell'incontro e RICORDA che i documenti utili vanno inviati su questa chat PRIMA dell'appuntamento.";
+    return "Documentazione annotata come promemoria per l'appuntamento. Conferma al cliente la ricezione, indica che sar\xE0 esaminata prima dell'incontro e RICORDA che eventuali altri documenti utili vanno inviati PRIMA dell'appuntamento, su questa chat WhatsApp oppure via email a studiobranca@tiscali.it o studiobranca@icloud.com.";
   }
   if (name === "already_handled") {
     out.handled = true;
@@ -25506,9 +25506,10 @@ GESTIONE OPERATIVA:
   confirm_appointment. Non serve l'approvazione dello studio per concordare data e ora.
 - DOCUMENTI PRIMA DELL'INCONTRO: se l'appuntamento riguarda documenti da esaminare (atti o
   cartelle notificate, fatture, dichiarazioni, contratti, avvisi), CHIARISCI sempre che il
-  cliente deve inviarli su questa chat PRIMA dell'appuntamento: solo cos\xEC potranno essere
-  visionati e poi DISCUSSI durante l'incontro. Senza i documenti in anticipo l'incontro non
-  sarebbe produttivo.
+  cliente deve inviarli PRIMA dell'appuntamento: solo cos\xEC potranno essere visionati e poi
+  DISCUSSI durante l'incontro. Senza i documenti in anticipo l'incontro non sarebbe produttivo.
+  COME inviarli: su questa chat WhatsApp OPPURE via email a studiobranca@tiscali.it o
+  studiobranca@icloud.com. Indica SEMPRE questi due indirizzi quando chiedi la documentazione.
 - RICHIESTE DI CHIAMATA: se il cliente chiede di essere richiamato o lamenta una chiamata
   senza risposta ("mi chiami", "ti ho chiamato e non rispondi", "richiamatemi"), NON promettere
   una chiamata immediata: spiega con cortesia che ora non \xE8 possibile rispondere subito e che lo
@@ -99518,6 +99519,9 @@ function autoReplyEnabled() {
 function replyMaxAgeMin() {
   return parseInt(process.env.EMAIL_REPLY_MAX_AGE_MIN || "120", 10);
 }
+function notifyMaxAgeMin() {
+  return parseInt(process.env.EMAIL_NOTIFY_MAX_AGE_MIN || "180", 10);
+}
 function classify(subject, fromAddr, body) {
   const f = (fromAddr || "").toLowerCase();
   const hay = `${subject} ${body}`.toLowerCase();
@@ -99561,12 +99565,12 @@ async function sendReply(acc, to, subject, body, inReplyTo) {
   });
 }
 async function maybeAutoReply(acc, row) {
-  if (!autoReplyEnabled()) return;
-  if (row.category !== "lavoro") return;
+  if (!autoReplyEnabled()) return null;
+  if (row.category !== "lavoro") return null;
   const fromAddr = (row.from_addr || "").toLowerCase();
-  if (!fromAddr || ownAddresses().has(fromAddr)) return;
+  if (!fromAddr || ownAddresses().has(fromAddr)) return null;
   const ageMin = (Date.now() - Date.parse(row.email_date)) / 6e4;
-  if (!(ageMin >= 0) || ageMin > replyMaxAgeMin()) return;
+  if (!(ageMin >= 0) || ageMin > replyMaxAgeMin()) return null;
   const key = `email:${fromAddr}`;
   const content = `Email dal cliente ${row.from_name || fromAddr} <${fromAddr}>
 Oggetto: ${row.subject}
@@ -99577,24 +99581,51 @@ ${row.body}`;
     outcome = await generateReplyCore(key, row.from_name || fromAddr, content, "email");
   } catch (e) {
     console.error("[Email] generazione risposta fallita:", e.message);
-    return;
+    return null;
   }
-  if (!outcome || outcome.kind !== "work" || !outcome.result) return;
+  if (!outcome || outcome.kind !== "work" || !outcome.result) return null;
   const res = outcome.result;
-  if (res.needsHuman) return;
+  if (res.needsHuman) return null;
   const isAppt = !!res.appointmentFlow || !!res.proposedEvent;
   const isDoc = !!res.docNoted;
-  if (!isAppt && !isDoc) return;
-  if (!res.draftText) return;
+  if (!isAppt && !isDoc) return null;
+  if (!res.draftText) return null;
   try {
     if (res.proposedEvent) {
       await materializeProposedEvent(key, row.from_name || fromAddr, res.proposedEvent, "email");
     }
     await sendReply(acc, fromAddr, row.subject, res.draftText, row.message_id || void 0);
     db.prepare(`UPDATE incoming_emails SET replied = 1, reply_text = ?, reply_at = datetime('now') WHERE id = ?`).run(res.draftText, row.id);
-    console.log(`[Email] Risposta automatica (${isAppt ? "appuntamento" : "documenti"}) inviata a ${fromAddr}.`);
+    const label = isAppt ? "appuntamento" : "documenti";
+    console.log(`[Email] Risposta automatica (${label}) inviata a ${fromAddr}.`);
+    return label;
   } catch (e) {
     console.error("[Email] invio risposta fallito:", e.message);
+    return null;
+  }
+}
+async function notifyControlNewEmail(row, autoReplied) {
+  const isClient = row.category === "lavoro" || !!row.matched_client;
+  if (!isClient) return;
+  const ageMin = (Date.now() - Date.parse(row.email_date)) / 6e4;
+  if (!(ageMin >= 0) || ageMin > notifyMaxAgeMin()) return;
+  const control = getControlNumber();
+  if (!control) return;
+  const who = row.matched_client ? `${row.from_name} [cliente: ${row.matched_client}]` : row.from_name;
+  const parts = [
+    `\u{1F4E7} Nuova email cliente (${row.account})`,
+    `Da: ${who} <${row.from_addr}>`,
+    `Oggetto: ${row.subject}`
+  ];
+  if (row.snippet) parts.push(`
+"${row.snippet.slice(0, 200)}"`);
+  parts.push(autoReplied ? `
+\u2705 Risposta automatica inviata (${autoReplied}).` : `
+\u2139\uFE0F In attesa di gestione (apri il Cruscotto \u203A Email).`);
+  try {
+    await sendTextMessage(control, parts.join("\n"));
+  } catch (e) {
+    console.error("[Email] notifica controllo fallita:", e.message);
   }
 }
 async function pollAccount(acc) {
@@ -99634,7 +99665,7 @@ async function pollAccount(acc) {
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
           `).run(acc.name, msg.uid, parsed.messageId || null, fromAddr, fromName, subject, snippet, emailDate, category, matched);
           stored++;
-          await maybeAutoReply(acc, {
+          const replied = await maybeAutoReply(acc, {
             id: Number(info.lastInsertRowid),
             from_addr: fromAddr,
             from_name: fromName,
@@ -99644,6 +99675,16 @@ async function pollAccount(acc) {
             email_date: emailDate,
             message_id: parsed.messageId || null
           });
+          await notifyControlNewEmail({
+            account: acc.name,
+            from_addr: fromAddr,
+            from_name: fromName,
+            subject,
+            snippet,
+            category,
+            matched_client: matched,
+            email_date: emailDate
+          }, replied);
         } catch (e) {
           console.error(`[Email] parse ${acc.name}:`, e.message);
         }
@@ -99662,6 +99703,8 @@ function getEmailStatus() {
     configured: accounts().map((a) => ({ name: a.name, user: a.user })),
     autoReply: autoReplyEnabled(),
     replyMaxAgeMin: replyMaxAgeMin(),
+    notifyMaxAgeMin: notifyMaxAgeMin(),
+    controlNumber: getControlNumber(),
     lastPoll
   };
 }
@@ -99713,6 +99756,7 @@ var init_email = __esm({
     import_nodemailer = __toESM(require_nodemailer(), 1);
     init_db();
     init_chatbot();
+    init_zapi();
     db.exec(`
   CREATE TABLE IF NOT EXISTS incoming_emails (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100033,7 +100077,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.9.7", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.9.8", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/emails", async (req, res) => {
   try {

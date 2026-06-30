@@ -330,9 +330,10 @@ GESTIONE OPERATIVA:
   confirm_appointment. Non serve l'approvazione dello studio per concordare data e ora.
 - DOCUMENTI PRIMA DELL'INCONTRO: se l'appuntamento riguarda documenti da esaminare (atti o
   cartelle notificate, fatture, dichiarazioni, contratti, avvisi), CHIARISCI sempre che il
-  cliente deve inviarli su questa chat PRIMA dell'appuntamento: solo così potranno essere
-  visionati e poi DISCUSSI durante l'incontro. Senza i documenti in anticipo l'incontro non
-  sarebbe produttivo.
+  cliente deve inviarli PRIMA dell'appuntamento: solo così potranno essere visionati e poi
+  DISCUSSI durante l'incontro. Senza i documenti in anticipo l'incontro non sarebbe produttivo.
+  COME inviarli: su questa chat WhatsApp OPPURE via email a studiobranca@tiscali.it o
+  studiobranca@icloud.com. Indica SEMPRE questi due indirizzi quando chiedi la documentazione.
 - RICHIESTE DI CHIAMATA: se il cliente chiede di essere richiamato o lamenta una chiamata
   senza risposta ("mi chiami", "ti ho chiamato e non rispondi", "richiamatemi"), NON promettere
   una chiamata immediata: spiega con cortesia che ora non è possibile rispondere subito e che lo
@@ -575,7 +576,7 @@ async function runTool(name: string, input: any, out: DraftResult, phone: string
     }
     out.proposedEvent = { date, start, end: endTime(start), reason: String(input?.reason || 'Appuntamento') };
     out.appointmentFlow = true;
-    return 'Proposta registrata. Comunica al cliente lo slot e che resta in attesa di conferma, ringrazia e — se l\'incontro riguarda documenti da esaminare — CHIARISCI che deve inviarli su questa chat PRIMA dell\'appuntamento (es. atti/cartelle notificate, fatture, dichiarazioni, contratti, avvisi): solo così potranno essere visionati e poi discussi durante l\'incontro. Infine chiedigli di confermare quando avrà la certezza di poter venire.';
+    return 'Proposta registrata. Comunica al cliente lo slot e che resta in attesa di conferma, ringrazia e — se l\'incontro riguarda documenti da esaminare — CHIARISCI che deve inviarli PRIMA dell\'appuntamento (es. atti/cartelle notificate, fatture, dichiarazioni, contratti, avvisi), su questa chat WhatsApp OPPURE via email a studiobranca@tiscali.it o studiobranca@icloud.com: solo così potranno essere visionati e poi discussi durante l\'incontro. Infine chiedigli di confermare quando avrà la certezza di poter venire.';
   }
   if (name === 'confirm_appointment') {
     out.appointmentFlow = true;
@@ -584,7 +585,7 @@ async function runTool(name: string, input: any, out: DraftResult, phone: string
       return 'Non risulta alcun appuntamento in attesa di conferma per questo cliente: non confermare nulla, prosegui normalmente.';
     }
     const r = await confirmAppointmentRow(appt, { notify: true });
-    return `Appuntamento confermato e ${r.calendarUpdated ? 'agenda aggiornata' : 'segnalato al Dott. Branca'}. Scrivi al cliente un breve messaggio che CONFERMA l'appuntamento del ${appt.date} alle ${appt.start}, ringrazia, e — se l'incontro riguarda documenti da esaminare — RIBADISCI che deve inviarli su questa chat PRIMA dell'appuntamento, così potranno essere visionati e discussi durante l'incontro; indica che lo studio è in Via Operai 102, Barcellona P.G. (ME).`;
+    return `Appuntamento confermato e ${r.calendarUpdated ? 'agenda aggiornata' : 'segnalato al Dott. Branca'}. Scrivi al cliente un breve messaggio che CONFERMA l'appuntamento del ${appt.date} alle ${appt.start}, ringrazia, e — se l'incontro riguarda documenti da esaminare — RIBADISCI che deve inviarli PRIMA dell'appuntamento (su questa chat WhatsApp oppure via email a studiobranca@tiscali.it o studiobranca@icloud.com), così potranno essere visionati e discussi durante l'incontro; indica che lo studio è in Via Operai 102, Barcellona P.G. (ME).`;
   }
   if (name === 'need_human') {
     out.needsHuman = true;
@@ -608,7 +609,7 @@ async function runTool(name: string, input: any, out: DraftResult, phone: string
         markDocNotesAttached(phone);
       } catch (e: any) { console.error('[Chatbot] annota documenti su evento:', e.message); }
     }
-    return 'Documentazione annotata come promemoria per l\'appuntamento. Conferma al cliente la ricezione, indica che sarà esaminata prima dell\'incontro e RICORDA che i documenti utili vanno inviati su questa chat PRIMA dell\'appuntamento.';
+    return 'Documentazione annotata come promemoria per l\'appuntamento. Conferma al cliente la ricezione, indica che sarà esaminata prima dell\'incontro e RICORDA che eventuali altri documenti utili vanno inviati PRIMA dell\'appuntamento, su questa chat WhatsApp oppure via email a studiobranca@tiscali.it o studiobranca@icloud.com.';
   }
   if (name === 'already_handled') {
     out.handled = true;
