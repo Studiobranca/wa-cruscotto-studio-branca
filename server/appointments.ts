@@ -4,13 +4,17 @@
  * Calcola gli slot liberi incrociando l'orario studio con Google Calendar
  * (freeBusy). Regole fisse concordate (ricevimento Dott. Branca, salvo appuntamenti):
  *  - lun, mar, gio: 9:00–18:00 a orario continuato
- *  - mer, ven: 9:00–13:00 (solo mattina)
+ *  - mer, ven: 9:00–13:00 (solo mattina); DAL 10 LUGLIO 2026 → 9:00–14:00
  *  - ESCLUSI: sabato, domenica
  *  - ESCLUSE: feste comandate italiane (incl. lunedì dell'Angelo)
  *  - ESCLUSA: chiusura estiva 20 luglio – 31 agosto (ogni anno)
  */
 
 const TZ = 'Europe/Rome';
+
+// Dal 10/07/2026 l'apertura di mercoledì e venerdì si estende fino alle 14:00
+// (prima 9–13). Modifica permanente comunicata dallo Studio.
+const MERVEN_EXT_FROM = '2026-07-10';
 
 async function getGoogleAccessToken(): Promise<string | null> {
   const clientId = process.env.GOOGLE_CLIENT_ID;
@@ -68,9 +72,11 @@ interface Slot { date: string; start: string; end: string; dow: number; }
 function daySlots(ds: string, dow: number): Slot[] {
   if (dow === 0 || dow === 6) return [];          // domenica, sabato
   if (isHoliday(ds) || isSummerClosure(ds)) return [];
-  // Lun(1), Mar(2), Gio(4): orario continuato 9:00–18:00. Mer(3) e Ven(5): solo 9:00–13:00.
+  // Lun(1), Mar(2), Gio(4): orario continuato 9:00–18:00. Mer(3) e Ven(5): 9:00–13:00,
+  // ESTESO a 9:00–14:00 dal 10/07/2026 in poi.
   const fullDay = dow === 1 || dow === 2 || dow === 4;
-  const lastHour = fullDay ? 18 : 13;
+  const merVenLast = ds >= MERVEN_EXT_FROM ? 14 : 13;
+  const lastHour = fullDay ? 18 : merVenLast;
   const out: Slot[] = [];
   for (let h = 9; h < lastHour; h++) out.push({ date: ds, start: `${String(h).padStart(2, '0')}:00`, end: `${String(h + 1).padStart(2, '0')}:00`, dow });
   return out;

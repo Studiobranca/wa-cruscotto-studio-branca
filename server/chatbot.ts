@@ -121,6 +121,20 @@ export function getPendingAppointment(phone: string): any | null {
   `).get(phone) as any || null;
 }
 
+/**
+ * Appuntamento FUTURO già in agenda per un numero (da confermare o confermato),
+ * con data >= oggi. Serve al dedup: se il cliente riscrive per la stessa cosa, il
+ * bot NON deve fissarne un altro ma gestire quello esistente.
+ */
+export function getUpcomingAppointment(phone: string): any | null {
+  const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Rome' }).format(new Date());
+  return db.prepare(`
+    SELECT * FROM bot_appointments
+    WHERE phone = ? AND status IN ('da_confermare','confermato') AND date >= ?
+    ORDER BY date ASC, start ASC LIMIT 1
+  `).get(phone, today) as any || null;
+}
+
 /** Segna un appuntamento come confermato dal cliente. */
 export function markAppointmentConfirmed(id: number): void {
   db.prepare(`UPDATE bot_appointments SET status = 'confermato', confirmed_at = datetime('now') WHERE id = ?`).run(id);
@@ -211,6 +225,15 @@ export function getBotModel(): string { return getSetting('bot_model', DEFAULT_M
 export function isAutoSendEnabled(): boolean {
   if (process.env.BOT_ALLOW_AUTOSEND !== '1') return false;
   return getSetting('bot_auto_send', '0') === '1';
+}
+
+// Appuntamenti in AUTONOMIA: il bot, sul flusso agenda (proposta/conferma/spostamento),
+// risponde da solo al cliente DOPO aver incrociato Google Calendar. È un automatismo
+// VOLUTO e circoscritto (solo agenda, non urgenze, non risposte di merito generiche) →
+// di default attivo, con un proprio interruttore. NON è soggetto al lucchetto autoSend
+// perché è limitato al flusso appuntamenti e l'agenda è già verificata.
+export function isAutoAppointmentsEnabled(): boolean {
+  return getSetting('bot_auto_appointments', '1') === '1';
 }
 
 // Anti-spam cortesia: il messaggio "sono impegnato, ricontatto" per i messaggi NON di
@@ -321,7 +344,8 @@ GESTIONE OPERATIVA:
   facendoti inviare PRIMA la documentazione pertinente per la valutazione. Puoi dare un primo
   inquadramento tecnico, ma la trattazione vera avviene in studio sui documenti.
 - ORARI STUDIO (get_availability li rispetta già; non proporre MAI fuori da questi):
-  lunedì, martedì e giovedì 9:00–18:00 (orario continuato); mercoledì e venerdì 9:00–13:00.
+  lunedì, martedì e giovedì 9:00–18:00 (orario continuato); mercoledì e venerdì 9:00–13:00
+  (DAL 10 LUGLIO 2026: mercoledì e venerdì 9:00–14:00).
   MAI sabato e domenica, MAI feste comandate; studio CHIUSO dal 20 luglio al 31 agosto.
 - CONTROLLO DUPLICATI (obbligatorio): prima di rispondere a una richiesta o a un invio di
   documenti, chiama find_previous_requests per verificare se il cliente aveva GIÀ inviato lo
@@ -606,12 +630,22 @@ export async function generateDraft(phone: string, contactName: string): Promise
 
   // Se per questo cliente c'è un appuntamento "da confermare", informane il modello:
   // se il cliente lo conferma deve chiamare confirm_appointment (aggiorna l'agenda).
+  // Dedup appuntamenti: se esiste GIÀ un appuntamento futuro (da confermare o confermato)
+  // il modello deve gestire QUELLO, non fissarne un secondo per la stessa cosa.
+  const upcomingAppt = getUpcomingAppointment(phone);
   const pendingAppt = getPendingAppointment(phone);
-  const apptBlock = pendingAppt
-    ? `\n\nAPPUNTAMENTO IN ATTESA DI CONFERMA per questo cliente: ${pendingAppt.date} alle ${pendingAppt.start}${pendingAppt.reason ? ` (${pendingAppt.reason})` : ''}.
+  let apptBlock = '';
+  if (upcomingAppt && upcomingAppt.status === 'confermato') {
+    apptBlock = `\n\n⚠️ QUESTO CLIENTE HA GIÀ UN APPUNTAMENTO CONFERMATO IN AGENDA: ${upcomingAppt.date} alle ${upcomingAppt.start}${upcomingAppt.reason ? ` (${upcomingAppt.reason})` : ''}.
+- NON proporre e NON fissare un nuovo appuntamento per la stessa questione: l'appuntamento c'è già. Ricordaglielo con garbo (data e ora).
+- Solo se il cliente chiede ESPLICITAMENTE di SPOSTARLO, usa get_availability per riproporre nuovi slot; se chiede di DISDIRE, segnala con need_human.
+- Se serve, ricorda che la documentazione utile va inviata su questa chat PRIMA dell'incontro.`;
+  } else if (pendingAppt) {
+    apptBlock = `\n\nAPPUNTAMENTO IN ATTESA DI CONFERMA per questo cliente: ${pendingAppt.date} alle ${pendingAppt.start}${pendingAppt.reason ? ` (${pendingAppt.reason})` : ''}.
+- NON proporre un secondo appuntamento per la stessa cosa: ce n'è già uno in attesa.
 - Se nell'ULTIMO messaggio il cliente CONFERMA che può venire (es. "confermo", "sì va bene", "ci sono", "perfetto", "ok per quel giorno"), chiama confirm_appointment e poi conferma con garbo.
-- Se invece chiede di SPOSTARE l'orario, usa get_availability per riproporre nuovi slot; se vuole DISDIRE o è incerto, NON chiamare confirm_appointment.`
-    : '';
+- Se invece chiede di SPOSTARE l'orario, usa get_availability per riproporre nuovi slot; se vuole DISDIRE o è incerto, NON chiamare confirm_appointment.`;
+  }
 
   const system = `${SYSTEM_PROMPT}\n\nData odierna: ${todayStr} (${todayISO}). Usa SEMPRE date coerenti con oggi e non inventare l'anno.${apptBlock}`;
 

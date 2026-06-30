@@ -24207,6 +24207,7 @@ init_db();
 
 // server/appointments.ts
 var TZ = "Europe/Rome";
+var MERVEN_EXT_FROM = "2026-07-10";
 async function getGoogleAccessToken() {
   const clientId = process.env.GOOGLE_CLIENT_ID;
   const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
@@ -24256,7 +24257,8 @@ function daySlots(ds, dow) {
   if (dow === 0 || dow === 6) return [];
   if (isHoliday(ds) || isSummerClosure(ds)) return [];
   const fullDay = dow === 1 || dow === 2 || dow === 4;
-  const lastHour = fullDay ? 18 : 13;
+  const merVenLast = ds >= MERVEN_EXT_FROM ? 14 : 13;
+  const lastHour = fullDay ? 18 : merVenLast;
   const out = [];
   for (let h = 9; h < lastHour; h++) out.push({ date: ds, start: `${String(h).padStart(2, "0")}:00`, end: `${String(h + 1).padStart(2, "0")}:00`, dow });
   return out;
@@ -24973,6 +24975,14 @@ function getPendingAppointment(phone) {
     ORDER BY created_at DESC LIMIT 1
   `).get(phone) || null;
 }
+function getUpcomingAppointment(phone) {
+  const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Rome" }).format(/* @__PURE__ */ new Date());
+  return db_default.prepare(`
+    SELECT * FROM bot_appointments
+    WHERE phone = ? AND status IN ('da_confermare','confermato') AND date >= ?
+    ORDER BY date ASC, start ASC LIMIT 1
+  `).get(phone, today) || null;
+}
 function markAppointmentConfirmed(id) {
   db_default.prepare(`UPDATE bot_appointments SET status = 'confermato', confirmed_at = datetime('now') WHERE id = ?`).run(id);
 }
@@ -25050,6 +25060,9 @@ function getBotModel() {
 function isAutoSendEnabled() {
   if (process.env.BOT_ALLOW_AUTOSEND !== "1") return false;
   return getSetting("bot_auto_send", "0") === "1";
+}
+function isAutoAppointmentsEnabled() {
+  return getSetting("bot_auto_appointments", "1") === "1";
 }
 function todayRome() {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Rome" }).format(/* @__PURE__ */ new Date());
@@ -25147,7 +25160,8 @@ GESTIONE OPERATIVA:
   facendoti inviare PRIMA la documentazione pertinente per la valutazione. Puoi dare un primo
   inquadramento tecnico, ma la trattazione vera avviene in studio sui documenti.
 - ORARI STUDIO (get_availability li rispetta gi\xE0; non proporre MAI fuori da questi):
-  luned\xEC, marted\xEC e gioved\xEC 9:00\u201318:00 (orario continuato); mercoled\xEC e venerd\xEC 9:00\u201313:00.
+  luned\xEC, marted\xEC e gioved\xEC 9:00\u201318:00 (orario continuato); mercoled\xEC e venerd\xEC 9:00\u201313:00
+  (DAL 10 LUGLIO 2026: mercoled\xEC e venerd\xEC 9:00\u201314:00).
   MAI sabato e domenica, MAI feste comandate; studio CHIUSO dal 20 luglio al 31 agosto.
 - CONTROLLO DUPLICATI (obbligatorio): prima di rispondere a una richiesta o a un invio di
   documenti, chiama find_previous_requests per verificare se il cliente aveva GI\xC0 inviato lo
@@ -25398,12 +25412,24 @@ async function generateDraft(phone, contactName) {
     timeZone: "Europe/Rome"
   });
   const todayISO = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Rome" }).format(/* @__PURE__ */ new Date());
+  const upcomingAppt = getUpcomingAppointment(phone);
   const pendingAppt = getPendingAppointment(phone);
-  const apptBlock = pendingAppt ? `
+  let apptBlock = "";
+  if (upcomingAppt && upcomingAppt.status === "confermato") {
+    apptBlock = `
+
+\u26A0\uFE0F QUESTO CLIENTE HA GI\xC0 UN APPUNTAMENTO CONFERMATO IN AGENDA: ${upcomingAppt.date} alle ${upcomingAppt.start}${upcomingAppt.reason ? ` (${upcomingAppt.reason})` : ""}.
+- NON proporre e NON fissare un nuovo appuntamento per la stessa questione: l'appuntamento c'\xE8 gi\xE0. Ricordaglielo con garbo (data e ora).
+- Solo se il cliente chiede ESPLICITAMENTE di SPOSTARLO, usa get_availability per riproporre nuovi slot; se chiede di DISDIRE, segnala con need_human.
+- Se serve, ricorda che la documentazione utile va inviata su questa chat PRIMA dell'incontro.`;
+  } else if (pendingAppt) {
+    apptBlock = `
 
 APPUNTAMENTO IN ATTESA DI CONFERMA per questo cliente: ${pendingAppt.date} alle ${pendingAppt.start}${pendingAppt.reason ? ` (${pendingAppt.reason})` : ""}.
+- NON proporre un secondo appuntamento per la stessa cosa: ce n'\xE8 gi\xE0 uno in attesa.
 - Se nell'ULTIMO messaggio il cliente CONFERMA che pu\xF2 venire (es. "confermo", "s\xEC va bene", "ci sono", "perfetto", "ok per quel giorno"), chiama confirm_appointment e poi conferma con garbo.
-- Se invece chiede di SPOSTARE l'orario, usa get_availability per riproporre nuovi slot; se vuole DISDIRE o \xE8 incerto, NON chiamare confirm_appointment.` : "";
+- Se invece chiede di SPOSTARE l'orario, usa get_availability per riproporre nuovi slot; se vuole DISDIRE o \xE8 incerto, NON chiamare confirm_appointment.`;
+  }
   const system = `${SYSTEM_PROMPT}
 
 Data odierna: ${todayStr} (${todayISO}). Usa SEMPRE date coerenti con oggi e non inventare l'anno.${apptBlock}`;
@@ -25804,7 +25830,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.9.4", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.9.5", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/debug/laura", (_req, res) => {
   try {
@@ -26501,12 +26527,13 @@ Da confermare.`,
             const res2 = outcome.result;
             const id = saveDraft({ phone, contactName: cName, incoming: content, result: res2 });
             const isUrgent = res2.needsHuman;
+            const autonomousAppt = !!res2.appointmentFlow && !isUrgent && isAutoAppointmentsEnabled();
             const globalAuto = isAutoSendEnabled() && !isUrgent;
-            if (globalAuto) {
-              const r = await approveDraftCore(id, { force: true });
+            if (autonomousAppt || globalAuto) {
+              const r = await approveDraftCore(id, { force: globalAuto && !autonomousAppt });
               if (r.ok) {
                 broadcastEvent("bot_draft", { id, phone, contactName: cName, needsHuman: false, autoSent: true });
-                console.log(`[Chatbot] Auto-risposta a ${cName} (${phone})${r.hadEvent ? " + appuntamento DA CONFERMARE" : ""}`);
+                console.log(`[Chatbot] ${autonomousAppt ? "Appuntamento autonomo" : "Auto-risposta"} a ${cName} (${phone})${r.hadEvent ? " + appuntamento DA CONFERMARE" : ""}`);
               } else if (r.conflict) {
                 broadcastEvent("bot_draft", { id, phone, contactName: cName, needsHuman: false, conflict: true });
                 console.warn(`[Chatbot] Slot in conflitto per ${cName} (${phone}): bozza #${id} resta in attesa di revisione.`);
