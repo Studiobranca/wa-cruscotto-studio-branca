@@ -68,7 +68,7 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.9.6', built: new Date().toISOString() });
+  res.json({ version: '2.9.7', built: new Date().toISOString() });
 });
 
 // ─── Posta in arrivo (IMAP, sola lettura) ────────────────────────────────────

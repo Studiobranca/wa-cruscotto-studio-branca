@@ -343,10 +343,16 @@ GESTIONE OPERATIVA:
   o di una consulenza, tendi SEMPRE a ricondurre la questione a un appuntamento IN PRESENZA,
   facendoti inviare PRIMA la documentazione pertinente per la valutazione. Puoi dare un primo
   inquadramento tecnico, ma la trattazione vera avviene in studio sui documenti.
-- ORARI STUDIO (get_availability li rispetta già; non proporre MAI fuori da questi):
-  lunedì, martedì e giovedì 9:00–18:00 (orario continuato); mercoledì e venerdì 9:00–13:00
-  (DAL 10 LUGLIO 2026: mercoledì e venerdì 9:00–14:00).
-  MAI sabato e domenica, MAI feste comandate; studio CHIUSO dal 20 luglio al 31 agosto.
+- ORARI STUDIO (get_availability li applica GIÀ con le date esatte; non proporre MAI fuori da
+  questi e non citare orari diversi da quelli che get_availability restituisce):
+  • STANDARD (fino al 9 luglio 2026 e da settembre 2026): lun/mar/gio 9:00–18:00 continuato;
+    mer/ven 9:00–13:00.
+  • 10–25 luglio 2026: ORARIO UNICO 9:00–14:00 tutti i feriali.
+  • 26 luglio–31 agosto 2026: studio CHIUSO, NON fissare alcun appuntamento in questo periodo
+    (se il cliente chiede, spiega che si riprende dal 1° settembre e proponi date da settembre).
+  • settembre 2026: di nuovo orario STANDARD.
+  MAI sabato e domenica, MAI feste comandate. In ogni caso fidati SEMPRE degli slot reali di
+  get_availability (incrocia già l'agenda Google del Dott. Branca).
 - CONTROLLO DUPLICATI (obbligatorio): prima di rispondere a una richiesta o a un invio di
   documenti, chiama find_previous_requests per verificare se il cliente aveva GIÀ inviato lo
   stesso documento o fatto la stessa richiesta. Se sì, faglielo presente con garbo citando
@@ -498,6 +504,9 @@ interface DraftResult {
   appointmentFlow?: boolean;
   // true quando il Dott. Branca ha già gestito di persona l'ultima richiesta → nessun messaggio.
   handled?: boolean;
+  // true quando il bot ha registrato documentazione ricevuta (tool note_documents):
+  // su email autorizza l'invio automatico della risposta (conferma ricezione + integrazione).
+  docNoted?: boolean;
 }
 
 // Esito della generazione: 'work' (bozza da approvare) o 'personal' (chat privata,
@@ -589,6 +598,7 @@ async function runTool(name: string, input: any, out: DraftResult, phone: string
   if (name === 'note_documents') {
     const summary = String(input?.summary || '').trim().slice(0, 300);
     if (!summary) return 'Nessun contenuto da annotare.';
+    out.docNoted = true;
     recordDocNote(phone, summary);
     // Se c'è già un appuntamento in agenda per questo cliente, annota subito sull'evento.
     const appt = getActiveAppointmentWithEvent(phone);
@@ -612,6 +622,18 @@ async function runTool(name: string, input: any, out: DraftResult, phone: string
  * (manca ANTHROPIC_API_KEY) o se non produce testo.
  */
 export async function generateDraft(phone: string, contactName: string): Promise<DraftOutcome | null> {
+  return generateReplyCore(phone, contactName, buildTranscript(phone, contactName), 'whatsapp');
+}
+
+/**
+ * Cuore della generazione risposta, condiviso tra WhatsApp ed EMAIL. `key` è
+ * l'identificativo del contatto (telefono per WhatsApp, indirizzo email per le
+ * email): è la chiave usata per appuntamenti e note documenti, indipendente per
+ * canale. `userContent` è il messaggio/transcript da passare al modello.
+ */
+export async function generateReplyCore(
+  key: string, contactName: string, userContent: string, channel: 'whatsapp' | 'email' = 'whatsapp',
+): Promise<DraftOutcome | null> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
     console.warn('[Chatbot] ANTHROPIC_API_KEY non configurata: bozza non generata.');
@@ -619,7 +641,8 @@ export async function generateDraft(phone: string, contactName: string): Promise
   }
 
   const out: DraftResult = { draftText: '', proposedEvent: null, needsHuman: false };
-  const messages: any[] = [{ role: 'user', content: buildTranscript(phone, contactName) }];
+  const messages: any[] = [{ role: 'user', content: userContent }];
+  const dest = channel === 'email' ? 'in risposta a questa email' : 'su questa chat';
 
   // Data odierna (Europe/Rome) iniettata nel system: senza, il modello sbaglia
   // l'anno quando il cliente cita un giorno senza anno (es. "martedì 17").
@@ -632,14 +655,14 @@ export async function generateDraft(phone: string, contactName: string): Promise
   // se il cliente lo conferma deve chiamare confirm_appointment (aggiorna l'agenda).
   // Dedup appuntamenti: se esiste GIÀ un appuntamento futuro (da confermare o confermato)
   // il modello deve gestire QUELLO, non fissarne un secondo per la stessa cosa.
-  const upcomingAppt = getUpcomingAppointment(phone);
-  const pendingAppt = getPendingAppointment(phone);
+  const upcomingAppt = getUpcomingAppointment(key);
+  const pendingAppt = getPendingAppointment(key);
   let apptBlock = '';
   if (upcomingAppt && upcomingAppt.status === 'confermato') {
     apptBlock = `\n\n⚠️ QUESTO CLIENTE HA GIÀ UN APPUNTAMENTO CONFERMATO IN AGENDA: ${upcomingAppt.date} alle ${upcomingAppt.start}${upcomingAppt.reason ? ` (${upcomingAppt.reason})` : ''}.
 - NON proporre e NON fissare un nuovo appuntamento per la stessa questione: l'appuntamento c'è già. Ricordaglielo con garbo (data e ora).
 - Solo se il cliente chiede ESPLICITAMENTE di SPOSTARLO, usa get_availability per riproporre nuovi slot; se chiede di DISDIRE, segnala con need_human.
-- Se serve, ricorda che la documentazione utile va inviata su questa chat PRIMA dell'incontro.`;
+- Se serve, ricorda che la documentazione utile va inviata ${dest} PRIMA dell'incontro.`;
   } else if (pendingAppt) {
     apptBlock = `\n\nAPPUNTAMENTO IN ATTESA DI CONFERMA per questo cliente: ${pendingAppt.date} alle ${pendingAppt.start}${pendingAppt.reason ? ` (${pendingAppt.reason})` : ''}.
 - NON proporre un secondo appuntamento per la stessa cosa: ce n'è già uno in attesa.
@@ -647,7 +670,11 @@ export async function generateDraft(phone: string, contactName: string): Promise
 - Se invece chiede di SPOSTARE l'orario, usa get_availability per riproporre nuovi slot; se vuole DISDIRE o è incerto, NON chiamare confirm_appointment.`;
   }
 
-  const system = `${SYSTEM_PROMPT}\n\nData odierna: ${todayStr} (${todayISO}). Usa SEMPRE date coerenti con oggi e non inventare l'anno.${apptBlock}`;
+  const channelNote = channel === 'email'
+    ? `\n\nCANALE = EMAIL. Stai rispondendo via email a un messaggio che il cliente ha inviato allo studio (spesso ALLEGANDO documenti). Scrivi una email cordiale e completa: saluto iniziale ("Gentile ...,"), corpo, chiusura con firma. Quando chiedi documenti o ne confermi la ricezione, di' di inviarli "${dest}". Per il resto valgono tutte le regole (orari, dedup, zero-errori, niente quantificazioni del singolo caso).`
+    : '';
+
+  const system = `${SYSTEM_PROMPT}\n\nData odierna: ${todayStr} (${todayISO}). Usa SEMPRE date coerenti con oggi e non inventare l'anno.${apptBlock}${channelNote}`;
 
   for (let loop = 0; loop < MAX_TOOL_LOOPS; loop++) {
     let data: any;
@@ -687,7 +714,7 @@ export async function generateDraft(phone: string, contactName: string): Promise
       const toolResults: any[] = [];
       for (const b of blocks) {
         if (b.type === 'tool_use') {
-          const result = await runTool(b.name, b.input, out, phone);
+          const result = await runTool(b.name, b.input, out, key);
           toolResults.push({ type: 'tool_result', tool_use_id: b.id, content: result });
         }
       }
@@ -770,27 +797,38 @@ export async function approveDraftCore(id: number, opts: { text?: string; force?
 
   let calendar: any = null;
   if (d.proposed_event) {
-    const ev = d.proposed_event;
-    // Promemoria documenti già inviati dal cliente (a cosa si riferiscono): in descrizione.
-    const docNotes = getUnattachedDocNotes(d.phone);
-    const docBlock = docNotes.length ? `\n\n${formatDocNotes(docNotes)}` : '';
-    calendar = await createCalendarEvent({
-      title: `[DA CONFERMARE] ${ev.reason} — ${d.contact_name || d.phone}`,
-      description: `Appuntamento proposto dal chatbot WhatsApp.\nCliente: ${d.contact_name || ''} (${d.phone})\nMotivo: ${ev.reason}${docBlock}\n\n⚠️ Confermare con il cliente.`,
-      startDate: `${ev.date}T${ev.start}:00`,
-      endDate: `${ev.date}T${ev.end}:00`,
-    });
-    // Traccia l'appuntamento (con eventId) così la conferma del cliente potrà
-    // ritrovare e aggiornare l'evento in agenda.
-    recordAppointment({
-      phone: d.phone, contactName: d.contact_name, eventId: calendar?.eventId ?? null,
-      date: ev.date, start: ev.start, end: ev.end, reason: ev.reason,
-    });
-    if (docNotes.length) markDocNotesAttached(d.phone);
+    calendar = await materializeProposedEvent(d.phone, d.contact_name, d.proposed_event, 'whatsapp');
   }
   markDraftSent(id);
   broadcastEvent('message', { type: 'sent', phone: d.phone, contactName: d.contact_name, content: finalText, timestamp: now });
   return { ok: true, status: 200, calendar, contactName: d.contact_name, hadEvent: !!d.proposed_event };
+}
+
+/**
+ * Crea l'evento [DA CONFERMARE] su Google Calendar e traccia l'appuntamento
+ * (tabella bot_appointments). Cuore condiviso tra WhatsApp (approveDraftCore) ed
+ * EMAIL (modulo email). `key` = telefono o indirizzo email del cliente.
+ */
+export async function materializeProposedEvent(
+  key: string, contactName: string | null,
+  ev: { date: string; start: string; end: string; reason: string },
+  channel: 'whatsapp' | 'email' = 'whatsapp',
+): Promise<any> {
+  const docNotes = getUnattachedDocNotes(key);
+  const docBlock = docNotes.length ? `\n\n${formatDocNotes(docNotes)}` : '';
+  const src = channel === 'email' ? 'assistente email' : 'chatbot WhatsApp';
+  const calendar = await createCalendarEvent({
+    title: `[DA CONFERMARE] ${ev.reason} — ${contactName || key}`,
+    description: `Appuntamento proposto dall'${src}.\nCliente: ${contactName || ''} (${key})\nMotivo: ${ev.reason}${docBlock}\n\n⚠️ Confermare con il cliente.`,
+    startDate: `${ev.date}T${ev.start}:00`,
+    endDate: `${ev.date}T${ev.end}:00`,
+  });
+  recordAppointment({
+    phone: key, contactName, eventId: calendar?.eventId ?? null,
+    date: ev.date, start: ev.start, end: ev.end, reason: ev.reason,
+  });
+  if (docNotes.length) markDocNotesAttached(key);
+  return calendar;
 }
 
 // ─── Notifica WhatsApp della bozza a Mariano ─────────────────────────────────

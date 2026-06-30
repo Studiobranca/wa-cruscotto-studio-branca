@@ -2,19 +2,35 @@
  * Disponibilità appuntamenti — Studio Tributario Branca
  *
  * Calcola gli slot liberi incrociando l'orario studio con Google Calendar
- * (freeBusy). Regole fisse concordate (ricevimento Dott. Branca, salvo appuntamenti):
+ * (freeBusy). Calendario ricevimento Dott. Branca (salvo appuntamenti):
+ *  ── ORARIO STANDARD (fino al 9 luglio 2026 e da settembre 2026) ──
  *  - lun, mar, gio: 9:00–18:00 a orario continuato
- *  - mer, ven: 9:00–13:00 (solo mattina); DAL 10 LUGLIO 2026 → 9:00–14:00
- *  - ESCLUSI: sabato, domenica
- *  - ESCLUSE: feste comandate italiane (incl. lunedì dell'Angelo)
- *  - ESCLUSA: chiusura estiva 20 luglio – 31 agosto (ogni anno)
+ *  - mer, ven: 9:00–13:00 (solo mattina)
+ *  ── ORARIO ESTIVO 2026 (date esatte comunicate dallo Studio) ──
+ *  - 10–25 luglio 2026: ORARIO UNICO 9:00–14:00 tutti i feriali
+ *  - 26 luglio – 31 agosto 2026: CHIUSO, NESSUN appuntamento
+ *  - 1–30 settembre 2026: torna all'orario STANDARD
+ *  - da ottobre 2026: DA RIDETERMINARE → per ora usa lo STANDARD (fallback)
+ *  ── SEMPRE esclusi ──
+ *  - sabato, domenica; feste comandate italiane (incl. lunedì dell'Angelo)
  */
 
 const TZ = 'Europe/Rome';
 
-// Dal 10/07/2026 l'apertura di mercoledì e venerdì si estende fino alle 14:00
-// (prima 9–13). Modifica permanente comunicata dallo Studio.
-const MERVEN_EXT_FROM = '2026-07-10';
+// Periodi 2026 a date esatte (override sullo standard). ATTENZIONE: lo Studio
+// rideterminerà ottobre 2026 → finché non arriva, ottobre+ usa lo standard.
+const ESTIVO_UNICO_DA = '2026-07-10';   // incluso
+const ESTIVO_UNICO_A = '2026-07-25';    // incluso → 9–14 ogni feriale
+const CHIUSURA_DA = '2026-07-26';       // incluso
+const CHIUSURA_A = '2026-08-31';        // incluso → niente appuntamenti
+
+// Finestra di apertura del giorno (ore intere) o null se CHIUSO. dow: 0=dom..6=sab.
+function openWindow(ds: string, dow: number): { start: number; last: number } | null {
+  if (ds >= ESTIVO_UNICO_DA && ds <= ESTIVO_UNICO_A) return { start: 9, last: 14 }; // orario unico estivo
+  if (ds >= CHIUSURA_DA && ds <= CHIUSURA_A) return null;                            // chiusura estiva
+  const fullDay = dow === 1 || dow === 2 || dow === 4;                              // standard
+  return { start: 9, last: fullDay ? 18 : 13 };
+}
 
 async function getGoogleAccessToken(): Promise<string | null> {
   const clientId = process.env.GOOGLE_CLIENT_ID;
@@ -61,24 +77,18 @@ function isHoliday(ds: string): boolean {
   return false;
 }
 
-function isSummerClosure(ds: string): boolean {
-  const md = ds.slice(5); // MM-DD
-  return md >= '07-20' && md <= '08-31';
-}
-
 interface Slot { date: string; start: string; end: string; dow: number; }
 
-// Slot teorici di un giorno secondo le regole studio (slot da 1 ora)
+// Slot teorici di un giorno secondo il calendario studio (slot da 1 ora).
 function daySlots(ds: string, dow: number): Slot[] {
   if (dow === 0 || dow === 6) return [];          // domenica, sabato
-  if (isHoliday(ds) || isSummerClosure(ds)) return [];
-  // Lun(1), Mar(2), Gio(4): orario continuato 9:00–18:00. Mer(3) e Ven(5): 9:00–13:00,
-  // ESTESO a 9:00–14:00 dal 10/07/2026 in poi.
-  const fullDay = dow === 1 || dow === 2 || dow === 4;
-  const merVenLast = ds >= MERVEN_EXT_FROM ? 14 : 13;
-  const lastHour = fullDay ? 18 : merVenLast;
+  if (isHoliday(ds)) return [];
+  const win = openWindow(ds, dow);                // null = chiuso (es. 26/7–31/8)
+  if (!win) return [];
   const out: Slot[] = [];
-  for (let h = 9; h < lastHour; h++) out.push({ date: ds, start: `${String(h).padStart(2, '0')}:00`, end: `${String(h + 1).padStart(2, '0')}:00`, dow });
+  for (let h = win.start; h < win.last; h++) {
+    out.push({ date: ds, start: `${String(h).padStart(2, '0')}:00`, end: `${String(h + 1).padStart(2, '0')}:00`, dow });
+  }
   return out;
 }
 
