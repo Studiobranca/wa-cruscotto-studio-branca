@@ -99951,6 +99951,24 @@ async function sendReply(acc, to, subject, body, inReplyTo) {
     references: inReplyTo || void 0
   });
 }
+async function notifyUrgentEmail(row, reason) {
+  const esc = (s) => String(s ?? "").replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" })[c]);
+  const subject = `\u{1F534} URGENTE \u2014 email cliente \u2014 ${row.from_name || row.from_addr}`;
+  const html = `
+    <h2 style="color:#b00020;margin:0 0 8px">Richiesta urgente arrivata via EMAIL</h2>
+    <p><b>Cliente:</b> ${esc(row.from_name || row.from_addr)} (${esc(row.from_addr)})</p>
+    <p><b>Oggetto:</b> ${esc(row.subject)}</p>
+    ${reason ? `<p><b>Motivo segnalato dal bot:</b> ${esc(reason)}</p>` : ""}
+    <p style="white-space:pre-wrap">${esc((row.body || "").slice(0, 1e3))}</p>
+    <p>Nessuna risposta automatica \xE8 stata inviata: apri il Cruscotto (tab Email) o rispondi
+    direttamente dalla tua casella di posta.</p>
+  `;
+  try {
+    await sendStudioAlertEmail(subject, html);
+  } catch (e) {
+    console.error("[Email] alert urgenza fallito:", e.message);
+  }
+}
 async function maybeAutoReply(acc, row) {
   if (!autoReplyEnabled()) return null;
   if (row.category !== "lavoro") return null;
@@ -99974,18 +99992,20 @@ ${row.body}`;
   }
   if (!outcome || outcome.kind !== "work" || !outcome.result) return null;
   const res = outcome.result;
-  if (res.needsHuman) return null;
+  if (res.needsHuman) {
+    await notifyUrgentEmail(row, res.humanReason);
+    return null;
+  }
+  if (!res.draftText) return null;
   const isAppt = !!res.appointmentFlow || !!res.proposedEvent;
   const isDoc = !!res.docNoted;
-  if (!isAppt && !isDoc) return null;
-  if (!res.draftText) return null;
   try {
     if (res.proposedEvent) {
       await materializeProposedEvent(key, row.from_name || fromAddr, res.proposedEvent, "email");
     }
     await sendReply(acc, fromAddr, row.subject, res.draftText, row.message_id || void 0);
     db.prepare(`UPDATE incoming_emails SET replied = 1, reply_text = ?, reply_at = datetime('now') WHERE id = ?`).run(res.draftText, row.id);
-    const label = isAppt ? "appuntamento" : "documenti";
+    const label = isAppt ? "appuntamento" : isDoc ? "documenti" : "risposta";
     console.log(`[Email] Risposta automatica (${label}) inviata a ${fromAddr}.`);
     return label;
   } catch (e) {

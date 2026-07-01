@@ -12,15 +12,18 @@
  *  - SOLA LETTURA in ingresso (non cancella/sposta nulla sul server).
  *  - Auto-risposta SOLO a email recenti (< EMAIL_REPLY_MAX_AGE_MIN, default 120 min) →
  *    al primo giro NON risponde al pregresso già in inbox.
- *  - Auto-risposta SOLO categoria 'lavoro' e SOLO per appuntamenti/documenti; mai a
- *    mittenti automatici/noreply; mai alle urgenze (need_human) → quelle si smistano.
+ *  - Auto-risposta SOLO categoria 'lavoro'; MAI a mittenti automatici/noreply; MAI alle
+ *    urgenze (need_human) → quelle restano senza risposta automatica e generano un alert
+ *    email dedicato a Mariano (rev. 02/07/2026: prima solo appuntamenti/documenti
+ *    auto-rispondevano, ora ogni risposta di merito non urgente parte da sola — stessa
+ *    logica già attiva su WhatsApp, "allarga la maglia, valuta solo le criticità").
  *  - Tutto isolato: si attiva solo con le credenziali via env; un errore qui non tocca il bot.
  */
 import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import nodemailer from 'nodemailer';
 import { db } from './db.js';
-import { generateReplyCore, materializeProposedEvent, getControlNumber } from './chatbot.js';
+import { generateReplyCore, materializeProposedEvent, getControlNumber, sendStudioAlertEmail } from './chatbot.js';
 import { sendTextMessage } from './zapi.js';
 import * as contacts from './contacts.js';
 
@@ -186,8 +189,28 @@ async function sendReply(acc: MailAccount, to: string, subject: string, body: st
   });
 }
 
-/** Genera e (se appuntamento/documenti) INVIA la risposta automatica a una email di lavoro.
- *  Ritorna una breve etichetta dell'azione svolta ('appuntamento'|'documenti') o null. */
+/** Invia a Mariano un alert email dedicato per un'urgenza (need_human) arrivata via posta:
+ *  stesso principio del need_human WhatsApp (notifyUrgentByEmail), canale distinto e
+ *  affidabile, per non confonderla con il generico "email cliente in attesa di gestione". */
+async function notifyUrgentEmail(row: { from_addr: string; from_name: string; subject: string; body: string }, reason?: string): Promise<void> {
+  const esc = (s: any) => String(s ?? '').replace(/[<>&]/g, (c) => (({ '<': '&lt;', '>': '&gt;', '&': '&amp;' } as any)[c]));
+  const subject = `🔴 URGENTE — email cliente — ${row.from_name || row.from_addr}`;
+  const html = `
+    <h2 style="color:#b00020;margin:0 0 8px">Richiesta urgente arrivata via EMAIL</h2>
+    <p><b>Cliente:</b> ${esc(row.from_name || row.from_addr)} (${esc(row.from_addr)})</p>
+    <p><b>Oggetto:</b> ${esc(row.subject)}</p>
+    ${reason ? `<p><b>Motivo segnalato dal bot:</b> ${esc(reason)}</p>` : ''}
+    <p style="white-space:pre-wrap">${esc((row.body || '').slice(0, 1000))}</p>
+    <p>Nessuna risposta automatica è stata inviata: apri il Cruscotto (tab Email) o rispondi
+    direttamente dalla tua casella di posta.</p>
+  `;
+  try { await sendStudioAlertEmail(subject, html); }
+  catch (e: any) { console.error('[Email] alert urgenza fallito:', e.message); }
+}
+
+/** Genera e INVIA la risposta automatica a una email di lavoro non urgente (rev. 02/07/2026:
+ *  ampliato da "solo appuntamenti/documenti" a QUALSIASI risposta di merito non urgente).
+ *  Ritorna una breve etichetta dell'azione svolta o null. */
 async function maybeAutoReply(acc: MailAccount, row: {
   id: number; from_addr: string; from_name: string; subject: string; body: string;
   category: string; email_date: string; message_id: string | null;
@@ -213,11 +236,14 @@ async function maybeAutoReply(acc: MailAccount, row: {
   }
   if (!outcome || outcome.kind !== 'work' || !outcome.result) return null;
   const res = outcome.result;
-  if (res.needsHuman) return null;                                // urgenze → smistamento, non auto
+  if (res.needsHuman) {
+    // Urgenza: MAI auto-rispondere. Alert dedicato, distinto dal generico "in attesa".
+    await notifyUrgentEmail(row, res.humanReason);
+    return null;
+  }
+  if (!res.draftText) return null;
   const isAppt = !!res.appointmentFlow || !!res.proposedEvent;
   const isDoc = !!res.docNoted;
-  if (!isAppt && !isDoc) return null;                             // merito generico → smistamento
-  if (!res.draftText) return null;
 
   try {
     if (res.proposedEvent) {
@@ -226,7 +252,7 @@ async function maybeAutoReply(acc: MailAccount, row: {
     await sendReply(acc, fromAddr, row.subject, res.draftText, row.message_id || undefined);
     db.prepare(`UPDATE incoming_emails SET replied = 1, reply_text = ?, reply_at = datetime('now') WHERE id = ?`)
       .run(res.draftText, row.id);
-    const label = isAppt ? 'appuntamento' : 'documenti';
+    const label = isAppt ? 'appuntamento' : isDoc ? 'documenti' : 'risposta';
     console.log(`[Email] Risposta automatica (${label}) inviata a ${fromAddr}.`);
     return label;
   } catch (e: any) {
