@@ -11,7 +11,7 @@
  */
 
 import db from './db.js';
-import { getAvailability, formatAvailabilityIT, isSlotBusy } from './appointments.js';
+import { getAvailability, formatAvailabilityIT, isSlotBusy, getNowStatus, formatDateIT } from './appointments.js';
 import { sendTextMessage } from './zapi.js';
 import { createCalendarEvent, updateCalendarEvent, appendEventDescription } from './integrations.js';
 import { broadcastEvent } from './sse.js';
@@ -337,6 +337,18 @@ GESTIONE OPERATIVA:
   reali (incrocia già l'agenda Google e gli orari studio); quando il cliente sceglie uno slot
   chiama propose_booking; se in un secondo momento conferma di poter venire chiama
   confirm_appointment. Non serve l'approvazione dello studio per concordare data e ora.
+- RICHIESTA DI PASSARE SUBITO/ORA in studio (in autonomia, diverso da un appuntamento futuro:
+  "posso passare adesso/subito/in giornata?", NON "vorrei un appuntamento"): chiama SEMPRE
+  check_walkin_now (mai a intuito, sempre incrociando l'agenda reale e l'orario di lavoro) e
+  segui la sua indicazione:
+  • Se lo studio è aperto ORA e il Dott. Branca è libero → dai l'OK di passare subito.
+  • Se lo studio è aperto ma il Dott. Branca è impegnato → dai comunque l'OK di passare, ma
+    avvisa con garbo che dovrà attendere, indicando quanti impegni risultano prima di lui/lei.
+  • Se lo studio ORA è chiuso → NON spiegare il motivo della chiusura: comunica solo la prima
+    data/ora utile per incontrarsi (fornita dallo strumento), dicendo che prima di quella non è
+    possibile.
+  In ogni caso aggiungi che, se vuole, può nel frattempo inviare tutta la documentazione su
+  questa chat o via email per una valutazione preliminare.
 - DOCUMENTI PRIMA DELL'INCONTRO: se l'appuntamento riguarda documenti da esaminare (atti o
   cartelle notificate, fatture, dichiarazioni, contratti, avvisi), CHIARISCI sempre che il
   cliente deve inviarli PRIMA dell'appuntamento: solo così potranno essere visionati e poi
@@ -432,6 +444,11 @@ const TOOLS = [
       type: 'object',
       properties: { days: { type: 'integer', description: 'Giorni avanti da considerare (default 14)' } },
     },
+  },
+  {
+    name: 'check_walkin_now',
+    description: 'Quando il cliente chiede di passare SUBITO/ORA/in giornata in studio (NON un appuntamento futuro): controlla se lo studio è aperto in questo momento, se il Dott. Branca è libero ADESSO, quanti impegni restano oggi prima che si liberi, e — se lo studio è chiuso ora — la prima data/ora utile. Per fissare un appuntamento futuro usa invece get_availability.',
+    input_schema: { type: 'object', properties: {} },
   },
   {
     name: 'propose_booking',
@@ -633,6 +650,23 @@ async function runTool(name: string, input: any, out: DraftResult, phone: string
     // copiare questi valori in propose_booking, mai inventare la data/anno.
     const iso = slots.slice(0, 12).map((s) => `${s.date} ${s.start}`).join('; ');
     return `${calendarChecked ? '' : '(agenda non verificata su Calendar) '}Prossime disponibilità (da mostrare al cliente):\n${txt}\n\nSlot con data esatta da usare in propose_booking (date=YYYY-MM-DD, start=HH:MM): ${iso}`;
+  }
+  if (name === 'check_walkin_now') {
+    out.appointmentFlow = true;
+    const s = await getNowStatus();
+    if (s.isOpenNow) {
+      if (s.freeNow) {
+        return 'Lo studio è APERTO ora e il Dott. Branca è LIBERO: dai al cliente l\'OK di passare subito. Aggiungi che, se comodo, può inviare fin da ora la documentazione su questa chat o via email, così viene già valutata al suo arrivo.';
+      }
+      const impegni = s.appointmentsRemainingToday > 0
+        ? ` Risultano ${s.appointmentsRemainingToday} impegn${s.appointmentsRemainingToday === 1 ? 'o' : 'i'} in agenda prima di lui/lei oggi.`
+        : '';
+      return `Lo studio è APERTO ora ma il Dott. Branca è IMPEGNATO: dai comunque l'OK di passare, ma avvisa che dovrà attendere.${impegni} Nel frattempo può inviare la documentazione su questa chat o via email per la valutazione.`;
+    }
+    if (s.nextSlot) {
+      return `Lo studio ORA è chiuso. NON spiegare il motivo della chiusura: comunica solo che prima di ${formatDateIT(s.nextSlot.date)} alle ${s.nextSlot.start} non è possibile incontrarsi. Nel frattempo può comunque inviare tutta la documentazione su questa chat o via email per una valutazione preliminare.`;
+    }
+    return 'Lo studio ORA è chiuso e non risulta una disponibilità nei prossimi giorni: invita il cliente a inviare la documentazione su questa chat o via email nel frattempo; sarà ricontattato appena possibile per un appuntamento.';
   }
   if (name === 'propose_booking') {
     const date = String(input?.date || '');

@@ -24162,6 +24162,62 @@ function formatAvailabilityIT(slots, maxDays = 4, maxPerDay = 3) {
   }
   return lines.join("\n");
 }
+function formatDateIT(ds) {
+  const day = parseInt(ds.slice(8, 10), 10), month = MONTH_IT[parseInt(ds.slice(5, 7), 10) - 1];
+  return `${day} ${month}`;
+}
+async function getNowStatus() {
+  const now = /* @__PURE__ */ new Date();
+  const todayISO = new Intl.DateTimeFormat("en-CA", { timeZone: TZ }).format(now);
+  const wd = new Intl.DateTimeFormat("en-US", { timeZone: TZ, weekday: "short" }).format(now);
+  const dow = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(wd);
+  const hour = parseInt(new Intl.DateTimeFormat("en-GB", { timeZone: TZ, hour: "2-digit", hour12: false }).format(now), 10);
+  const todaySlots = daySlots(todayISO, dow);
+  const isOpenNow = todaySlots.some((s) => hour >= parseInt(s.start.slice(0, 2), 10) && hour < parseInt(s.end.slice(0, 2), 10));
+  let freeNow = true;
+  let appointmentsRemainingToday = 0;
+  let calendarChecked = false;
+  const token = await getGoogleAccessToken();
+  if (token && isOpenNow && todaySlots.length) {
+    try {
+      const off = romeOffset(todayISO);
+      const last = todaySlots[todaySlots.length - 1];
+      const timeMax = `${todayISO}T${last.end}:00${off}`;
+      const resp = await fetch("https://www.googleapis.com/calendar/v3/freeBusy", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          timeMin: now.toISOString(),
+          timeMax,
+          timeZone: TZ,
+          items: [{ id: process.env.GOOGLE_CALENDAR_ID || "primary" }]
+        })
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        const cal = data.calendars?.[Object.keys(data.calendars || {})[0]];
+        const busy = cal?.busy || [];
+        calendarChecked = true;
+        appointmentsRemainingToday = busy.length;
+        const nowMs = now.getTime();
+        freeNow = !busy.some((b) => Date.parse(b.start) <= nowMs && Date.parse(b.end) > nowMs);
+      }
+    } catch (e) {
+      console.error("[Appuntamenti] getNowStatus freeBusy:", e);
+    }
+  }
+  let nextSlot = null;
+  if (!isOpenNow) {
+    const firstToday = todaySlots[0];
+    if (firstToday && hour < parseInt(firstToday.start.slice(0, 2), 10)) {
+      nextSlot = { date: todayISO, start: firstToday.start };
+    } else {
+      const { slots } = await getAvailability(60);
+      if (slots.length) nextSlot = { date: slots[0].date, start: slots[0].start };
+    }
+  }
+  return { isOpenNow, freeNow, appointmentsRemainingToday, nextSlot, calendarChecked };
+}
 var TZ, ESTIVO_UNICO_DA, ESTIVO_UNICO_A, CHIUSURA_DA, CHIUSURA_A, DOW_IT, MONTH_IT;
 var init_appointments = __esm({
   "server/appointments.ts"() {
@@ -25246,6 +25302,21 @@ ${txt}
 
 Slot con data esatta da usare in propose_booking (date=YYYY-MM-DD, start=HH:MM): ${iso}`;
   }
+  if (name === "check_walkin_now") {
+    out.appointmentFlow = true;
+    const s = await getNowStatus();
+    if (s.isOpenNow) {
+      if (s.freeNow) {
+        return "Lo studio \xE8 APERTO ora e il Dott. Branca \xE8 LIBERO: dai al cliente l'OK di passare subito. Aggiungi che, se comodo, pu\xF2 inviare fin da ora la documentazione su questa chat o via email, cos\xEC viene gi\xE0 valutata al suo arrivo.";
+      }
+      const impegni = s.appointmentsRemainingToday > 0 ? ` Risultano ${s.appointmentsRemainingToday} impegn${s.appointmentsRemainingToday === 1 ? "o" : "i"} in agenda prima di lui/lei oggi.` : "";
+      return `Lo studio \xE8 APERTO ora ma il Dott. Branca \xE8 IMPEGNATO: dai comunque l'OK di passare, ma avvisa che dovr\xE0 attendere.${impegni} Nel frattempo pu\xF2 inviare la documentazione su questa chat o via email per la valutazione.`;
+    }
+    if (s.nextSlot) {
+      return `Lo studio ORA \xE8 chiuso. NON spiegare il motivo della chiusura: comunica solo che prima di ${formatDateIT(s.nextSlot.date)} alle ${s.nextSlot.start} non \xE8 possibile incontrarsi. Nel frattempo pu\xF2 comunque inviare tutta la documentazione su questa chat o via email per una valutazione preliminare.`;
+    }
+    return "Lo studio ORA \xE8 chiuso e non risulta una disponibilit\xE0 nei prossimi giorni: invita il cliente a inviare la documentazione su questa chat o via email nel frattempo; sar\xE0 ricontattato appena possibile per un appuntamento.";
+  }
   if (name === "propose_booking") {
     const date = String(input?.date || "");
     const start = String(input?.start || "");
@@ -25672,6 +25743,18 @@ GESTIONE OPERATIVA:
   reali (incrocia gi\xE0 l'agenda Google e gli orari studio); quando il cliente sceglie uno slot
   chiama propose_booking; se in un secondo momento conferma di poter venire chiama
   confirm_appointment. Non serve l'approvazione dello studio per concordare data e ora.
+- RICHIESTA DI PASSARE SUBITO/ORA in studio (in autonomia, diverso da un appuntamento futuro:
+  "posso passare adesso/subito/in giornata?", NON "vorrei un appuntamento"): chiama SEMPRE
+  check_walkin_now (mai a intuito, sempre incrociando l'agenda reale e l'orario di lavoro) e
+  segui la sua indicazione:
+  \u2022 Se lo studio \xE8 aperto ORA e il Dott. Branca \xE8 libero \u2192 dai l'OK di passare subito.
+  \u2022 Se lo studio \xE8 aperto ma il Dott. Branca \xE8 impegnato \u2192 dai comunque l'OK di passare, ma
+    avvisa con garbo che dovr\xE0 attendere, indicando quanti impegni risultano prima di lui/lei.
+  \u2022 Se lo studio ORA \xE8 chiuso \u2192 NON spiegare il motivo della chiusura: comunica solo la prima
+    data/ora utile per incontrarsi (fornita dallo strumento), dicendo che prima di quella non \xE8
+    possibile.
+  In ogni caso aggiungi che, se vuole, pu\xF2 nel frattempo inviare tutta la documentazione su
+  questa chat o via email per una valutazione preliminare.
 - DOCUMENTI PRIMA DELL'INCONTRO: se l'appuntamento riguarda documenti da esaminare (atti o
   cartelle notificate, fatture, dichiarazioni, contratti, avvisi), CHIARISCI sempre che il
   cliente deve inviarli PRIMA dell'appuntamento: solo cos\xEC potranno essere visionati e poi
@@ -25766,6 +25849,11 @@ cliente: NIENTE analisi, premesse, ragionamenti o commenti tra parentesi.`;
           type: "object",
           properties: { days: { type: "integer", description: "Giorni avanti da considerare (default 14)" } }
         }
+      },
+      {
+        name: "check_walkin_now",
+        description: "Quando il cliente chiede di passare SUBITO/ORA/in giornata in studio (NON un appuntamento futuro): controlla se lo studio \xE8 aperto in questo momento, se il Dott. Branca \xE8 libero ADESSO, quanti impegni restano oggi prima che si liberi, e \u2014 se lo studio \xE8 chiuso ora \u2014 la prima data/ora utile. Per fissare un appuntamento futuro usa invece get_availability.",
+        input_schema: { type: "object", properties: {} }
       },
       {
         name: "propose_booking",

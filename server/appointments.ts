@@ -194,3 +194,86 @@ export function formatAvailabilityIT(slots: Slot[], maxDays = 4, maxPerDay = 3):
   }
   return lines.join('\n');
 }
+
+/** Data in italiano (senza giorno della settimana), es. "3 luglio". */
+export function formatDateIT(ds: string): string {
+  const day = parseInt(ds.slice(8, 10), 10), month = MONTH_IT[parseInt(ds.slice(5, 7), 10) - 1];
+  return `${day} ${month}`;
+}
+
+export interface NowStatus {
+  isOpenNow: boolean;
+  freeNow: boolean;
+  appointmentsRemainingToday: number;
+  nextSlot: { date: string; start: string } | null;
+  calendarChecked: boolean;
+}
+
+/**
+ * Stato "adesso" per le richieste di passare SUBITO in studio (non un appuntamento
+ * futuro): lo studio è aperto in questo momento? Il Dott. Branca è libero ADESSO?
+ * Quanti impegni restano oggi prima che si liberi? Se lo studio è chiuso ora, qual è
+ * la prima data/ora utile? Sempre incrociato con l'orario REALE dello studio
+ * (openWindow/isHoliday, le stesse regole di getAvailability) e con Google Calendar.
+ */
+export async function getNowStatus(): Promise<NowStatus> {
+  const now = new Date();
+  const todayISO = new Intl.DateTimeFormat('en-CA', { timeZone: TZ }).format(now);
+  const wd = new Intl.DateTimeFormat('en-US', { timeZone: TZ, weekday: 'short' }).format(now);
+  const dow = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(wd);
+  const hour = parseInt(new Intl.DateTimeFormat('en-GB', { timeZone: TZ, hour: '2-digit', hour12: false }).format(now), 10);
+
+  const todaySlots = daySlots(todayISO, dow);
+  const isOpenNow = todaySlots.some((s) => hour >= parseInt(s.start.slice(0, 2), 10) && hour < parseInt(s.end.slice(0, 2), 10));
+
+  let freeNow = true;
+  let appointmentsRemainingToday = 0;
+  let calendarChecked = false;
+
+  const token = await getGoogleAccessToken();
+  // Il freeBusy di "oggi" serve solo se lo studio è aperto ORA (freeNow/appointmentsRemainingToday
+  // non vengono letti dal chiamante quando isOpenNow è false — vedi runTool check_walkin_now).
+  if (token && isOpenNow && todaySlots.length) {
+    try {
+      const off = romeOffset(todayISO);
+      const last = todaySlots[todaySlots.length - 1];
+      const timeMax = `${todayISO}T${last.end}:00${off}`;
+      const resp = await fetch('https://www.googleapis.com/calendar/v3/freeBusy', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          timeMin: now.toISOString(),
+          timeMax,
+          timeZone: TZ,
+          items: [{ id: process.env.GOOGLE_CALENDAR_ID || 'primary' }],
+        }),
+      });
+      if (resp.ok) {
+        const data = await resp.json() as any;
+        const cal = data.calendars?.[Object.keys(data.calendars || {})[0]];
+        const busy = (cal?.busy || []) as { start: string; end: string }[];
+        calendarChecked = true;
+        appointmentsRemainingToday = busy.length;
+        const nowMs = now.getTime();
+        freeNow = !busy.some((b) => Date.parse(b.start) <= nowMs && Date.parse(b.end) > nowMs);
+      }
+    } catch (e) {
+      console.error('[Appuntamenti] getNowStatus freeBusy:', e);
+    }
+  }
+
+  let nextSlot: { date: string; start: string } | null = null;
+  if (!isOpenNow) {
+    const firstToday = todaySlots[0];
+    if (firstToday && hour < parseInt(firstToday.start.slice(0, 2), 10)) {
+      // Oggi apriamo più tardi: il prossimo slot utile è oggi stesso.
+      nextSlot = { date: todayISO, start: firstToday.start };
+    } else {
+      // Oggi è finito (o chiuso tutto il giorno): cerca il primo slot dei prossimi giorni.
+      const { slots } = await getAvailability(60);
+      if (slots.length) nextSlot = { date: slots[0].date, start: slots[0].start };
+    }
+  }
+
+  return { isOpenNow, freeNow, appointmentsRemainingToday, nextSlot, calendarChecked };
+}
