@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { Mail, UserCheck, UserX, Truck, RefreshCw, CheckCircle2, Inbox as InboxIcon, Settings2, X, Phone, Calendar, FileText, MessageSquare } from 'lucide-react';
+import { Mail, UserCheck, UserX, Truck, Scale, RefreshCw, CheckCircle2, Inbox as InboxIcon, Settings2, X, Phone, Calendar, FileText, MessageSquare } from 'lucide-react';
 import { getApiBase } from '../lib/queryClient';
 
 interface EmailRow {
@@ -20,7 +20,7 @@ interface EmailStatus {
   autoReply: boolean;
   lastPoll: { at: string; ok: boolean; stored: number; error?: string } | null;
 }
-interface ContactEntry { value: string; name: string | null; type: 'cliente' | 'fornitore' | 'ignorato'; phone: string | null; created_at: string }
+interface ContactEntry { value: string; name: string | null; type: 'cliente' | 'fornitore' | 'ignorato' | 'cgt'; phone: string | null; created_at: string }
 interface ContactProfile {
   contact: ContactEntry;
   appointments: { date: string; start: string; end: string | null; reason: string | null; status: string; created_at: string }[];
@@ -32,15 +32,17 @@ interface ContactProfile {
 const CATS: { key: string; label: string }[] = [
   { key: 'lavoro', label: 'Lavoro' },
   { key: 'fornitore', label: 'Fornitori' },
+  { key: 'commissione_tributaria', label: 'CGT' },
   { key: 'altro', label: 'Altro' },
   { key: 'automatica', label: 'Automatiche' },
   { key: 'ignorata', label: 'Ignorate' },
   { key: '', label: 'Tutte' },
 ];
 
-const RUBRICA_TABS: { key: 'cliente' | 'fornitore' | 'ignorato'; label: string; bg: string; fg: string }[] = [
+const RUBRICA_TABS: { key: 'cliente' | 'fornitore' | 'ignorato' | 'cgt'; label: string; bg: string; fg: string }[] = [
   { key: 'cliente', label: 'Clienti', bg: '#e8f5e9', fg: '#1b5e20' },
   { key: 'fornitore', label: 'Fornitori', bg: '#e3f2fd', fg: '#0d47a1' },
+  { key: 'cgt', label: 'Commissione Tributaria', bg: '#ede7f6', fg: '#4527a0' },
   { key: 'ignorato', label: 'Ignorati', bg: '#ffebee', fg: '#b71c1c' },
 ];
 
@@ -54,6 +56,7 @@ function fmtWhen(s: string): string {
 function catColor(c: string): { bg: string; fg: string } {
   if (c === 'lavoro') return { bg: '#e8f5e9', fg: '#1b5e20' };
   if (c === 'fornitore') return { bg: '#e3f2fd', fg: '#0d47a1' };
+  if (c === 'commissione_tributaria') return { bg: '#ede7f6', fg: '#4527a0' };
   if (c === 'automatica') return { bg: '#eceff1', fg: '#546e7a' };
   if (c === 'ignorata') return { bg: '#ffebee', fg: '#b71c1c' };
   return { bg: '#fff8e1', fg: '#8d6e00' };
@@ -63,7 +66,7 @@ export default function Email() {
   const qc = useQueryClient();
   const [cat, setCat] = useState('lavoro');
   const [showManage, setShowManage] = useState(false);
-  const [rubricaTab, setRubricaTab] = useState<'cliente' | 'fornitore' | 'ignorato'>('cliente');
+  const [rubricaTab, setRubricaTab] = useState<'cliente' | 'fornitore' | 'ignorato' | 'cgt'>('cliente');
   const [selected, setSelected] = useState<string | null>(null);
 
   const { data: status } = useQuery<EmailStatus>({
@@ -108,6 +111,10 @@ export default function Email() {
   });
   const markNotClient = useMutation({
     mutationFn: async (id: number) => (await fetch(`${getApiBase()}/api/emails/${id}/mark-not-client`, { method: 'POST' })).json(),
+    onSuccess: invalidateAll,
+  });
+  const markCGT = useMutation({
+    mutationFn: async (id: number) => (await fetch(`${getApiBase()}/api/emails/${id}/mark-cgt`, { method: 'POST' })).json(),
     onSuccess: invalidateAll,
   });
   const removeContact = useMutation({
@@ -304,6 +311,17 @@ export default function Email() {
                           border: '1px solid var(--border)', borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: 'pointer',
                         }}>
                         <Truck size={14} /> Fornitore
+                      </button>
+                    )}
+                    {m.category !== 'commissione_tributaria' && (
+                      <button onClick={() => markCGT.mutate(m.id)} disabled={markCGT.isPending}
+                        title="Da ricollegare a un procedimento (Commissione Tributaria / Corte di Giustizia Tributaria), anche se non è PEC"
+                        style={{
+                          display: 'flex', alignItems: 'center', gap: 5,
+                          padding: '6px 12px', background: 'var(--bg3)', color: '#4527a0',
+                          border: '1px solid var(--border)', borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: 'pointer',
+                        }}>
+                        <Scale size={14} /> Commissione Tributaria
                       </button>
                     )}
                     {m.category !== 'lavoro' && (

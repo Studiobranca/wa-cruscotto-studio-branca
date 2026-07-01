@@ -24953,7 +24953,7 @@ function setContactType(value, name, type) {
   if (!v) return { value: v, matchedPhone: null };
   const existing = db.prepare(`SELECT phone FROM email_contacts WHERE value = ?`).get(v);
   let phone = existing?.phone ?? null;
-  if (!phone && type !== "ignorato") {
+  if (!phone && type !== "ignorato" && type !== "cgt") {
     const m = autoMatchPhone(name);
     if (m) phone = m.phone;
   }
@@ -25023,7 +25023,7 @@ var init_contacts = __esm({
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     value TEXT UNIQUE NOT NULL,   -- indirizzo completo (mario@x.it) o dominio (@studioX.it)
     name TEXT,
-    type TEXT NOT NULL DEFAULT 'cliente',  -- cliente | fornitore | ignorato
+    type TEXT NOT NULL DEFAULT 'cliente',  -- cliente | fornitore | ignorato | cgt
     phone TEXT,                    -- numero WhatsApp collegato (auto o manuale), opzionale
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now'))
@@ -99836,6 +99836,7 @@ var email_exports = {};
 __export(email_exports, {
   getEmailStatus: () => getEmailStatus,
   getRecentEmails: () => getRecentEmails,
+  markEmailAsCGT: () => markEmailAsCGT,
   markEmailAsClient: () => markEmailAsClient,
   markEmailAsFornitore: () => markEmailAsFornitore,
   markEmailAsNotClient: () => markEmailAsNotClient,
@@ -99902,6 +99903,7 @@ function classify(subject, fromAddr, body) {
     if (known.type === "cliente") return "lavoro";
     if (known.type === "fornitore") return "fornitore";
     if (known.type === "ignorato") return "ignorata";
+    if (known.type === "cgt") return "commissione_tributaria";
   }
   if (isAutomatedSender(fromAddr)) return "automatica";
   const hay = `${subject} ${body}`.toLowerCase();
@@ -100166,6 +100168,9 @@ function markEmailAsFornitore(id) {
 function markEmailAsNotClient(id) {
   return markEmailAs(id, "ignorato");
 }
+function markEmailAsCGT(id) {
+  return markEmailAs(id, "cgt");
+}
 async function pollAll() {
   const accs = accounts();
   if (!accs.length) return;
@@ -100289,7 +100294,8 @@ var init_email = __esm({
     CATEGORY_OF_TYPE = {
       cliente: "lavoro",
       fornitore: "fornitore",
-      ignorato: "ignorata"
+      ignorato: "ignorata",
+      cgt: "commissione_tributaria"
     };
   }
 });
@@ -100653,7 +100659,7 @@ router.post("/contacts", async (req, res) => {
     const c = await Promise.resolve().then(() => (init_contacts(), contacts_exports));
     const { value, name, type } = req.body || {};
     if (!value) return res.status(400).json({ error: "value richiesto" });
-    const t = type === "fornitore" || type === "ignorato" ? type : "cliente";
+    const t = type === "fornitore" || type === "ignorato" || type === "cgt" ? type : "cliente";
     c.setContactType(String(value), name ? String(name) : void 0, t);
     res.json({ ok: true, contacts: c.listContacts() });
   } catch (e) {
@@ -100733,6 +100739,14 @@ router.post("/emails/:id/mark-not-client", async (req, res) => {
   try {
     const m = await Promise.resolve().then(() => (init_email(), email_exports));
     res.json({ ok: m.markEmailAsNotClient(parseInt(req.params.id, 10)) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+router.post("/emails/:id/mark-cgt", async (req, res) => {
+  try {
+    const m = await Promise.resolve().then(() => (init_email(), email_exports));
+    res.json({ ok: m.markEmailAsCGT(parseInt(req.params.id, 10)) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

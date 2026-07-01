@@ -140,6 +140,7 @@ function classify(subject: string, fromAddr: string, body: string): string {
     if (known.type === 'cliente') return 'lavoro';
     if (known.type === 'fornitore') return 'fornitore';
     if (known.type === 'ignorato') return 'ignorata';
+    if (known.type === 'cgt') return 'commissione_tributaria';
   }
   if (isAutomatedSender(fromAddr)) return 'automatica';
   const hay = `${subject} ${body}`.toLowerCase();
@@ -408,10 +409,10 @@ export function markEmailSeen(id: number): void {
 }
 
 const CATEGORY_OF_TYPE: Record<contacts.ContactType, string> = {
-  cliente: 'lavoro', fornitore: 'fornitore', ignorato: 'ignorata',
+  cliente: 'lavoro', fornitore: 'fornitore', ignorato: 'ignorata', cgt: 'commissione_tributaria',
 };
 
-/** Segna l'email (e il suo mittente) con un tipo di contatto (cliente/fornitore/ignorato):
+/** Segna l'email (e il suo mittente) con un tipo di contatto (cliente/fornitore/ignorato/cgt):
  *  aggiorna la rubrica (con raffronto WhatsApp per nome) e riclassifica le sue email. */
 function markEmailAs(id: number, type: contacts.ContactType): boolean {
   const row = db.prepare(`SELECT from_addr, from_name FROM incoming_emails WHERE id = ?`).get(id) as any;
@@ -426,6 +427,10 @@ function markEmailAs(id: number, type: contacts.ContactType): boolean {
 export function markEmailAsClient(id: number): boolean { return markEmailAs(id, 'cliente'); }
 export function markEmailAsFornitore(id: number): boolean { return markEmailAs(id, 'fornitore'); }
 export function markEmailAsNotClient(id: number): boolean { return markEmailAs(id, 'ignorato'); }
+/** Segna l'email come Commissione Tributaria/Corte di Giustizia Tributaria: da ricollegare
+ *  a un procedimento anche quando non arriva via PEC. Mai lavoro, mai auto-risposta
+ *  (category !== 'lavoro' esclude già l'auto-invio in maybeAutoReply). */
+export function markEmailAsCGT(id: number): boolean { return markEmailAs(id, 'cgt'); }
 
 async function pollAll(): Promise<void> {
   const accs = accounts();

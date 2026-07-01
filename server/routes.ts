@@ -122,7 +122,7 @@ router.post('/contacts', async (req: Request, res: Response) => {
     const c = await import('./contacts.js');
     const { value, name, type } = req.body || {};
     if (!value) return res.status(400).json({ error: 'value richiesto' });
-    const t = type === 'fornitore' || type === 'ignorato' ? type : 'cliente';
+    const t = type === 'fornitore' || type === 'ignorato' || type === 'cgt' ? type : 'cliente';
     c.setContactType(String(value), name ? String(name) : undefined, t);
     res.json({ ok: true, contacts: c.listContacts() });
   } catch (e: any) { res.status(500).json({ error: e.message }); }
@@ -172,6 +172,12 @@ router.post('/emails/:id/mark-fornitore', async (req: Request, res: Response) =>
 });
 router.post('/emails/:id/mark-not-client', async (req: Request, res: Response) => {
   try { const m = await import('./email.js'); res.json({ ok: m.markEmailAsNotClient(parseInt(req.params.id, 10)) }); }
+  catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+// Commissione Tributaria / Corte di Giustizia Tributaria: da ricollegare a un procedimento
+// anche quando l'email non arriva via PEC (mai lavoro, mai auto-risposta).
+router.post('/emails/:id/mark-cgt', async (req: Request, res: Response) => {
+  try { const m = await import('./email.js'); res.json({ ok: m.markEmailAsCGT(parseInt(req.params.id, 10)) }); }
   catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 

@@ -2,14 +2,17 @@
  * Rubrica unificata — Studio Tributario Branca
  *
  * Un contatto email (indirizzo o dominio) può essere marcato come CLIENTE,
- * FORNITORE o IGNORATO (pubblicità/estranei): la classificazione delle email
- * in arrivo (email.ts) usa questa rubrica come fonte di verità, prima di
- * ricadere sulle euristiche (mittenti automatici, parole chiave).
+ * FORNITORE, IGNORATO (pubblicità/estranei) o CGT (Commissione Tributaria/Corte
+ * di Giustizia Tributaria — corrispondenza da ricollegare a un procedimento,
+ * anche quando NON arriva via PEC): la classificazione delle email in arrivo
+ * (email.ts) usa questa rubrica come fonte di verità, prima di ricadere sulle
+ * euristiche (mittenti automatici, parole chiave).
  *
  * RAFFRONTO CON WHATSAPP: quando un contatto viene marcato cliente/fornitore,
  * si cerca in automatico una corrispondenza per nome tra le conversazioni
  * WhatsApp già attive, così la rubrica collega lo stesso cliente sui due
- * canali (telefono trovato in automatico, comunque editabile a mano).
+ * canali (telefono trovato in automatico, comunque editabile a mano). Non si
+ * cerca per i contatti ignorati o CGT (non hanno una controparte WhatsApp).
  *
  * SCHEDA CONTATTO (uso interno studio): getContactProfile() aggrega, per un
  * contatto, gli appuntamenti (bot_appointments), le note documenti
@@ -19,14 +22,14 @@
  */
 import { db } from './db.js';
 
-export type ContactType = 'cliente' | 'fornitore' | 'ignorato';
+export type ContactType = 'cliente' | 'fornitore' | 'ignorato' | 'cgt';
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS email_contacts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     value TEXT UNIQUE NOT NULL,   -- indirizzo completo (mario@x.it) o dominio (@studioX.it)
     name TEXT,
-    type TEXT NOT NULL DEFAULT 'cliente',  -- cliente | fornitore | ignorato
+    type TEXT NOT NULL DEFAULT 'cliente',  -- cliente | fornitore | ignorato | cgt
     phone TEXT,                    -- numero WhatsApp collegato (auto o manuale), opzionale
     created_at TEXT DEFAULT (datetime('now')),
     updated_at TEXT DEFAULT (datetime('now'))
@@ -75,15 +78,16 @@ export function autoMatchPhone(name: string | null | undefined): { phone: string
   } catch { return null; }
 }
 
-/** Imposta il tipo (cliente/fornitore/ignorato) per un indirizzo/dominio: crea o
+/** Imposta il tipo (cliente/fornitore/ignorato/cgt) per un indirizzo/dominio: crea o
  *  aggiorna la riga, e se cliente/fornitore prova ad agganciare un numero WhatsApp
- *  già noto (raffronto per nome) quando non c'è ancora un telefono collegato. */
+ *  già noto (raffronto per nome) quando non c'è ancora un telefono collegato.
+ *  Non cerca il numero per ignorato/cgt: non hanno una controparte WhatsApp cliente. */
 export function setContactType(value: string, name: string | null | undefined, type: ContactType): { value: string; matchedPhone: string | null } {
   const v = (value || '').trim().toLowerCase();
   if (!v) return { value: v, matchedPhone: null };
   const existing = db.prepare(`SELECT phone FROM email_contacts WHERE value = ?`).get(v) as any;
   let phone: string | null = existing?.phone ?? null;
-  if (!phone && type !== 'ignorato') {
+  if (!phone && type !== 'ignorato' && type !== 'cgt') {
     const m = autoMatchPhone(name);
     if (m) phone = m.phone;
   }
