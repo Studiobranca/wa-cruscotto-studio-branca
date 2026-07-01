@@ -286,7 +286,27 @@ async function pollAccount(acc: MailAccount): Promise<number> {
           const fromVal = (parsed.from as any)?.value?.[0] || {};
           const fromAddr = fromVal.address || '';
           const fromName = fromVal.name || fromAddr;
-          const text = (parsed.text || '').replace(/\s+/g, ' ').trim();
+          let text = (parsed.text || '').replace(/\s+/g, ' ').trim();
+
+          // Lettura automatica degli allegati (rev. 01/07/2026): prima venivano ignorati del
+          // tutto (si leggeva solo il testo del corpo). Analizza il primo allegato immagine/PDF
+          // (tipo di documento, mittente/ente, riferimenti visibili) e lo aggiunge al testo, così
+          // classificazione e risposta automatica tengono conto di cosa è stato ricevuto davvero.
+          const attachment = (parsed.attachments || []).find((a: any) =>
+            a.content && (/^image\/(jpeg|png|gif|webp)$/.test(a.contentType) || a.contentType === 'application/pdf'),
+          ) as any;
+          if (attachment) {
+            try {
+              const dv = await import('./docvision.js');
+              const desc = attachment.contentType === 'application/pdf'
+                ? await dv.analyzePdfBuffer(attachment.content as Buffer)
+                : await dv.analyzeImageBuffer(attachment.content as Buffer, attachment.contentType);
+              if (desc) text = `${text}\n\n[Allegato "${attachment.filename || 'documento'}"] analisi automatica: ${desc}`.trim();
+            } catch (e: any) {
+              console.error(`[DocVision] allegato ${acc.name}:`, e.message);
+            }
+          }
+
           const snippet = text.slice(0, 240);
           const category = classify(subject, fromAddr, text);
           // matched_client è un'etichetta "probabile cliente": solo i contatti di tipo

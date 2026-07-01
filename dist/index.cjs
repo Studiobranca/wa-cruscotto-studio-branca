@@ -24860,6 +24860,144 @@ var init_integrations = __esm({
   }
 });
 
+// server/contacts.ts
+var contacts_exports = {};
+__export(contacts_exports, {
+  autoMatchPhone: () => autoMatchPhone,
+  findContact: () => findContact,
+  getContactProfile: () => getContactProfile,
+  listContacts: () => listContacts,
+  removeContact: () => removeContact,
+  resolveIdentities: () => resolveIdentities,
+  setContactPhone: () => setContactPhone,
+  setContactType: () => setContactType
+});
+function listContacts(type) {
+  try {
+    if (type) return db.prepare(`SELECT value, name, type, phone, created_at FROM email_contacts WHERE type = ? ORDER BY value`).all(type);
+    return db.prepare(`SELECT value, name, type, phone, created_at FROM email_contacts ORDER BY type, value`).all();
+  } catch {
+    return [];
+  }
+}
+function autoMatchPhone(name) {
+  const n = (name || "").trim();
+  if (n.length < 4) return null;
+  try {
+    const row = db.prepare(
+      `SELECT phone, contact_name FROM conversations WHERE contact_name IS NOT NULL AND contact_name LIKE ? LIMIT 1`
+    ).get(`%${n}%`);
+    return row?.phone ? { phone: row.phone, contact_name: row.contact_name } : null;
+  } catch {
+    return null;
+  }
+}
+function setContactType(value, name, type) {
+  const v = (value || "").trim().toLowerCase();
+  if (!v) return { value: v, matchedPhone: null };
+  const existing = db.prepare(`SELECT phone FROM email_contacts WHERE value = ?`).get(v);
+  let phone = existing?.phone ?? null;
+  if (!phone && type !== "ignorato") {
+    const m = autoMatchPhone(name);
+    if (m) phone = m.phone;
+  }
+  db.prepare(`
+    INSERT INTO email_contacts (value, name, type, phone, updated_at) VALUES (?, ?, ?, ?, datetime('now'))
+    ON CONFLICT(value) DO UPDATE SET
+      type = excluded.type,
+      name = COALESCE(excluded.name, email_contacts.name),
+      phone = COALESCE(email_contacts.phone, excluded.phone),
+      updated_at = datetime('now')
+  `).run(v, name || null, type, phone);
+  return { value: v, matchedPhone: phone };
+}
+function removeContact(value) {
+  db.prepare(`DELETE FROM email_contacts WHERE value = ?`).run((value || "").trim().toLowerCase());
+}
+function setContactPhone(value, phone) {
+  db.prepare(`UPDATE email_contacts SET phone = ?, updated_at = datetime('now') WHERE value = ?`).run(phone && phone.trim() ? phone.trim() : null, (value || "").trim().toLowerCase());
+}
+function findContact(fromAddr) {
+  const f = (fromAddr || "").toLowerCase();
+  if (!f) return null;
+  const domain = "@" + (f.split("@")[1] || "");
+  try {
+    const row = db.prepare(`SELECT value, name, type, phone FROM email_contacts WHERE value = ? OR value = ? LIMIT 1`).get(f, domain);
+    return row || null;
+  } catch {
+    return null;
+  }
+}
+function resolveIdentities(key) {
+  if (key.startsWith("email:")) {
+    const email = key.slice("email:".length);
+    const row2 = db.prepare(`SELECT phone FROM email_contacts WHERE value = ?`).get(email);
+    return { phone: row2?.phone || null, email };
+  }
+  const row = db.prepare(`SELECT value FROM email_contacts WHERE phone = ? LIMIT 1`).get(key);
+  return { phone: key, email: row?.value || null };
+}
+function getContactProfile(value) {
+  const v = (value || "").trim().toLowerCase();
+  const contact = db.prepare(`SELECT value, name, type, phone, created_at FROM email_contacts WHERE value = ?`).get(v);
+  if (!contact) return null;
+  const emailKey = `email:${v}`;
+  const keys = contact.phone ? [contact.phone, emailKey] : [emailKey];
+  const placeholders = keys.map(() => "?").join(",");
+  const appointments = db.prepare(
+    `SELECT date, start, end, reason, status, created_at FROM bot_appointments WHERE phone IN (${placeholders}) ORDER BY date DESC, start DESC LIMIT 20`
+  ).all(...keys);
+  const docNotes = db.prepare(
+    `SELECT summary, created_at FROM bot_doc_notes WHERE phone IN (${placeholders}) ORDER BY created_at DESC LIMIT 20`
+  ).all(...keys);
+  const emailHistory = v.startsWith("@") ? db.prepare(`SELECT subject, snippet, email_date, category FROM incoming_emails WHERE lower(from_addr) LIKE ? ORDER BY email_date DESC LIMIT 20`).all(`%${v}`) : db.prepare(`SELECT subject, snippet, email_date, category FROM incoming_emails WHERE lower(from_addr) = ? ORDER BY email_date DESC LIMIT 20`).all(v);
+  let whatsapp = null;
+  if (contact.phone) {
+    const conv = db.prepare(`SELECT phone, contact_name, last_message, last_message_at, total_received, total_sent FROM conversations WHERE phone = ?`).get(contact.phone);
+    if (conv) whatsapp = conv;
+  }
+  return { contact, appointments, docNotes, emailHistory, whatsapp };
+}
+var init_contacts = __esm({
+  "server/contacts.ts"() {
+    "use strict";
+    init_db();
+    db.exec(`
+  CREATE TABLE IF NOT EXISTS email_contacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    value TEXT UNIQUE NOT NULL,   -- indirizzo completo (mario@x.it) o dominio (@studioX.it)
+    name TEXT,
+    type TEXT NOT NULL DEFAULT 'cliente',  -- cliente | fornitore | ignorato
+    phone TEXT,                    -- numero WhatsApp collegato (auto o manuale), opzionale
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_email_contacts_type ON email_contacts(type);
+`);
+    try {
+      const already = db.prepare(`SELECT COUNT(*) as c FROM email_contacts`).get();
+      if (already.c === 0) {
+        try {
+          const oldClients = db.prepare(`SELECT value, name FROM email_clients`).all();
+          for (const r of oldClients) {
+            db.prepare(`INSERT OR IGNORE INTO email_contacts (value, name, type) VALUES (?, ?, 'cliente')`).run(r.value, r.name || null);
+          }
+        } catch {
+        }
+        try {
+          const oldIgnored = db.prepare(`SELECT value, name FROM email_ignored`).all();
+          for (const r of oldIgnored) {
+            db.prepare(`INSERT OR IGNORE INTO email_contacts (value, name, type) VALUES (?, ?, 'ignorato')`).run(r.value, r.name || null);
+          }
+        } catch {
+        }
+      }
+    } catch (e) {
+      console.error("[Contatti] migrazione whitelist/blacklist:", e.message);
+    }
+  }
+});
+
 // server/chatbot.ts
 function recordDocNote(phone, summary) {
   db_default.prepare(`INSERT INTO bot_doc_notes (phone, summary) VALUES (?, ?)`).run(phone, summary);
@@ -25060,18 +25198,42 @@ async function runTool(name, input, out, phone) {
   if (name === "find_previous_requests") {
     const kws = String(input?.query || "").toLowerCase().split(/\s+/).filter((w) => w.length > 3).slice(0, 6);
     if (!kws.length) return "Nessun termine utile per la ricerca.";
-    const rows = db_default.prepare(`
-      SELECT content, timestamp FROM live_messages
-      WHERE phone = ? AND direction = 'received' AND content IS NOT NULL
-      ORDER BY timestamp DESC LIMIT 300
-    `).all(phone);
     const cutoff = Date.now() - 2 * 864e5;
-    const hits = rows.filter((r) => {
-      const t = Date.parse(r.timestamp);
-      return !isNaN(t) && t < cutoff && kws.some((k) => (r.content || "").toLowerCase().includes(k));
-    }).slice(0, 5);
-    if (!hits.length) return "Nessuna richiesta o documento simile inviato in passato dal cliente.";
-    return "Richieste/documenti SIMILI gi\xE0 inviati in passato (cita la data al cliente):\n" + hits.map((h) => `- ${(h.timestamp || "").slice(0, 10)}: "${(h.content || "").replace(/\n+/g, " ").slice(0, 90)}"`).join("\n");
+    const { phone: waPhone, email } = resolveIdentities(phone);
+    let waHits = [];
+    if (waPhone) {
+      const rows = db_default.prepare(`
+        SELECT content, timestamp FROM live_messages
+        WHERE phone = ? AND direction = 'received' AND content IS NOT NULL
+        ORDER BY timestamp DESC LIMIT 300
+      `).all(waPhone);
+      waHits = rows.filter((r) => {
+        const t = Date.parse(r.timestamp);
+        return !isNaN(t) && t < cutoff && kws.some((k) => (r.content || "").toLowerCase().includes(k));
+      }).slice(0, 5).map((r) => ({ data: (r.timestamp || "").slice(0, 10), testo: (r.content || "").replace(/\n+/g, " ").slice(0, 90) }));
+    }
+    let emailHits = [];
+    if (email) {
+      try {
+        const domain = "@" + (email.split("@")[1] || "");
+        const rows = db_default.prepare(`
+          SELECT subject, snippet, email_date FROM incoming_emails
+          WHERE (lower(from_addr) = ? OR lower(from_addr) LIKE ?) AND email_date IS NOT NULL
+          ORDER BY email_date DESC LIMIT 300
+        `).all(email, `%${domain}`);
+        emailHits = rows.filter((r) => {
+          const t = Date.parse(r.email_date);
+          const hay = `${r.subject || ""} ${r.snippet || ""}`.toLowerCase();
+          return !isNaN(t) && t < cutoff && kws.some((k) => hay.includes(k));
+        }).slice(0, 5).map((r) => ({ data: (r.email_date || "").slice(0, 10), testo: `${r.subject || ""} \u2014 ${(r.snippet || "").slice(0, 70)}` }));
+      } catch {
+      }
+    }
+    if (!waHits.length && !emailHits.length) return "Nessuna richiesta o documento simile inviato in passato dal cliente (n\xE9 su WhatsApp n\xE9 via email).";
+    const lines = [];
+    if (waHits.length) lines.push("Su WhatsApp:", ...waHits.map((h) => `- ${h.data}: "${h.testo}"`));
+    if (emailHits.length) lines.push("Via email:", ...emailHits.map((h) => `- ${h.data}: "${h.testo}"`));
+    return "Richieste/documenti SIMILI gi\xE0 inviati in passato (cita la data e il canale al cliente):\n" + lines.join("\n");
   }
   if (name === "get_availability") {
     out.appointmentFlow = true;
@@ -25413,6 +25575,7 @@ var init_chatbot = __esm({
     init_zapi();
     init_integrations();
     init_sse();
+    init_contacts();
     ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
     ANTHROPIC_VERSION = "2023-06-01";
     DEFAULT_MODEL = "claude-sonnet-4-6";
@@ -25535,12 +25698,32 @@ GESTIONE OPERATIVA:
   \u2022 settembre 2026: di nuovo orario STANDARD.
   MAI sabato e domenica, MAI feste comandate. In ogni caso fidati SEMPRE degli slot reali di
   get_availability (incrocia gi\xE0 l'agenda Google del Dott. Branca).
-- CONTROLLO DUPLICATI (obbligatorio): prima di rispondere a una richiesta o a un invio di
-  documenti, chiama find_previous_requests per verificare se il cliente aveva GI\xC0 inviato lo
-  stesso documento o fatto la stessa richiesta. Se s\xEC, faglielo presente con garbo citando
-  la data (es. "risulta che ci aveva gi\xE0 inviato ... in data ...").
-- Documenti/foto ricevuti: conferma la ricezione, indica di cosa si tratta se riconoscibile,
-  e dai un primo inquadramento tecnico utile; precisa che verranno esaminati in dettaglio.
+- ANALISI DEL DOCUMENTO RICEVUTO (obbligatorio, PRIMA di rispondere \u2014 mai risposte generiche):
+  se nel messaggio pi\xF9 recente compare "\u{1F4C4} Documento ricevuto ... \u2014 analisi automatica: ..."
+  (foto WhatsApp) oppure, per le email, "[Allegato "..."] analisi automatica: ...", quella \xE8
+  una descrizione GI\xC0 FATTA in automatico di cosa contiene la foto/allegato \u2014 LEGGILA prima di
+  scrivere la risposta, \xE8 la base per capire di che documento si tratta. \xC8 un'estrazione
+  automatica (pu\xF2 essere incompleta o imprecisa su un documento sfocato/parziale): valgono su
+  di essa gli stessi LIMITI DI ACCURATEZZA sopra, non darla mai per certa al 100% n\xE9 citarla al
+  cliente come fosse una tua lettura infallibile.
+  1. VERIFICA LA CORRISPONDENZA: la richiesta del cliente riguarda proprio il documento appena
+     arrivato, o \xE8 il completamento di una pratica aperta in precedenza (appuntamento gi\xE0
+     fissato, ricorso in corso, documento gi\xE0 chiesto)? Usa lo STORICO PRECEDENTE per capirlo.
+  2. Se trovi corrispondenza chiara: rispondi nel merito citando cosa hai riconosciuto (tipo di
+     atto, mittente/ente) SENZA calcolare importi/scadenze specifiche (resta il limite sopra).
+  3. Se NON trovi corrispondenza, o non capisci a cosa si riferisce il documento o la richiesta
+     (es. un allegato isolato senza spiegazione, o un messaggio breve tipo "quello che ti avevo
+     detto"): chiama SEMPRE find_previous_requests \u2014 cerca sia su WhatsApp sia sulle email
+     collegate dello stesso cliente (raffronto multi-canale) \u2014 per ricostruire il contesto PRIMA
+     di rispondere. Non limitarti a "l'abbiamo ricevuto, lo esamineremo" senza averci provato.
+  4. Se dopo la ricerca resta poco chiaro: o chiedi con garbo al cliente di INTEGRARE la
+     documentazione/spiegare a cosa si riferisce (indica in modo specifico cosa manca, non in
+     modo generico), oppure \u2014 se il tema richiede comunque un confronto diretto \u2014 proponi un
+     appuntamento (gestione agenda sopra: SEMPRE confrontandoti con orari studio e agenda reale
+     via get_availability, mai a caso).
+  5. Se resti in dubbio anche dopo aver cercato e chiesto, o la situazione ha margini di rischio
+     (termini che potrebbero gi\xE0 decorrere, atto che non riesci a inquadrare con certezza):
+     chiama need_human, non indovinare.
 
 URGENZE (cartella esattoriale, avviso di accertamento, atto notificato con termini in
 decorrenza, udienza, pignoramento): chiama need_human per allertare il Dott. Branca, MA
@@ -25643,7 +25826,7 @@ cliente: NIENTE analisi, premesse, ragionamenti o commenti tra parentesi.`;
       },
       {
         name: "find_previous_requests",
-        description: "Cerca nello storico dei messaggi del cliente se aveva gi\xE0 inviato lo stesso documento o fatto la stessa richiesta in passato. Usalo SEMPRE prima di rispondere a una richiesta/invio documenti.",
+        description: "Cerca nello storico SIA dei messaggi WhatsApp SIA delle email collegate allo stesso cliente (raffronto multi-canale) se aveva gi\xE0 inviato lo stesso documento o fatto la stessa richiesta in passato. Usalo SEMPRE prima di rispondere a una richiesta/invio documenti, e SEMPRE quando non capisci a cosa si riferisce un documento o una richiesta.",
         input_schema: {
           type: "object",
           properties: { query: { type: "string", description: 'Parole chiave della richiesta/documento (es. "dichiarazione redditi", "visura", "f24")' } },
@@ -99486,131 +99669,77 @@ var require_nodemailer = __commonJS({
   }
 });
 
-// server/contacts.ts
-var contacts_exports = {};
-__export(contacts_exports, {
-  autoMatchPhone: () => autoMatchPhone,
-  findContact: () => findContact,
-  getContactProfile: () => getContactProfile,
-  listContacts: () => listContacts,
-  removeContact: () => removeContact,
-  setContactPhone: () => setContactPhone,
-  setContactType: () => setContactType
+// server/docvision.ts
+var docvision_exports = {};
+__export(docvision_exports, {
+  analyzeImageBuffer: () => analyzeImageBuffer,
+  analyzeImageUrl: () => analyzeImageUrl,
+  analyzePdfBuffer: () => analyzePdfBuffer
 });
-function listContacts(type) {
+async function callVision(contentBlock) {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return null;
   try {
-    if (type) return db.prepare(`SELECT value, name, type, phone, created_at FROM email_contacts WHERE type = ? ORDER BY value`).all(type);
-    return db.prepare(`SELECT value, name, type, phone, created_at FROM email_contacts ORDER BY type, value`).all();
-  } catch {
-    return [];
-  }
-}
-function autoMatchPhone(name) {
-  const n = (name || "").trim();
-  if (n.length < 4) return null;
-  try {
-    const row = db.prepare(
-      `SELECT phone, contact_name FROM conversations WHERE contact_name IS NOT NULL AND contact_name LIKE ? LIMIT 1`
-    ).get(`%${n}%`);
-    return row?.phone ? { phone: row.phone, contact_name: row.contact_name } : null;
-  } catch {
-    return null;
-  }
-}
-function setContactType(value, name, type) {
-  const v = (value || "").trim().toLowerCase();
-  if (!v) return { value: v, matchedPhone: null };
-  const existing = db.prepare(`SELECT phone FROM email_contacts WHERE value = ?`).get(v);
-  let phone = existing?.phone ?? null;
-  if (!phone && type !== "ignorato") {
-    const m = autoMatchPhone(name);
-    if (m) phone = m.phone;
-  }
-  db.prepare(`
-    INSERT INTO email_contacts (value, name, type, phone, updated_at) VALUES (?, ?, ?, ?, datetime('now'))
-    ON CONFLICT(value) DO UPDATE SET
-      type = excluded.type,
-      name = COALESCE(excluded.name, email_contacts.name),
-      phone = COALESCE(email_contacts.phone, excluded.phone),
-      updated_at = datetime('now')
-  `).run(v, name || null, type, phone);
-  return { value: v, matchedPhone: phone };
-}
-function removeContact(value) {
-  db.prepare(`DELETE FROM email_contacts WHERE value = ?`).run((value || "").trim().toLowerCase());
-}
-function setContactPhone(value, phone) {
-  db.prepare(`UPDATE email_contacts SET phone = ?, updated_at = datetime('now') WHERE value = ?`).run(phone && phone.trim() ? phone.trim() : null, (value || "").trim().toLowerCase());
-}
-function findContact(fromAddr) {
-  const f = (fromAddr || "").toLowerCase();
-  if (!f) return null;
-  const domain = "@" + (f.split("@")[1] || "");
-  try {
-    const row = db.prepare(`SELECT value, name, type, phone FROM email_contacts WHERE value = ? OR value = ? LIMIT 1`).get(f, domain);
-    return row || null;
-  } catch {
-    return null;
-  }
-}
-function getContactProfile(value) {
-  const v = (value || "").trim().toLowerCase();
-  const contact = db.prepare(`SELECT value, name, type, phone, created_at FROM email_contacts WHERE value = ?`).get(v);
-  if (!contact) return null;
-  const emailKey = `email:${v}`;
-  const keys = contact.phone ? [contact.phone, emailKey] : [emailKey];
-  const placeholders = keys.map(() => "?").join(",");
-  const appointments = db.prepare(
-    `SELECT date, start, end, reason, status, created_at FROM bot_appointments WHERE phone IN (${placeholders}) ORDER BY date DESC, start DESC LIMIT 20`
-  ).all(...keys);
-  const docNotes = db.prepare(
-    `SELECT summary, created_at FROM bot_doc_notes WHERE phone IN (${placeholders}) ORDER BY created_at DESC LIMIT 20`
-  ).all(...keys);
-  const emailHistory = v.startsWith("@") ? db.prepare(`SELECT subject, snippet, email_date, category FROM incoming_emails WHERE lower(from_addr) LIKE ? ORDER BY email_date DESC LIMIT 20`).all(`%${v}`) : db.prepare(`SELECT subject, snippet, email_date, category FROM incoming_emails WHERE lower(from_addr) = ? ORDER BY email_date DESC LIMIT 20`).all(v);
-  let whatsapp = null;
-  if (contact.phone) {
-    const conv = db.prepare(`SELECT phone, contact_name, last_message, last_message_at, total_received, total_sent FROM conversations WHERE phone = ?`).get(contact.phone);
-    if (conv) whatsapp = conv;
-  }
-  return { contact, appointments, docNotes, emailHistory, whatsapp };
-}
-var init_contacts = __esm({
-  "server/contacts.ts"() {
-    "use strict";
-    init_db();
-    db.exec(`
-  CREATE TABLE IF NOT EXISTS email_contacts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    value TEXT UNIQUE NOT NULL,   -- indirizzo completo (mario@x.it) o dominio (@studioX.it)
-    name TEXT,
-    type TEXT NOT NULL DEFAULT 'cliente',  -- cliente | fornitore | ignorato
-    phone TEXT,                    -- numero WhatsApp collegato (auto o manuale), opzionale
-    created_at TEXT DEFAULT (datetime('now')),
-    updated_at TEXT DEFAULT (datetime('now'))
-  );
-  CREATE INDEX IF NOT EXISTS idx_email_contacts_type ON email_contacts(type);
-`);
-    try {
-      const already = db.prepare(`SELECT COUNT(*) as c FROM email_contacts`).get();
-      if (already.c === 0) {
-        try {
-          const oldClients = db.prepare(`SELECT value, name FROM email_clients`).all();
-          for (const r of oldClients) {
-            db.prepare(`INSERT OR IGNORE INTO email_contacts (value, name, type) VALUES (?, ?, 'cliente')`).run(r.value, r.name || null);
-          }
-        } catch {
-        }
-        try {
-          const oldIgnored = db.prepare(`SELECT value, name FROM email_ignored`).all();
-          for (const r of oldIgnored) {
-            db.prepare(`INSERT OR IGNORE INTO email_contacts (value, name, type) VALUES (?, ?, 'ignorato')`).run(r.value, r.name || null);
-          }
-        } catch {
-        }
-      }
-    } catch (e) {
-      console.error("[Contatti] migrazione whitelist/blacklist:", e.message);
+    const resp = await fetch(ANTHROPIC_URL2, {
+      method: "POST",
+      headers: { "x-api-key": apiKey, "anthropic-version": ANTHROPIC_VERSION2, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: VISION_MODEL,
+        max_tokens: 300,
+        messages: [{ role: "user", content: [contentBlock, { type: "text", text: DOC_PROMPT }] }]
+      })
+    });
+    if (!resp.ok) {
+      console.error("[DocVision] Anthropic HTTP", resp.status, (await resp.text()).slice(0, 200));
+      return null;
     }
+    const data = await resp.json();
+    const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("").trim();
+    return text || null;
+  } catch (e) {
+    console.error("[DocVision] errore chiamata:", e.message);
+    return null;
+  }
+}
+async function analyzeImageUrl(url) {
+  try {
+    const resp = await fetch(url);
+    if (!resp.ok) return null;
+    const buf = Buffer.from(await resp.arrayBuffer());
+    if (buf.length > MAX_BYTES) return null;
+    const mediaType = (resp.headers.get("content-type") || "").split(";")[0].trim() || "image/jpeg";
+    if (!SUPPORTED_IMAGE.test(mediaType)) return null;
+    return await callVision({ type: "image", source: { type: "base64", media_type: mediaType, data: buf.toString("base64") } });
+  } catch (e) {
+    console.error("[DocVision] fetch immagine WhatsApp:", e.message);
+    return null;
+  }
+}
+async function analyzeImageBuffer(buf, mediaType) {
+  if (buf.length > MAX_BYTES || !SUPPORTED_IMAGE.test(mediaType)) return null;
+  return callVision({ type: "image", source: { type: "base64", media_type: mediaType, data: buf.toString("base64") } });
+}
+async function analyzePdfBuffer(buf) {
+  if (buf.length > MAX_BYTES) return null;
+  return callVision({ type: "document", source: { type: "base64", media_type: "application/pdf", data: buf.toString("base64") } });
+}
+var ANTHROPIC_URL2, ANTHROPIC_VERSION2, VISION_MODEL, MAX_BYTES, DOC_PROMPT, SUPPORTED_IMAGE;
+var init_docvision = __esm({
+  "server/docvision.ts"() {
+    "use strict";
+    ANTHROPIC_URL2 = "https://api.anthropic.com/v1/messages";
+    ANTHROPIC_VERSION2 = "2023-06-01";
+    VISION_MODEL = "claude-haiku-4-5-20251001";
+    MAX_BYTES = 8 * 1024 * 1024;
+    DOC_PROMPT = `Analizza questo documento (foto o scansione) inviato da un cliente allo Studio Tributario Branca.
+Riporta in 3-5 righe SOLO ci\xF2 che \xE8 chiaramente leggibile nel documento:
+- Tipo di documento (es. cartella esattoriale, avviso di accertamento, F24, fattura, contratto, busta paga, sentenza, PEC, altro).
+- Ente/mittente indicato, se visibile.
+- Riferimenti principali visibili: numero atto/protocollo, data del documento, oggetto.
+NON calcolare n\xE9 dedurre importi, scadenze o conseguenze legali: riporta SOLO ci\xF2 che leggi testualmente.
+Se il documento \xE8 illeggibile, sfocato, o non \xE8 un documento di lavoro (es. una foto personale), dillo chiaramente in una riga.
+Output: SOLO la descrizione, nessuna premessa n\xE9 commento.`;
+    SUPPORTED_IMAGE = /^image\/(jpeg|png|gif|webp)$/;
   }
 });
 
@@ -99828,7 +99957,21 @@ async function pollAccount(acc) {
           const fromVal = parsed.from?.value?.[0] || {};
           const fromAddr = fromVal.address || "";
           const fromName = fromVal.name || fromAddr;
-          const text = (parsed.text || "").replace(/\s+/g, " ").trim();
+          let text = (parsed.text || "").replace(/\s+/g, " ").trim();
+          const attachment = (parsed.attachments || []).find(
+            (a) => a.content && (/^image\/(jpeg|png|gif|webp)$/.test(a.contentType) || a.contentType === "application/pdf")
+          );
+          if (attachment) {
+            try {
+              const dv = await Promise.resolve().then(() => (init_docvision(), docvision_exports));
+              const desc = attachment.contentType === "application/pdf" ? await dv.analyzePdfBuffer(attachment.content) : await dv.analyzeImageBuffer(attachment.content, attachment.contentType);
+              if (desc) text = `${text}
+
+[Allegato "${attachment.filename || "documento"}"] analisi automatica: ${desc}`.trim();
+            } catch (e) {
+              console.error(`[DocVision] allegato ${acc.name}:`, e.message);
+            }
+          }
           const snippet = text.slice(0, 240);
           const category = classify(subject, fromAddr, text);
           const knownContact = findContact(fromAddr);
@@ -100923,6 +101066,17 @@ router.post("/webhook/message", async (req, res) => {
     if (isImage) content = caption ? `[Immagine: ${caption}]` : "[Immagine]";
     else if (isAudio) content = "[Messaggio vocale \u{1F3A4}]";
     else content = text || "";
+    if (isImage && imageUrl && !fromMe) {
+      try {
+        const { analyzeImageUrl: analyzeImageUrl2 } = await Promise.resolve().then(() => (init_docvision(), docvision_exports));
+        const desc = await analyzeImageUrl2(imageUrl);
+        if (desc) {
+          content = `\u{1F4C4} Documento ricevuto${caption ? ` (didascalia cliente: "${caption}")` : ""} \u2014 analisi automatica: ${desc}`;
+        }
+      } catch (e) {
+        console.error("[DocVision] webhook immagine:", e.message);
+      }
+    }
     const deepgramKey = process.env.DEEPGRAM_API_KEY;
     if (isAudio && audioUrl && deepgramKey) {
       try {

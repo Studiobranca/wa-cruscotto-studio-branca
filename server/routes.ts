@@ -690,6 +690,22 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
     else if (isAudio) content = '[Messaggio vocale 🎤]';
     else content = text || '';
 
+    // Lettura automatica del documento (rev. 01/07/2026): prima il bot vedeva solo un
+    // segnaposto "[Immagine]" e rispondeva in modo generico. Ora analizza la foto (tipo di
+    // documento, mittente/ente, riferimenti visibili) così la risposta può essere pertinente
+    // a quanto ricevuto. Isolato: se l'analisi fallisce, resta il segnaposto testuale.
+    if (isImage && imageUrl && !fromMe) {
+      try {
+        const { analyzeImageUrl } = await import('./docvision.js');
+        const desc = await analyzeImageUrl(imageUrl);
+        if (desc) {
+          content = `📄 Documento ricevuto${caption ? ` (didascalia cliente: "${caption}")` : ''} — analisi automatica: ${desc}`;
+        }
+      } catch (e: any) {
+        console.error('[DocVision] webhook immagine:', e.message);
+      }
+    }
+
     // Trascrizione Deepgram (richiede DEEPGRAM_API_KEY env var)
     const deepgramKey = process.env.DEEPGRAM_API_KEY;
     if (isAudio && audioUrl && deepgramKey) {

@@ -15,6 +15,7 @@ import { getAvailability, formatAvailabilityIT, isSlotBusy } from './appointment
 import { sendTextMessage } from './zapi.js';
 import { createCalendarEvent, updateCalendarEvent, appendEventDescription } from './integrations.js';
 import { broadcastEvent } from './sse.js';
+import { resolveIdentities } from './contacts.js';
 
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
 const ANTHROPIC_VERSION = '2023-06-01';
@@ -362,12 +363,32 @@ GESTIONE OPERATIVA:
   • settembre 2026: di nuovo orario STANDARD.
   MAI sabato e domenica, MAI feste comandate. In ogni caso fidati SEMPRE degli slot reali di
   get_availability (incrocia già l'agenda Google del Dott. Branca).
-- CONTROLLO DUPLICATI (obbligatorio): prima di rispondere a una richiesta o a un invio di
-  documenti, chiama find_previous_requests per verificare se il cliente aveva GIÀ inviato lo
-  stesso documento o fatto la stessa richiesta. Se sì, faglielo presente con garbo citando
-  la data (es. "risulta che ci aveva già inviato ... in data ...").
-- Documenti/foto ricevuti: conferma la ricezione, indica di cosa si tratta se riconoscibile,
-  e dai un primo inquadramento tecnico utile; precisa che verranno esaminati in dettaglio.
+- ANALISI DEL DOCUMENTO RICEVUTO (obbligatorio, PRIMA di rispondere — mai risposte generiche):
+  se nel messaggio più recente compare "📄 Documento ricevuto ... — analisi automatica: ..."
+  (foto WhatsApp) oppure, per le email, "[Allegato "..."] analisi automatica: ...", quella è
+  una descrizione GIÀ FATTA in automatico di cosa contiene la foto/allegato — LEGGILA prima di
+  scrivere la risposta, è la base per capire di che documento si tratta. È un'estrazione
+  automatica (può essere incompleta o imprecisa su un documento sfocato/parziale): valgono su
+  di essa gli stessi LIMITI DI ACCURATEZZA sopra, non darla mai per certa al 100% né citarla al
+  cliente come fosse una tua lettura infallibile.
+  1. VERIFICA LA CORRISPONDENZA: la richiesta del cliente riguarda proprio il documento appena
+     arrivato, o è il completamento di una pratica aperta in precedenza (appuntamento già
+     fissato, ricorso in corso, documento già chiesto)? Usa lo STORICO PRECEDENTE per capirlo.
+  2. Se trovi corrispondenza chiara: rispondi nel merito citando cosa hai riconosciuto (tipo di
+     atto, mittente/ente) SENZA calcolare importi/scadenze specifiche (resta il limite sopra).
+  3. Se NON trovi corrispondenza, o non capisci a cosa si riferisce il documento o la richiesta
+     (es. un allegato isolato senza spiegazione, o un messaggio breve tipo "quello che ti avevo
+     detto"): chiama SEMPRE find_previous_requests — cerca sia su WhatsApp sia sulle email
+     collegate dello stesso cliente (raffronto multi-canale) — per ricostruire il contesto PRIMA
+     di rispondere. Non limitarti a "l'abbiamo ricevuto, lo esamineremo" senza averci provato.
+  4. Se dopo la ricerca resta poco chiaro: o chiedi con garbo al cliente di INTEGRARE la
+     documentazione/spiegare a cosa si riferisce (indica in modo specifico cosa manca, non in
+     modo generico), oppure — se il tema richiede comunque un confronto diretto — proponi un
+     appuntamento (gestione agenda sopra: SEMPRE confrontandoti con orari studio e agenda reale
+     via get_availability, mai a caso).
+  5. Se resti in dubbio anche dopo aver cercato e chiesto, o la situazione ha margini di rischio
+     (termini che potrebbero già decorrere, atto che non riesci a inquadrare con certezza):
+     chiama need_human, non indovinare.
 
 URGENZE (cartella esattoriale, avviso di accertamento, atto notificato con termini in
 decorrenza, udienza, pignoramento): chiama need_human per allertare il Dott. Branca, MA
@@ -471,7 +492,7 @@ const TOOLS = [
   },
   {
     name: 'find_previous_requests',
-    description: 'Cerca nello storico dei messaggi del cliente se aveva già inviato lo stesso documento o fatto la stessa richiesta in passato. Usalo SEMPRE prima di rispondere a una richiesta/invio documenti.',
+    description: 'Cerca nello storico SIA dei messaggi WhatsApp SIA delle email collegate allo stesso cliente (raffronto multi-canale) se aveva già inviato lo stesso documento o fatto la stessa richiesta in passato. Usalo SEMPRE prima di rispondere a una richiesta/invio documenti, e SEMPRE quando non capisci a cosa si riferisce un documento o una richiesta.',
     input_schema: {
       type: 'object',
       properties: { query: { type: 'string', description: 'Parole chiave della richiesta/documento (es. "dichiarazione redditi", "visura", "f24")' } },
@@ -560,19 +581,48 @@ async function runTool(name: string, input: any, out: DraftResult, phone: string
   if (name === 'find_previous_requests') {
     const kws = String(input?.query || '').toLowerCase().split(/\s+/).filter((w) => w.length > 3).slice(0, 6);
     if (!kws.length) return 'Nessun termine utile per la ricerca.';
-    const rows = db.prepare(`
-      SELECT content, timestamp FROM live_messages
-      WHERE phone = ? AND direction = 'received' AND content IS NOT NULL
-      ORDER BY timestamp DESC LIMIT 300
-    `).all(phone) as any[];
     const cutoff = Date.now() - 2 * 86400000; // ignora le ultime 48h (conversazione corrente)
-    const hits = rows.filter((r) => {
-      const t = Date.parse(r.timestamp);
-      return !isNaN(t) && t < cutoff && kws.some((k) => (r.content || '').toLowerCase().includes(k));
-    }).slice(0, 5);
-    if (!hits.length) return 'Nessuna richiesta o documento simile inviato in passato dal cliente.';
-    return 'Richieste/documenti SIMILI già inviati in passato (cita la data al cliente):\n' +
-      hits.map((h) => `- ${(h.timestamp || '').slice(0, 10)}: "${(h.content || '').replace(/\n+/g, ' ').slice(0, 90)}"`).join('\n');
+
+    // Cerca sia su WhatsApp SIA sulle email collegate in rubrica allo stesso cliente
+    // (raffronto multi-canale): il cliente potrebbe aver scritto un messaggio ora ma aver
+    // già inviato lo stesso documento per email tempo fa, o viceversa.
+    const { phone: waPhone, email } = resolveIdentities(phone);
+
+    let waHits: { data: string; testo: string }[] = [];
+    if (waPhone) {
+      const rows = db.prepare(`
+        SELECT content, timestamp FROM live_messages
+        WHERE phone = ? AND direction = 'received' AND content IS NOT NULL
+        ORDER BY timestamp DESC LIMIT 300
+      `).all(waPhone) as any[];
+      waHits = rows.filter((r) => {
+        const t = Date.parse(r.timestamp);
+        return !isNaN(t) && t < cutoff && kws.some((k) => (r.content || '').toLowerCase().includes(k));
+      }).slice(0, 5).map((r) => ({ data: (r.timestamp || '').slice(0, 10), testo: (r.content || '').replace(/\n+/g, ' ').slice(0, 90) }));
+    }
+
+    let emailHits: { data: string; testo: string }[] = [];
+    if (email) {
+      try {
+        const domain = '@' + (email.split('@')[1] || '');
+        const rows = db.prepare(`
+          SELECT subject, snippet, email_date FROM incoming_emails
+          WHERE (lower(from_addr) = ? OR lower(from_addr) LIKE ?) AND email_date IS NOT NULL
+          ORDER BY email_date DESC LIMIT 300
+        `).all(email, `%${domain}`) as any[];
+        emailHits = rows.filter((r) => {
+          const t = Date.parse(r.email_date);
+          const hay = `${r.subject || ''} ${r.snippet || ''}`.toLowerCase();
+          return !isNaN(t) && t < cutoff && kws.some((k) => hay.includes(k));
+        }).slice(0, 5).map((r) => ({ data: (r.email_date || '').slice(0, 10), testo: `${r.subject || ''} — ${(r.snippet || '').slice(0, 70)}` }));
+      } catch { /* tabella email non disponibile: non bloccare la ricerca WhatsApp */ }
+    }
+
+    if (!waHits.length && !emailHits.length) return 'Nessuna richiesta o documento simile inviato in passato dal cliente (né su WhatsApp né via email).';
+    const lines: string[] = [];
+    if (waHits.length) lines.push('Su WhatsApp:', ...waHits.map((h) => `- ${h.data}: "${h.testo}"`));
+    if (emailHits.length) lines.push('Via email:', ...emailHits.map((h) => `- ${h.data}: "${h.testo}"`));
+    return 'Richieste/documenti SIMILI già inviati in passato (cita la data e il canale al cliente):\n' + lines.join('\n');
   }
   if (name === 'get_availability') {
     out.appointmentFlow = true;

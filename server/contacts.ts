@@ -118,6 +118,19 @@ export function findContact(fromAddr: string): { value: string; name: string | n
   } catch { return null; }
 }
 
+/** Dato un identificativo (telefono WhatsApp o "email:indirizzo"), risolve l'ALTRO canale
+ *  eventualmente collegato in rubrica. Usato per cercare corrispondenza tra vecchie email e
+ *  vecchi messaggi WhatsApp dello stesso cliente, a prescindere dal canale con cui scrive ora. */
+export function resolveIdentities(key: string): { phone: string | null; email: string | null } {
+  if (key.startsWith('email:')) {
+    const email = key.slice('email:'.length);
+    const row = db.prepare(`SELECT phone FROM email_contacts WHERE value = ?`).get(email) as any;
+    return { phone: row?.phone || null, email };
+  }
+  const row = db.prepare(`SELECT value FROM email_contacts WHERE phone = ? LIMIT 1`).get(key) as any;
+  return { phone: key, email: row?.value || null };
+}
+
 /** Scheda contatto: aggrega appuntamenti, note documenti, cronologia email e WhatsApp. */
 export function getContactProfile(value: string): any {
   const v = (value || '').trim().toLowerCase();
