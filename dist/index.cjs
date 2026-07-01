@@ -99486,20 +99486,143 @@ var require_nodemailer = __commonJS({
   }
 });
 
+// server/contacts.ts
+var contacts_exports = {};
+__export(contacts_exports, {
+  autoMatchPhone: () => autoMatchPhone,
+  findContact: () => findContact,
+  getContactProfile: () => getContactProfile,
+  listContacts: () => listContacts,
+  removeContact: () => removeContact,
+  setContactPhone: () => setContactPhone,
+  setContactType: () => setContactType
+});
+function listContacts(type) {
+  try {
+    if (type) return db.prepare(`SELECT value, name, type, phone, created_at FROM email_contacts WHERE type = ? ORDER BY value`).all(type);
+    return db.prepare(`SELECT value, name, type, phone, created_at FROM email_contacts ORDER BY type, value`).all();
+  } catch {
+    return [];
+  }
+}
+function autoMatchPhone(name) {
+  const n = (name || "").trim();
+  if (n.length < 4) return null;
+  try {
+    const row = db.prepare(
+      `SELECT phone, contact_name FROM conversations WHERE contact_name IS NOT NULL AND contact_name LIKE ? LIMIT 1`
+    ).get(`%${n}%`);
+    return row?.phone ? { phone: row.phone, contact_name: row.contact_name } : null;
+  } catch {
+    return null;
+  }
+}
+function setContactType(value, name, type) {
+  const v = (value || "").trim().toLowerCase();
+  if (!v) return { value: v, matchedPhone: null };
+  const existing = db.prepare(`SELECT phone FROM email_contacts WHERE value = ?`).get(v);
+  let phone = existing?.phone ?? null;
+  if (!phone && type !== "ignorato") {
+    const m = autoMatchPhone(name);
+    if (m) phone = m.phone;
+  }
+  db.prepare(`
+    INSERT INTO email_contacts (value, name, type, phone, updated_at) VALUES (?, ?, ?, ?, datetime('now'))
+    ON CONFLICT(value) DO UPDATE SET
+      type = excluded.type,
+      name = COALESCE(excluded.name, email_contacts.name),
+      phone = COALESCE(email_contacts.phone, excluded.phone),
+      updated_at = datetime('now')
+  `).run(v, name || null, type, phone);
+  return { value: v, matchedPhone: phone };
+}
+function removeContact(value) {
+  db.prepare(`DELETE FROM email_contacts WHERE value = ?`).run((value || "").trim().toLowerCase());
+}
+function setContactPhone(value, phone) {
+  db.prepare(`UPDATE email_contacts SET phone = ?, updated_at = datetime('now') WHERE value = ?`).run(phone && phone.trim() ? phone.trim() : null, (value || "").trim().toLowerCase());
+}
+function findContact(fromAddr) {
+  const f = (fromAddr || "").toLowerCase();
+  if (!f) return null;
+  const domain = "@" + (f.split("@")[1] || "");
+  try {
+    const row = db.prepare(`SELECT value, name, type, phone FROM email_contacts WHERE value = ? OR value = ? LIMIT 1`).get(f, domain);
+    return row || null;
+  } catch {
+    return null;
+  }
+}
+function getContactProfile(value) {
+  const v = (value || "").trim().toLowerCase();
+  const contact = db.prepare(`SELECT value, name, type, phone, created_at FROM email_contacts WHERE value = ?`).get(v);
+  if (!contact) return null;
+  const emailKey = `email:${v}`;
+  const keys = contact.phone ? [contact.phone, emailKey] : [emailKey];
+  const placeholders = keys.map(() => "?").join(",");
+  const appointments = db.prepare(
+    `SELECT date, start, end, reason, status, created_at FROM bot_appointments WHERE phone IN (${placeholders}) ORDER BY date DESC, start DESC LIMIT 20`
+  ).all(...keys);
+  const docNotes = db.prepare(
+    `SELECT summary, created_at FROM bot_doc_notes WHERE phone IN (${placeholders}) ORDER BY created_at DESC LIMIT 20`
+  ).all(...keys);
+  const emailHistory = v.startsWith("@") ? db.prepare(`SELECT subject, snippet, email_date, category FROM incoming_emails WHERE lower(from_addr) LIKE ? ORDER BY email_date DESC LIMIT 20`).all(`%${v}`) : db.prepare(`SELECT subject, snippet, email_date, category FROM incoming_emails WHERE lower(from_addr) = ? ORDER BY email_date DESC LIMIT 20`).all(v);
+  let whatsapp = null;
+  if (contact.phone) {
+    const conv = db.prepare(`SELECT phone, contact_name, last_message, last_message_at, total_received, total_sent FROM conversations WHERE phone = ?`).get(contact.phone);
+    if (conv) whatsapp = conv;
+  }
+  return { contact, appointments, docNotes, emailHistory, whatsapp };
+}
+var init_contacts = __esm({
+  "server/contacts.ts"() {
+    "use strict";
+    init_db();
+    db.exec(`
+  CREATE TABLE IF NOT EXISTS email_contacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    value TEXT UNIQUE NOT NULL,   -- indirizzo completo (mario@x.it) o dominio (@studioX.it)
+    name TEXT,
+    type TEXT NOT NULL DEFAULT 'cliente',  -- cliente | fornitore | ignorato
+    phone TEXT,                    -- numero WhatsApp collegato (auto o manuale), opzionale
+    created_at TEXT DEFAULT (datetime('now')),
+    updated_at TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_email_contacts_type ON email_contacts(type);
+`);
+    try {
+      const already = db.prepare(`SELECT COUNT(*) as c FROM email_contacts`).get();
+      if (already.c === 0) {
+        try {
+          const oldClients = db.prepare(`SELECT value, name FROM email_clients`).all();
+          for (const r of oldClients) {
+            db.prepare(`INSERT OR IGNORE INTO email_contacts (value, name, type) VALUES (?, ?, 'cliente')`).run(r.value, r.name || null);
+          }
+        } catch {
+        }
+        try {
+          const oldIgnored = db.prepare(`SELECT value, name FROM email_ignored`).all();
+          for (const r of oldIgnored) {
+            db.prepare(`INSERT OR IGNORE INTO email_contacts (value, name, type) VALUES (?, ?, 'ignorato')`).run(r.value, r.name || null);
+          }
+        } catch {
+        }
+      }
+    } catch (e) {
+      console.error("[Contatti] migrazione whitelist/blacklist:", e.message);
+    }
+  }
+});
+
 // server/email.ts
 var email_exports = {};
 __export(email_exports, {
-  addClient: () => addClient,
-  addIgnored: () => addIgnored,
   getEmailStatus: () => getEmailStatus,
   getRecentEmails: () => getRecentEmails,
-  listClients: () => listClients,
-  listIgnored: () => listIgnored,
   markEmailAsClient: () => markEmailAsClient,
+  markEmailAsFornitore: () => markEmailAsFornitore,
   markEmailAsNotClient: () => markEmailAsNotClient,
   markEmailSeen: () => markEmailSeen,
-  removeClient: () => removeClient,
-  removeIgnored: () => removeIgnored,
   startEmailPoller: () => startEmailPoller
 });
 function accounts() {
@@ -99556,60 +99679,13 @@ function isAutomatedSender(fromAddr) {
   const AUTO_DOMAIN = /(^|\.)(email|mail|mailer|news|em|e|sendgrid|mailchimp|mandrillapp|amazonses|sendinblue|brevo|mailjet|sparkpostmail|cmail|rsys|exct|sailthru|hubspotemail|mktomail)\./;
   return AUTO_LOCAL.test(local) || AUTO_DOMAIN.test(domain);
 }
-function listClients() {
-  try {
-    return db.prepare(`SELECT value, name, created_at FROM email_clients ORDER BY value`).all();
-  } catch {
-    return [];
-  }
-}
-function addClient(value, name) {
-  const v = (value || "").trim().toLowerCase();
-  if (!v) return;
-  db.prepare(`INSERT INTO email_clients (value, name) VALUES (?, ?) ON CONFLICT(value) DO UPDATE SET name = COALESCE(excluded.name, email_clients.name)`).run(v, name || null);
-}
-function removeClient(value) {
-  db.prepare(`DELETE FROM email_clients WHERE value = ?`).run((value || "").trim().toLowerCase());
-}
-function whitelistedClient(fromAddr) {
-  const f = (fromAddr || "").toLowerCase();
-  if (!f) return { match: false, name: null };
-  const domain = "@" + (f.split("@")[1] || "");
-  try {
-    const row = db.prepare(`SELECT name FROM email_clients WHERE value = ? OR value = ? LIMIT 1`).get(f, domain);
-    return { match: !!row, name: row?.name ?? null };
-  } catch {
-    return { match: false, name: null };
-  }
-}
-function listIgnored() {
-  try {
-    return db.prepare(`SELECT value, name, created_at FROM email_ignored ORDER BY value`).all();
-  } catch {
-    return [];
-  }
-}
-function addIgnored(value, name) {
-  const v = (value || "").trim().toLowerCase();
-  if (!v) return;
-  db.prepare(`INSERT INTO email_ignored (value, name) VALUES (?, ?) ON CONFLICT(value) DO UPDATE SET name = COALESCE(excluded.name, email_ignored.name)`).run(v, name || null);
-}
-function removeIgnored(value) {
-  db.prepare(`DELETE FROM email_ignored WHERE value = ?`).run((value || "").trim().toLowerCase());
-}
-function ignoredSender(fromAddr) {
-  const f = (fromAddr || "").toLowerCase();
-  if (!f) return false;
-  const domain = "@" + (f.split("@")[1] || "");
-  try {
-    return !!db.prepare(`SELECT 1 FROM email_ignored WHERE value = ? OR value = ? LIMIT 1`).get(f, domain);
-  } catch {
-    return false;
-  }
-}
 function classify(subject, fromAddr, body) {
-  if (whitelistedClient(fromAddr).match) return "lavoro";
-  if (ignoredSender(fromAddr)) return "ignorata";
+  const known = findContact(fromAddr);
+  if (known) {
+    if (known.type === "cliente") return "lavoro";
+    if (known.type === "fornitore") return "fornitore";
+    if (known.type === "ignorato") return "ignorata";
+  }
   if (isAutomatedSender(fromAddr)) return "automatica";
   const hay = `${subject} ${body}`.toLowerCase();
   if (WORK_KW.some((k) => hay.includes(k))) return "lavoro";
@@ -99755,7 +99831,8 @@ async function pollAccount(acc) {
           const text = (parsed.text || "").replace(/\s+/g, " ").trim();
           const snippet = text.slice(0, 240);
           const category = classify(subject, fromAddr, text);
-          const matched = whitelistedClient(fromAddr).name || matchClient(fromName);
+          const knownContact = findContact(fromAddr);
+          const matched = (knownContact?.type === "cliente" ? knownContact.name : null) || matchClient(fromName);
           const emailDate = (parsed.date || /* @__PURE__ */ new Date()).toISOString();
           const info = db.prepare(`
             INSERT OR IGNORE INTO incoming_emails
@@ -99818,21 +99895,23 @@ function getRecentEmails(limit = 100, category) {
 function markEmailSeen(id) {
   db.prepare(`UPDATE incoming_emails SET seen = 1 WHERE id = ?`).run(id);
 }
-function markEmailAsClient(id) {
+function markEmailAs(id, type) {
   const row = db.prepare(`SELECT from_addr, from_name FROM incoming_emails WHERE id = ?`).get(id);
   if (!row?.from_addr) return false;
-  removeIgnored(row.from_addr);
-  addClient(row.from_addr, row.from_name || null);
-  db.prepare(`UPDATE incoming_emails SET category = 'lavoro', matched_client = COALESCE(matched_client, ?) WHERE lower(from_addr) = lower(?)`).run(row.from_name || null, row.from_addr);
+  setContactType(row.from_addr, row.from_name || null, type);
+  const category = CATEGORY_OF_TYPE[type];
+  const matchedClient = type === "cliente" ? row.from_name || null : null;
+  db.prepare(`UPDATE incoming_emails SET category = ?, matched_client = ? WHERE lower(from_addr) = lower(?)`).run(category, matchedClient, row.from_addr);
   return true;
 }
+function markEmailAsClient(id) {
+  return markEmailAs(id, "cliente");
+}
+function markEmailAsFornitore(id) {
+  return markEmailAs(id, "fornitore");
+}
 function markEmailAsNotClient(id) {
-  const row = db.prepare(`SELECT from_addr, from_name FROM incoming_emails WHERE id = ?`).get(id);
-  if (!row?.from_addr) return false;
-  removeClient(row.from_addr);
-  addIgnored(row.from_addr, row.from_name || null);
-  db.prepare(`UPDATE incoming_emails SET category = 'ignorata', matched_client = NULL WHERE lower(from_addr) = lower(?)`).run(row.from_addr);
-  return true;
+  return markEmailAs(id, "ignorato");
 }
 async function pollAll() {
   const accs = accounts();
@@ -99863,7 +99942,7 @@ function startEmailPoller(intervalMs = 5 * 60 * 1e3) {
     pollAll().catch((e) => console.error("[Email] poll:", e.message));
   }, intervalMs);
 }
-var import_imapflow, import_mailparser, import_nodemailer, WORK_KW, SIGN, emailTimer, lastPoll;
+var import_imapflow, import_mailparser, import_nodemailer, WORK_KW, SIGN, emailTimer, lastPoll, CATEGORY_OF_TYPE;
 var init_email = __esm({
   "server/email.ts"() {
     "use strict";
@@ -99873,6 +99952,7 @@ var init_email = __esm({
     init_db();
     init_chatbot();
     init_zapi();
+    init_contacts();
     db.exec(`
   CREATE TABLE IF NOT EXISTS incoming_emails (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99884,7 +99964,7 @@ var init_email = __esm({
     subject TEXT,
     snippet TEXT,
     email_date TEXT,
-    category TEXT,            -- lavoro | altro | automatica
+    category TEXT,            -- lavoro | fornitore | altro | automatica | ignorata
     matched_client TEXT,
     seen INTEGER DEFAULT 0,
     replied INTEGER DEFAULT 0,
@@ -99894,23 +99974,6 @@ var init_email = __esm({
   );
   CREATE UNIQUE INDEX IF NOT EXISTS idx_incoming_emails_uid ON incoming_emails(account, uid);
   CREATE INDEX IF NOT EXISTS idx_incoming_emails_cat ON incoming_emails(category, email_date);
-
-  -- Whitelist clienti: indirizzi o domini noti come CLIENTI dello studio. Un mittente
-  -- in whitelist \xE8 SEMPRE 'lavoro' (cliente), a prescindere dalle parole chiave.
-  CREATE TABLE IF NOT EXISTS email_clients (
-    value TEXT PRIMARY KEY,   -- indirizzo completo (mario@x.it) o dominio (@studioX.it)
-    name TEXT,
-    created_at TEXT DEFAULT (datetime('now'))
-  );
-
-  -- Blacklist "non cliente": mittenti che lo studio ha marcato esplicitamente da
-  -- IGNORARE come posta (mai 'lavoro', mai notifica, mai risposta automatica),
-  -- anche se il testo contiene parole chiave di lavoro.
-  CREATE TABLE IF NOT EXISTS email_ignored (
-    value TEXT PRIMARY KEY,   -- indirizzo completo o dominio (@dominio.it)
-    name TEXT,
-    created_at TEXT DEFAULT (datetime('now'))
-  );
 `);
     for (const col of ["replied INTEGER DEFAULT 0", "reply_text TEXT", "reply_at TEXT"]) {
       try {
@@ -99970,6 +100033,11 @@ var init_email = __esm({
     SIGN = "\n\n\u2014\nStudio Tributario Branca \u2014 Dott. Mariano Branca\nVia Operai 102, 98051 Barcellona P.G. (ME) \xB7 Segreteria 0909797187\n(Risposta automatica dell\u2019assistente; le risposte di merito sono riviste dal Dott. Branca.)";
     emailTimer = null;
     lastPoll = null;
+    CATEGORY_OF_TYPE = {
+      cliente: "lavoro",
+      fornitore: "fornitore",
+      ignorato: "ignorata"
+    };
   }
 });
 
@@ -100318,30 +100386,76 @@ router.post("/emails/:id/seen", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+router.get("/contacts", async (req, res) => {
+  try {
+    const c = await Promise.resolve().then(() => (init_contacts(), contacts_exports));
+    const type = req.query.type ? String(req.query.type) : void 0;
+    res.json({ contacts: c.listContacts(type) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+router.post("/contacts", async (req, res) => {
+  try {
+    const c = await Promise.resolve().then(() => (init_contacts(), contacts_exports));
+    const { value, name, type } = req.body || {};
+    if (!value) return res.status(400).json({ error: "value richiesto" });
+    const t = type === "fornitore" || type === "ignorato" ? type : "cliente";
+    c.setContactType(String(value), name ? String(name) : void 0, t);
+    res.json({ ok: true, contacts: c.listContacts() });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+router.get("/contacts/:value/profile", async (req, res) => {
+  try {
+    const c = await Promise.resolve().then(() => (init_contacts(), contacts_exports));
+    const profile = c.getContactProfile(decodeURIComponent(req.params.value));
+    if (!profile) return res.status(404).json({ error: "contatto non trovato" });
+    res.json(profile);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+router.patch("/contacts/:value", async (req, res) => {
+  try {
+    const c = await Promise.resolve().then(() => (init_contacts(), contacts_exports));
+    const { phone } = req.body || {};
+    c.setContactPhone(decodeURIComponent(req.params.value), phone ? String(phone) : null);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+router.delete("/contacts/:value", async (req, res) => {
+  try {
+    const c = await Promise.resolve().then(() => (init_contacts(), contacts_exports));
+    c.removeContact(decodeURIComponent(req.params.value));
+    res.json({ ok: true, contacts: c.listContacts() });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 router.get("/emails/clients", async (_req, res) => {
   try {
-    const m = await Promise.resolve().then(() => (init_email(), email_exports));
-    res.json({ clients: m.listClients() });
+    const c = await Promise.resolve().then(() => (init_contacts(), contacts_exports));
+    res.json({ clients: c.listContacts("cliente") });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
-router.post("/emails/clients", async (req, res) => {
+router.get("/emails/fornitori", async (_req, res) => {
   try {
-    const m = await Promise.resolve().then(() => (init_email(), email_exports));
-    const { value, name } = req.body || {};
-    if (!value) return res.status(400).json({ error: "value richiesto" });
-    m.addClient(String(value), name ? String(name) : void 0);
-    res.json({ ok: true, clients: m.listClients() });
+    const c = await Promise.resolve().then(() => (init_contacts(), contacts_exports));
+    res.json({ fornitori: c.listContacts("fornitore") });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
-router.delete("/emails/clients/:value", async (req, res) => {
+router.get("/emails/ignored", async (_req, res) => {
   try {
-    const m = await Promise.resolve().then(() => (init_email(), email_exports));
-    m.removeClient(decodeURIComponent(req.params.value));
-    res.json({ ok: true, clients: m.listClients() });
+    const c = await Promise.resolve().then(() => (init_contacts(), contacts_exports));
+    res.json({ ignored: c.listContacts("ignorato") });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -100349,36 +100463,15 @@ router.delete("/emails/clients/:value", async (req, res) => {
 router.post("/emails/:id/mark-client", async (req, res) => {
   try {
     const m = await Promise.resolve().then(() => (init_email(), email_exports));
-    const ok = m.markEmailAsClient(parseInt(req.params.id, 10));
-    res.json({ ok });
+    res.json({ ok: m.markEmailAsClient(parseInt(req.params.id, 10)) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
-router.get("/emails/ignored", async (_req, res) => {
+router.post("/emails/:id/mark-fornitore", async (req, res) => {
   try {
     const m = await Promise.resolve().then(() => (init_email(), email_exports));
-    res.json({ ignored: m.listIgnored() });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-router.post("/emails/ignored", async (req, res) => {
-  try {
-    const m = await Promise.resolve().then(() => (init_email(), email_exports));
-    const { value, name } = req.body || {};
-    if (!value) return res.status(400).json({ error: "value richiesto" });
-    m.addIgnored(String(value), name ? String(name) : void 0);
-    res.json({ ok: true, ignored: m.listIgnored() });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-router.delete("/emails/ignored/:value", async (req, res) => {
-  try {
-    const m = await Promise.resolve().then(() => (init_email(), email_exports));
-    m.removeIgnored(decodeURIComponent(req.params.value));
-    res.json({ ok: true, ignored: m.listIgnored() });
+    res.json({ ok: m.markEmailAsFornitore(parseInt(req.params.id, 10)) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -100386,8 +100479,7 @@ router.delete("/emails/ignored/:value", async (req, res) => {
 router.post("/emails/:id/mark-not-client", async (req, res) => {
   try {
     const m = await Promise.resolve().then(() => (init_email(), email_exports));
-    const ok = m.markEmailAsNotClient(parseInt(req.params.id, 10));
-    res.json({ ok });
+    res.json({ ok: m.markEmailAsNotClient(parseInt(req.params.id, 10)) });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

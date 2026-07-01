@@ -105,57 +105,74 @@ router.post('/emails/:id/seen', async (req: Request, res: Response) => {
     res.json({ ok: true });
   } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
-// Whitelist clienti email
+// ─── Rubrica contatti (clienti / fornitori / ignorati) ───────────────────────
+// Fonte di verità per la classificazione email; collega in automatico un numero
+// WhatsApp per raffronto (nome) quando un contatto viene marcato cliente/fornitore.
+router.get('/contacts', async (req: Request, res: Response) => {
+  try {
+    const c = await import('./contacts.js');
+    const type = req.query.type ? String(req.query.type) as any : undefined;
+    res.json({ contacts: c.listContacts(type) });
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+// Aggiunta manuale (es. un intero dominio "@fornitoreX.it" come fornitore, senza
+// dover aspettare che arrivi un'email da smistare).
+router.post('/contacts', async (req: Request, res: Response) => {
+  try {
+    const c = await import('./contacts.js');
+    const { value, name, type } = req.body || {};
+    if (!value) return res.status(400).json({ error: 'value richiesto' });
+    const t = type === 'fornitore' || type === 'ignorato' ? type : 'cliente';
+    c.setContactType(String(value), name ? String(name) : undefined, t);
+    res.json({ ok: true, contacts: c.listContacts() });
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+router.get('/contacts/:value/profile', async (req: Request, res: Response) => {
+  try {
+    const c = await import('./contacts.js');
+    const profile = c.getContactProfile(decodeURIComponent(req.params.value));
+    if (!profile) return res.status(404).json({ error: 'contatto non trovato' });
+    res.json(profile);
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+router.patch('/contacts/:value', async (req: Request, res: Response) => {
+  try {
+    const c = await import('./contacts.js');
+    const { phone } = req.body || {};
+    c.setContactPhone(decodeURIComponent(req.params.value), phone ? String(phone) : null);
+    res.json({ ok: true });
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+router.delete('/contacts/:value', async (req: Request, res: Response) => {
+  try { const c = await import('./contacts.js'); c.removeContact(decodeURIComponent(req.params.value)); res.json({ ok: true, contacts: c.listContacts() }); }
+  catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+// Alias compatibili con la UI email esistente (whitelist clienti / blacklist ignorati).
 router.get('/emails/clients', async (_req: Request, res: Response) => {
-  try { const m = await import('./email.js'); res.json({ clients: m.listClients() }); }
+  try { const c = await import('./contacts.js'); res.json({ clients: c.listContacts('cliente') }); }
   catch (e: any) { res.status(500).json({ error: e.message }); }
 });
-router.post('/emails/clients', async (req: Request, res: Response) => {
-  try {
-    const m = await import('./email.js');
-    const { value, name } = req.body || {};
-    if (!value) return res.status(400).json({ error: 'value richiesto' });
-    m.addClient(String(value), name ? String(name) : undefined);
-    res.json({ ok: true, clients: m.listClients() });
-  } catch (e: any) { res.status(500).json({ error: e.message }); }
-});
-router.delete('/emails/clients/:value', async (req: Request, res: Response) => {
-  try { const m = await import('./email.js'); m.removeClient(decodeURIComponent(req.params.value)); res.json({ ok: true, clients: m.listClients() }); }
+router.get('/emails/fornitori', async (_req: Request, res: Response) => {
+  try { const c = await import('./contacts.js'); res.json({ fornitori: c.listContacts('fornitore') }); }
   catch (e: any) { res.status(500).json({ error: e.message }); }
 });
-// Segna una email come "cliente": aggiunge il mittente alla whitelist e riclassifica la riga.
-router.post('/emails/:id/mark-client', async (req: Request, res: Response) => {
-  try {
-    const m = await import('./email.js');
-    const ok = m.markEmailAsClient(parseInt(req.params.id, 10));
-    res.json({ ok });
-  } catch (e: any) { res.status(500).json({ error: e.message }); }
-});
-// Blacklist "non cliente" email
 router.get('/emails/ignored', async (_req: Request, res: Response) => {
-  try { const m = await import('./email.js'); res.json({ ignored: m.listIgnored() }); }
+  try { const c = await import('./contacts.js'); res.json({ ignored: c.listContacts('ignorato') }); }
   catch (e: any) { res.status(500).json({ error: e.message }); }
 });
-router.post('/emails/ignored', async (req: Request, res: Response) => {
-  try {
-    const m = await import('./email.js');
-    const { value, name } = req.body || {};
-    if (!value) return res.status(400).json({ error: 'value richiesto' });
-    m.addIgnored(String(value), name ? String(name) : undefined);
-    res.json({ ok: true, ignored: m.listIgnored() });
-  } catch (e: any) { res.status(500).json({ error: e.message }); }
-});
-router.delete('/emails/ignored/:value', async (req: Request, res: Response) => {
-  try { const m = await import('./email.js'); m.removeIgnored(decodeURIComponent(req.params.value)); res.json({ ok: true, ignored: m.listIgnored() }); }
+// Segna una email (e il suo mittente) come cliente / fornitore / non-cliente:
+// aggiorna la rubrica (con raffronto WhatsApp) e riclassifica le email di quel mittente.
+router.post('/emails/:id/mark-client', async (req: Request, res: Response) => {
+  try { const m = await import('./email.js'); res.json({ ok: m.markEmailAsClient(parseInt(req.params.id, 10)) }); }
   catch (e: any) { res.status(500).json({ error: e.message }); }
 });
-// Segna una email come "NON cliente": aggiunge il mittente alla blacklist e riclassifica la riga.
+router.post('/emails/:id/mark-fornitore', async (req: Request, res: Response) => {
+  try { const m = await import('./email.js'); res.json({ ok: m.markEmailAsFornitore(parseInt(req.params.id, 10)) }); }
+  catch (e: any) { res.status(500).json({ error: e.message }); }
+});
 router.post('/emails/:id/mark-not-client', async (req: Request, res: Response) => {
-  try {
-    const m = await import('./email.js');
-    const ok = m.markEmailAsNotClient(parseInt(req.params.id, 10));
-    res.json({ ok });
-  } catch (e: any) { res.status(500).json({ error: e.message }); }
+  try { const m = await import('./email.js'); res.json({ ok: m.markEmailAsNotClient(parseInt(req.params.id, 10)) }); }
+  catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 // ─── Debug ───────────────────────────────────────────────────────────────────

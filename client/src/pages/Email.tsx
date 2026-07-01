@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { Mail, UserCheck, UserX, RefreshCw, CheckCircle2, Inbox as InboxIcon, Settings2, X } from 'lucide-react';
+import { Mail, UserCheck, UserX, Truck, RefreshCw, CheckCircle2, Inbox as InboxIcon, Settings2, X, Phone, Calendar, FileText, MessageSquare } from 'lucide-react';
 import { getApiBase } from '../lib/queryClient';
 
 interface EmailRow {
@@ -20,15 +20,28 @@ interface EmailStatus {
   autoReply: boolean;
   lastPoll: { at: string; ok: boolean; stored: number; error?: string } | null;
 }
-
-interface ContactEntry { value: string; name: string | null; created_at: string }
+interface ContactEntry { value: string; name: string | null; type: 'cliente' | 'fornitore' | 'ignorato'; phone: string | null; created_at: string }
+interface ContactProfile {
+  contact: ContactEntry;
+  appointments: { date: string; start: string; end: string | null; reason: string | null; status: string; created_at: string }[];
+  docNotes: { summary: string; created_at: string }[];
+  emailHistory: { subject: string; snippet: string; email_date: string; category: string }[];
+  whatsapp: { phone: string; contact_name: string | null; last_message: string | null; last_message_at: string | null; total_received: number; total_sent: number } | null;
+}
 
 const CATS: { key: string; label: string }[] = [
   { key: 'lavoro', label: 'Lavoro' },
+  { key: 'fornitore', label: 'Fornitori' },
   { key: 'altro', label: 'Altro' },
   { key: 'automatica', label: 'Automatiche' },
   { key: 'ignorata', label: 'Ignorate' },
   { key: '', label: 'Tutte' },
+];
+
+const RUBRICA_TABS: { key: 'cliente' | 'fornitore' | 'ignorato'; label: string; bg: string; fg: string }[] = [
+  { key: 'cliente', label: 'Clienti', bg: '#e8f5e9', fg: '#1b5e20' },
+  { key: 'fornitore', label: 'Fornitori', bg: '#e3f2fd', fg: '#0d47a1' },
+  { key: 'ignorato', label: 'Ignorati', bg: '#ffebee', fg: '#b71c1c' },
 ];
 
 function fmtWhen(s: string): string {
@@ -40,6 +53,7 @@ function fmtWhen(s: string): string {
 
 function catColor(c: string): { bg: string; fg: string } {
   if (c === 'lavoro') return { bg: '#e8f5e9', fg: '#1b5e20' };
+  if (c === 'fornitore') return { bg: '#e3f2fd', fg: '#0d47a1' };
   if (c === 'automatica') return { bg: '#eceff1', fg: '#546e7a' };
   if (c === 'ignorata') return { bg: '#ffebee', fg: '#b71c1c' };
   return { bg: '#fff8e1', fg: '#8d6e00' };
@@ -49,6 +63,8 @@ export default function Email() {
   const qc = useQueryClient();
   const [cat, setCat] = useState('lavoro');
   const [showManage, setShowManage] = useState(false);
+  const [rubricaTab, setRubricaTab] = useState<'cliente' | 'fornitore' | 'ignorato'>('cliente');
+  const [selected, setSelected] = useState<string | null>(null);
 
   const { data: status } = useQuery<EmailStatus>({
     queryKey: ['emails-status'],
@@ -63,53 +79,44 @@ export default function Email() {
   });
   const emails = emailsData?.emails ?? [];
 
-  const { data: clientsData } = useQuery<{ clients: ContactEntry[] }>({
-    queryKey: ['emails-clients'],
-    queryFn: async () => (await fetch(`${getApiBase()}/api/emails/clients`)).json(),
+  const { data: contactsData } = useQuery<{ contacts: ContactEntry[] }>({
+    queryKey: ['contacts', rubricaTab],
+    queryFn: async () => (await fetch(`${getApiBase()}/api/contacts?type=${rubricaTab}`)).json(),
     enabled: showManage,
   });
-  const { data: ignoredData } = useQuery<{ ignored: ContactEntry[] }>({
-    queryKey: ['emails-ignored'],
-    queryFn: async () => (await fetch(`${getApiBase()}/api/emails/ignored`)).json(),
-    enabled: showManage,
+  const contactsList = contactsData?.contacts ?? [];
+
+  const { data: profile } = useQuery<ContactProfile>({
+    queryKey: ['contact-profile', selected],
+    queryFn: async () => (await fetch(`${getApiBase()}/api/contacts/${encodeURIComponent(selected!)}/profile`)).json(),
+    enabled: !!selected,
   });
 
   const invalidateAll = () => {
     qc.invalidateQueries({ queryKey: ['emails'] });
-    qc.invalidateQueries({ queryKey: ['emails-clients'] });
-    qc.invalidateQueries({ queryKey: ['emails-ignored'] });
+    qc.invalidateQueries({ queryKey: ['contacts'] });
+    qc.invalidateQueries({ queryKey: ['contact-profile'] });
   };
 
   const markClient = useMutation({
-    mutationFn: async (id: number) => {
-      const r = await fetch(`${getApiBase()}/api/emails/${id}/mark-client`, { method: 'POST' });
-      return r.json();
-    },
+    mutationFn: async (id: number) => (await fetch(`${getApiBase()}/api/emails/${id}/mark-client`, { method: 'POST' })).json(),
+    onSuccess: invalidateAll,
+  });
+  const markFornitore = useMutation({
+    mutationFn: async (id: number) => (await fetch(`${getApiBase()}/api/emails/${id}/mark-fornitore`, { method: 'POST' })).json(),
     onSuccess: invalidateAll,
   });
   const markNotClient = useMutation({
-    mutationFn: async (id: number) => {
-      const r = await fetch(`${getApiBase()}/api/emails/${id}/mark-not-client`, { method: 'POST' });
-      return r.json();
-    },
+    mutationFn: async (id: number) => (await fetch(`${getApiBase()}/api/emails/${id}/mark-not-client`, { method: 'POST' })).json(),
     onSuccess: invalidateAll,
   });
-  const removeClient = useMutation({
-    mutationFn: async (value: string) => {
-      const r = await fetch(`${getApiBase()}/api/emails/clients/${encodeURIComponent(value)}`, { method: 'DELETE' });
-      return r.json();
-    },
-    onSuccess: invalidateAll,
-  });
-  const removeIgnored = useMutation({
-    mutationFn: async (value: string) => {
-      const r = await fetch(`${getApiBase()}/api/emails/ignored/${encodeURIComponent(value)}`, { method: 'DELETE' });
-      return r.json();
-    },
-    onSuccess: invalidateAll,
+  const removeContact = useMutation({
+    mutationFn: async (value: string) => (await fetch(`${getApiBase()}/api/contacts/${encodeURIComponent(value)}`, { method: 'DELETE' })).json(),
+    onSuccess: () => { invalidateAll(); setSelected(null); },
   });
 
   const configured = status?.configured ?? [];
+  const tabColor = RUBRICA_TABS.find((t) => t.key === rubricaTab)!;
 
   return (
     <div className="page-container">
@@ -124,48 +131,88 @@ export default function Email() {
             border: '1px solid var(--border)', background: showManage ? '#128C7E' : 'var(--bg3)',
             color: showManage ? 'white' : 'var(--text)', fontSize: 12, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap',
           }}>
-          <Settings2 size={14} /> Gestisci mittenti
+          <Settings2 size={14} /> Rubrica
         </button>
       </header>
 
       {showManage && (
-        <div className="settings-card" style={{ marginBottom: 14, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
-          <div>
-            <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 8, color: '#1b5e20' }}>Clienti noti ({clientsData?.clients.length ?? 0})</div>
-            {(clientsData?.clients ?? []).length === 0 ? (
-              <div style={{ fontSize: 12, color: 'var(--text-dim)' }}>Nessun cliente in whitelist.</div>
-            ) : (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 220, overflowY: 'auto' }}>
-                {clientsData!.clients.map((c) => (
-                  <div key={c.value} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, fontSize: 12, background: '#e8f5e9', borderRadius: 6, padding: '5px 8px' }}>
-                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.name ? `${c.name} — ` : ''}{c.value}</span>
-                    <button onClick={() => removeClient.mutate(c.value)} title="Rimuovi dalla whitelist"
-                      style={{ border: 'none', background: 'transparent', cursor: 'pointer', color: '#1b5e20', flexShrink: 0 }}>
+        <div className="settings-card" style={{ marginBottom: 14 }}>
+          <p style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 0, marginBottom: 10 }}>
+            Clienti e fornitori marcati da un'email vengono collegati in automatico, per nome, a una
+            conversazione WhatsApp già nota. Clicca un contatto per vedere la scheda (appuntamenti,
+            documenti, cronologia).
+          </p>
+          <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
+            {RUBRICA_TABS.map((t) => (
+              <button key={t.key} onClick={() => { setRubricaTab(t.key); setSelected(null); }}
+                style={{
+                  padding: '6px 12px', borderRadius: 999, fontSize: 12, fontWeight: 600, cursor: 'pointer',
+                  border: '1px solid var(--border)',
+                  background: rubricaTab === t.key ? t.bg : 'var(--bg3)',
+                  color: rubricaTab === t.key ? t.fg : 'var(--text)',
+                }}>
+                {t.label}
+              </button>
+            ))}
+          </div>
+
+          {contactsList.length === 0 ? (
+            <div style={{ fontSize: 12, color: 'var(--text-dim)' }}>Nessun contatto in questa lista.</div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 260, overflowY: 'auto' }}>
+              {contactsList.map((c) => (
+                <div key={c.value}>
+                  <div onClick={() => setSelected(selected === c.value ? null : c.value)}
+                    style={{
+                      display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, fontSize: 12,
+                      background: selected === c.value ? tabColor.bg : 'var(--bg3)', borderRadius: 6, padding: '6px 9px', cursor: 'pointer',
+                    }}>
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'flex', alignItems: 'center', gap: 6 }}>
+                      {c.name ? `${c.name} — ` : ''}{c.value}
+                      {c.phone && <Phone size={11} style={{ opacity: 0.6, flexShrink: 0 }} />}
+                    </span>
+                    <button onClick={(e) => { e.stopPropagation(); removeContact.mutate(c.value); }} title="Rimuovi dalla rubrica"
+                      style={{ border: 'none', background: 'transparent', cursor: 'pointer', color: tabColor.fg, flexShrink: 0 }}>
                       <X size={13} />
                     </button>
                   </div>
-                ))}
-              </div>
-            )}
-          </div>
-          <div>
-            <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 8, color: '#b71c1c' }}>Mittenti ignorati ({ignoredData?.ignored.length ?? 0})</div>
-            {(ignoredData?.ignored ?? []).length === 0 ? (
-              <div style={{ fontSize: 12, color: 'var(--text-dim)' }}>Nessun mittente ignorato.</div>
-            ) : (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 220, overflowY: 'auto' }}>
-                {ignoredData!.ignored.map((c) => (
-                  <div key={c.value} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, fontSize: 12, background: '#ffebee', borderRadius: 6, padding: '5px 8px' }}>
-                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.name ? `${c.name} — ` : ''}{c.value}</span>
-                    <button onClick={() => removeIgnored.mutate(c.value)} title="Rimuovi dalla blacklist"
-                      style={{ border: 'none', background: 'transparent', cursor: 'pointer', color: '#b71c1c', flexShrink: 0 }}>
-                      <X size={13} />
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
+
+                  {selected === c.value && profile && (
+                    <div style={{ padding: '10px 12px', background: 'var(--bg2)', borderRadius: 6, marginTop: 4, fontSize: 12 }}>
+                      {profile.whatsapp ? (
+                        <div style={{ marginBottom: 8, display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <MessageSquare size={13} color="#128C7E" />
+                          <span>{profile.whatsapp.contact_name || profile.whatsapp.phone} · {profile.whatsapp.total_received} ricevuti / {profile.whatsapp.total_sent} inviati</span>
+                        </div>
+                      ) : (
+                        <div style={{ marginBottom: 8, color: 'var(--text-dim)' }}>Nessuna conversazione WhatsApp collegata.</div>
+                      )}
+
+                      <div style={{ marginBottom: 6, fontWeight: 700, display: 'flex', alignItems: 'center', gap: 5 }}>
+                        <Calendar size={13} /> Appuntamenti ({profile.appointments.length})
+                      </div>
+                      {profile.appointments.length === 0 ? (
+                        <div style={{ color: 'var(--text-dim)', marginBottom: 8 }}>Nessuno.</div>
+                      ) : profile.appointments.slice(0, 5).map((a, i) => (
+                        <div key={i} style={{ color: 'var(--text-muted)', marginBottom: 3 }}>
+                          {a.date} {a.start} — {a.reason || 'appuntamento'} <i>({a.status})</i>
+                        </div>
+                      ))}
+
+                      <div style={{ margin: '8px 0 6px', fontWeight: 700, display: 'flex', alignItems: 'center', gap: 5 }}>
+                        <FileText size={13} /> Richieste/documenti ({profile.docNotes.length})
+                      </div>
+                      {profile.docNotes.length === 0 ? (
+                        <div style={{ color: 'var(--text-dim)' }}>Nessuna.</div>
+                      ) : profile.docNotes.slice(0, 5).map((n, i) => (
+                        <div key={i} style={{ color: 'var(--text-muted)', marginBottom: 3 }}>{n.summary}</div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
@@ -238,7 +285,7 @@ export default function Email() {
                       <CheckCircle2 size={14} /> Risposta inviata
                     </span>
                   )}
-                  <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+                  <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
                     {m.category !== 'ignorata' && (
                       <button onClick={() => markNotClient.mutate(m.id)} disabled={markNotClient.isPending}
                         style={{
@@ -247,6 +294,16 @@ export default function Email() {
                           border: '1px solid var(--border)', borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: 'pointer',
                         }}>
                         <UserX size={14} /> Non è cliente
+                      </button>
+                    )}
+                    {m.category !== 'fornitore' && (
+                      <button onClick={() => markFornitore.mutate(m.id)} disabled={markFornitore.isPending}
+                        style={{
+                          display: 'flex', alignItems: 'center', gap: 5,
+                          padding: '6px 12px', background: 'var(--bg3)', color: '#0d47a1',
+                          border: '1px solid var(--border)', borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: 'pointer',
+                        }}>
+                        <Truck size={14} /> Fornitore
                       </button>
                     )}
                     {m.category !== 'lavoro' && (
