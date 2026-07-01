@@ -14,7 +14,7 @@
  *    al primo giro NON risponde al pregresso già in inbox.
  *  - Auto-risposta SOLO categoria 'lavoro'; MAI a mittenti automatici/noreply; MAI alle
  *    urgenze (need_human) → quelle restano senza risposta automatica e generano un alert
- *    email dedicato a Mariano (rev. 02/07/2026: prima solo appuntamenti/documenti
+ *    email dedicato a Mariano (rev. 01/07/2026: prima solo appuntamenti/documenti
  *    auto-rispondevano, ora ogni risposta di merito non urgente parte da sola — stessa
  *    logica già attiva su WhatsApp, "allarga la maglia, valuta solo le criticità").
  *  - Tutto isolato: si attiva solo con le credenziali via env; un errore qui non tocca il bot.
@@ -208,7 +208,7 @@ async function notifyUrgentEmail(row: { from_addr: string; from_name: string; su
   catch (e: any) { console.error('[Email] alert urgenza fallito:', e.message); }
 }
 
-/** Genera e INVIA la risposta automatica a una email di lavoro non urgente (rev. 02/07/2026:
+/** Genera e INVIA la risposta automatica a una email di lavoro non urgente (rev. 01/07/2026:
  *  ampliato da "solo appuntamenti/documenti" a QUALSIASI risposta di merito non urgente).
  *  Ritorna una breve etichetta dell'azione svolta o null. */
 async function maybeAutoReply(acc: MailAccount, row: {
