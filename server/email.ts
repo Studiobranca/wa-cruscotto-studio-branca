@@ -51,6 +51,15 @@ db.exec(`
     name TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   );
+
+  -- Blacklist "non cliente": mittenti che lo studio ha marcato esplicitamente da
+  -- IGNORARE come posta (mai 'lavoro', mai notifica, mai risposta automatica),
+  -- anche se il testo contiene parole chiave di lavoro.
+  CREATE TABLE IF NOT EXISTS email_ignored (
+    value TEXT PRIMARY KEY,   -- indirizzo completo o dominio (@dominio.it)
+    name TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
 `);
 // Migrazione idempotente: aggiunge le colonne reply su DB già esistenti (v2.9.6).
 for (const col of ['replied INTEGER DEFAULT 0', 'reply_text TEXT', 'reply_at TEXT']) {
@@ -156,8 +165,32 @@ function whitelistedClient(fromAddr: string): { match: boolean; name: string | n
   } catch { return { match: false, name: null }; }
 }
 
+// ─── Blacklist "non cliente" ──────────────────────────────────────────────────
+export function listIgnored(): { value: string; name: string | null; created_at: string }[] {
+  try { return db.prepare(`SELECT value, name, created_at FROM email_ignored ORDER BY value`).all() as any[]; }
+  catch { return []; }
+}
+export function addIgnored(value: string, name?: string): void {
+  const v = (value || '').trim().toLowerCase();
+  if (!v) return;
+  db.prepare(`INSERT INTO email_ignored (value, name) VALUES (?, ?) ON CONFLICT(value) DO UPDATE SET name = COALESCE(excluded.name, email_ignored.name)`).run(v, name || null);
+}
+export function removeIgnored(value: string): void {
+  db.prepare(`DELETE FROM email_ignored WHERE value = ?`).run((value || '').trim().toLowerCase());
+}
+/** Il mittente è stato marcato esplicitamente come NON cliente? Match indirizzo o dominio. */
+function ignoredSender(fromAddr: string): boolean {
+  const f = (fromAddr || '').toLowerCase();
+  if (!f) return false;
+  const domain = '@' + (f.split('@')[1] || '');
+  try {
+    return !!db.prepare(`SELECT 1 FROM email_ignored WHERE value = ? OR value = ? LIMIT 1`).get(f, domain);
+  } catch { return false; }
+}
+
 function classify(subject: string, fromAddr: string, body: string): string {
   if (whitelistedClient(fromAddr).match) return 'lavoro';   // cliente noto → sempre lavoro
+  if (ignoredSender(fromAddr)) return 'ignorata';           // marcato esplicitamente non-cliente
   if (isAutomatedSender(fromAddr)) return 'automatica';
   const hay = `${subject} ${body}`.toLowerCase();
   if (WORK_KW.some((k) => hay.includes(k))) return 'lavoro';
@@ -375,9 +408,22 @@ export function markEmailSeen(id: number): void {
 export function markEmailAsClient(id: number): boolean {
   const row = db.prepare(`SELECT from_addr, from_name FROM incoming_emails WHERE id = ?`).get(id) as any;
   if (!row?.from_addr) return false;
+  removeIgnored(row.from_addr);   // un eventuale "non cliente" precedente viene annullato
   addClient(row.from_addr, row.from_name || null);
   db.prepare(`UPDATE incoming_emails SET category = 'lavoro', matched_client = COALESCE(matched_client, ?) WHERE lower(from_addr) = lower(?)`)
     .run(row.from_name || null, row.from_addr);
+  return true;
+}
+
+/** Segna l'email (e il suo mittente) come NON CLIENTE: blacklist + riclassifica le sue
+ *  email come 'ignorata' (mai lavoro, mai notifica, mai risposta automatica). */
+export function markEmailAsNotClient(id: number): boolean {
+  const row = db.prepare(`SELECT from_addr, from_name FROM incoming_emails WHERE id = ?`).get(id) as any;
+  if (!row?.from_addr) return false;
+  removeClient(row.from_addr);    // un eventuale "cliente" precedente viene annullato
+  addIgnored(row.from_addr, row.from_name || null);
+  db.prepare(`UPDATE incoming_emails SET category = 'ignorata', matched_client = NULL WHERE lower(from_addr) = lower(?)`)
+    .run(row.from_addr);
   return true;
 }
 

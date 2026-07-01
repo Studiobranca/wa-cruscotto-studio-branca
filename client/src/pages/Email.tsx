@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { Mail, UserCheck, RefreshCw, CheckCircle2, Inbox as InboxIcon } from 'lucide-react';
+import { Mail, UserCheck, UserX, RefreshCw, CheckCircle2, Inbox as InboxIcon, Settings2, X } from 'lucide-react';
 import { getApiBase } from '../lib/queryClient';
 
 interface EmailRow {
@@ -21,10 +21,13 @@ interface EmailStatus {
   lastPoll: { at: string; ok: boolean; stored: number; error?: string } | null;
 }
 
+interface ContactEntry { value: string; name: string | null; created_at: string }
+
 const CATS: { key: string; label: string }[] = [
   { key: 'lavoro', label: 'Lavoro' },
   { key: 'altro', label: 'Altro' },
   { key: 'automatica', label: 'Automatiche' },
+  { key: 'ignorata', label: 'Ignorate' },
   { key: '', label: 'Tutte' },
 ];
 
@@ -38,12 +41,14 @@ function fmtWhen(s: string): string {
 function catColor(c: string): { bg: string; fg: string } {
   if (c === 'lavoro') return { bg: '#e8f5e9', fg: '#1b5e20' };
   if (c === 'automatica') return { bg: '#eceff1', fg: '#546e7a' };
+  if (c === 'ignorata') return { bg: '#ffebee', fg: '#b71c1c' };
   return { bg: '#fff8e1', fg: '#8d6e00' };
 }
 
 export default function Email() {
   const qc = useQueryClient();
   const [cat, setCat] = useState('lavoro');
+  const [showManage, setShowManage] = useState(false);
 
   const { data: status } = useQuery<EmailStatus>({
     queryKey: ['emails-status'],
@@ -58,22 +63,111 @@ export default function Email() {
   });
   const emails = emailsData?.emails ?? [];
 
+  const { data: clientsData } = useQuery<{ clients: ContactEntry[] }>({
+    queryKey: ['emails-clients'],
+    queryFn: async () => (await fetch(`${getApiBase()}/api/emails/clients`)).json(),
+    enabled: showManage,
+  });
+  const { data: ignoredData } = useQuery<{ ignored: ContactEntry[] }>({
+    queryKey: ['emails-ignored'],
+    queryFn: async () => (await fetch(`${getApiBase()}/api/emails/ignored`)).json(),
+    enabled: showManage,
+  });
+
+  const invalidateAll = () => {
+    qc.invalidateQueries({ queryKey: ['emails'] });
+    qc.invalidateQueries({ queryKey: ['emails-clients'] });
+    qc.invalidateQueries({ queryKey: ['emails-ignored'] });
+  };
+
   const markClient = useMutation({
     mutationFn: async (id: number) => {
       const r = await fetch(`${getApiBase()}/api/emails/${id}/mark-client`, { method: 'POST' });
       return r.json();
     },
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['emails'] }); },
+    onSuccess: invalidateAll,
+  });
+  const markNotClient = useMutation({
+    mutationFn: async (id: number) => {
+      const r = await fetch(`${getApiBase()}/api/emails/${id}/mark-not-client`, { method: 'POST' });
+      return r.json();
+    },
+    onSuccess: invalidateAll,
+  });
+  const removeClient = useMutation({
+    mutationFn: async (value: string) => {
+      const r = await fetch(`${getApiBase()}/api/emails/clients/${encodeURIComponent(value)}`, { method: 'DELETE' });
+      return r.json();
+    },
+    onSuccess: invalidateAll,
+  });
+  const removeIgnored = useMutation({
+    mutationFn: async (value: string) => {
+      const r = await fetch(`${getApiBase()}/api/emails/ignored/${encodeURIComponent(value)}`, { method: 'DELETE' });
+      return r.json();
+    },
+    onSuccess: invalidateAll,
   });
 
   const configured = status?.configured ?? [];
 
   return (
     <div className="page-container">
-      <header className="page-header">
-        <h1 className="page-title">Email</h1>
-        <p className="page-subtitle">Posta in arrivo dello studio — Tiscali e iCloud (sola lettura)</p>
+      <header className="page-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 10 }}>
+        <div>
+          <h1 className="page-title">Email</h1>
+          <p className="page-subtitle">Posta in arrivo dello studio — Tiscali e iCloud (sola lettura)</p>
+        </div>
+        <button onClick={() => setShowManage((v) => !v)}
+          style={{
+            display: 'flex', alignItems: 'center', gap: 6, padding: '7px 12px', borderRadius: 8,
+            border: '1px solid var(--border)', background: showManage ? '#128C7E' : 'var(--bg3)',
+            color: showManage ? 'white' : 'var(--text)', fontSize: 12, fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap',
+          }}>
+          <Settings2 size={14} /> Gestisci mittenti
+        </button>
       </header>
+
+      {showManage && (
+        <div className="settings-card" style={{ marginBottom: 14, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+          <div>
+            <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 8, color: '#1b5e20' }}>Clienti noti ({clientsData?.clients.length ?? 0})</div>
+            {(clientsData?.clients ?? []).length === 0 ? (
+              <div style={{ fontSize: 12, color: 'var(--text-dim)' }}>Nessun cliente in whitelist.</div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 220, overflowY: 'auto' }}>
+                {clientsData!.clients.map((c) => (
+                  <div key={c.value} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, fontSize: 12, background: '#e8f5e9', borderRadius: 6, padding: '5px 8px' }}>
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.name ? `${c.name} — ` : ''}{c.value}</span>
+                    <button onClick={() => removeClient.mutate(c.value)} title="Rimuovi dalla whitelist"
+                      style={{ border: 'none', background: 'transparent', cursor: 'pointer', color: '#1b5e20', flexShrink: 0 }}>
+                      <X size={13} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+          <div>
+            <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 8, color: '#b71c1c' }}>Mittenti ignorati ({ignoredData?.ignored.length ?? 0})</div>
+            {(ignoredData?.ignored ?? []).length === 0 ? (
+              <div style={{ fontSize: 12, color: 'var(--text-dim)' }}>Nessun mittente ignorato.</div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6, maxHeight: 220, overflowY: 'auto' }}>
+                {ignoredData!.ignored.map((c) => (
+                  <div key={c.value} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8, fontSize: 12, background: '#ffebee', borderRadius: 6, padding: '5px 8px' }}>
+                    <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{c.name ? `${c.name} — ` : ''}{c.value}</span>
+                    <button onClick={() => removeIgnored.mutate(c.value)} title="Rimuovi dalla blacklist"
+                      style={{ border: 'none', background: 'transparent', cursor: 'pointer', color: '#b71c1c', flexShrink: 0 }}>
+                      <X size={13} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Stato */}
       <div className="settings-card" style={{ marginBottom: 14 }}>
@@ -144,16 +238,28 @@ export default function Email() {
                       <CheckCircle2 size={14} /> Risposta inviata
                     </span>
                   )}
-                  {m.category !== 'lavoro' && (
-                    <button onClick={() => markClient.mutate(m.id)} disabled={markClient.isPending}
-                      style={{
-                        marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 5,
-                        padding: '6px 12px', background: 'var(--bg3)', color: 'var(--text)',
-                        border: '1px solid var(--border)', borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: 'pointer',
-                      }}>
-                      <UserCheck size={14} /> Segna cliente
-                    </button>
-                  )}
+                  <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+                    {m.category !== 'ignorata' && (
+                      <button onClick={() => markNotClient.mutate(m.id)} disabled={markNotClient.isPending}
+                        style={{
+                          display: 'flex', alignItems: 'center', gap: 5,
+                          padding: '6px 12px', background: 'var(--bg3)', color: '#b71c1c',
+                          border: '1px solid var(--border)', borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: 'pointer',
+                        }}>
+                        <UserX size={14} /> Non è cliente
+                      </button>
+                    )}
+                    {m.category !== 'lavoro' && (
+                      <button onClick={() => markClient.mutate(m.id)} disabled={markClient.isPending}
+                        style={{
+                          display: 'flex', alignItems: 'center', gap: 5,
+                          padding: '6px 12px', background: 'var(--bg3)', color: 'var(--text)',
+                          border: '1px solid var(--border)', borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: 'pointer',
+                        }}>
+                        <UserCheck size={14} /> Segna cliente
+                      </button>
+                    )}
+                  </div>
                 </div>
               </div>
             );

@@ -391,6 +391,14 @@ REGOLE GENERALI:
    messaggi di cortesia): ricorda che per parlare con lo studio negli orari di segreteria si
    può chiamare lo 0909797187, e chiudi con la firma "Assistente Virtuale — Studio Tributario
    Branca".
+6. FORMATTAZIONE (WhatsApp NON è Markdown — inderogabile): WhatsApp interpreta il *singolo
+   asterisco* come grassetto. NON usare MAI il doppio asterisco **così** (compare come testo
+   letterale con gli asterischi, un errore che il cliente vede subito): se serve enfasi usa
+   *singolo asterisco*, con moderazione (poche parole chiave per messaggio, non frasi intere).
+   NON usare intestazioni Markdown (###, ecc.) né tabelle. Per gli elenchi usa un trattino "- "
+   a inizio riga, semplice testo. EMOJI: al massimo una, solo se pertinente e sobria (es. ✅ per
+   una conferma), MAI più di una nello stesso messaggio e MAI emoji decorative o giocose (🎉😊
+   e simili): lo studio comunica con un tono professionale, non da chat informale.
 
 Il tuo output finale deve contenere ESCLUSIVAMENTE il testo del messaggio da inviare al
 cliente: NIENTE analisi, premesse, ragionamenti o commenti tra parentesi.`;
@@ -680,7 +688,7 @@ export async function generateReplyCore(
   }
 
   const channelNote = channel === 'email'
-    ? `\n\nCANALE = EMAIL. Stai rispondendo via email a un messaggio che il cliente ha inviato allo studio (spesso ALLEGANDO documenti). Scrivi una email cordiale e completa: saluto iniziale ("Gentile ...,"), corpo, chiusura con firma. Quando chiedi documenti o ne confermi la ricezione, di' di inviarli "${dest}". Per il resto valgono tutte le regole (orari, dedup, zero-errori, niente quantificazioni del singolo caso).`
+    ? `\n\nCANALE = EMAIL. Stai rispondendo via email a un messaggio che il cliente ha inviato allo studio (spesso ALLEGANDO documenti). Scrivi una email cordiale e completa: saluto iniziale ("Gentile ...,"), corpo, chiusura con firma. Quando chiedi documenti o ne confermi la ricezione, di' di inviarli "${dest}". FORMATTAZIONE: qui la regola 6 sul *singolo asterisco* NON si applica — l'email è testo semplice, nessun carattere di enfasi verrà interpretato. NON usare asterischi, cancelletti o altri simboli Markdown per grassetto/enfasi/titoli: scrivi in prosa piana, ordinata in paragrafi brevi, con eventuali elenchi puntati solo col trattino "- ". Nessuna emoji nelle email (canale formale). Per il resto valgono tutte le regole (orari, dedup, zero-errori, niente quantificazioni del singolo caso).`
     : '';
 
   const system = `${SYSTEM_PROMPT}\n\nData odierna: ${todayStr} (${todayISO}). Usa SEMPRE date coerenti con oggi e non inventare l'anno.${apptBlock}${channelNote}`;

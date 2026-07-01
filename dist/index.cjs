@@ -25174,7 +25174,7 @@ APPUNTAMENTO IN ATTESA DI CONFERMA per questo cliente: ${pendingAppt.date} alle 
   }
   const channelNote = channel === "email" ? `
 
-CANALE = EMAIL. Stai rispondendo via email a un messaggio che il cliente ha inviato allo studio (spesso ALLEGANDO documenti). Scrivi una email cordiale e completa: saluto iniziale ("Gentile ...,"), corpo, chiusura con firma. Quando chiedi documenti o ne confermi la ricezione, di' di inviarli "${dest}". Per il resto valgono tutte le regole (orari, dedup, zero-errori, niente quantificazioni del singolo caso).` : "";
+CANALE = EMAIL. Stai rispondendo via email a un messaggio che il cliente ha inviato allo studio (spesso ALLEGANDO documenti). Scrivi una email cordiale e completa: saluto iniziale ("Gentile ...,"), corpo, chiusura con firma. Quando chiedi documenti o ne confermi la ricezione, di' di inviarli "${dest}". FORMATTAZIONE: qui la regola 6 sul *singolo asterisco* NON si applica \u2014 l'email \xE8 testo semplice, nessun carattere di enfasi verr\xE0 interpretato. NON usare asterischi, cancelletti o altri simboli Markdown per grassetto/enfasi/titoli: scrivi in prosa piana, ordinata in paragrafi brevi, con eventuali elenchi puntati solo col trattino "- ". Nessuna emoji nelle email (canale formale). Per il resto valgono tutte le regole (orari, dedup, zero-errori, niente quantificazioni del singolo caso).` : "";
   const system = `${SYSTEM_PROMPT}
 
 Data odierna: ${todayStr} (${todayISO}). Usa SEMPRE date coerenti con oggi e non inventare l'anno.${apptBlock}${channelNote}`;
@@ -25564,6 +25564,14 @@ REGOLE GENERALI:
    messaggi di cortesia): ricorda che per parlare con lo studio negli orari di segreteria si
    pu\xF2 chiamare lo 0909797187, e chiudi con la firma "Assistente Virtuale \u2014 Studio Tributario
    Branca".
+6. FORMATTAZIONE (WhatsApp NON \xE8 Markdown \u2014 inderogabile): WhatsApp interpreta il *singolo
+   asterisco* come grassetto. NON usare MAI il doppio asterisco **cos\xEC** (compare come testo
+   letterale con gli asterischi, un errore che il cliente vede subito): se serve enfasi usa
+   *singolo asterisco*, con moderazione (poche parole chiave per messaggio, non frasi intere).
+   NON usare intestazioni Markdown (###, ecc.) n\xE9 tabelle. Per gli elenchi usa un trattino "- "
+   a inizio riga, semplice testo. EMOJI: al massimo una, solo se pertinente e sobria (es. \u2705 per
+   una conferma), MAI pi\xF9 di una nello stesso messaggio e MAI emoji decorative o giocose (\u{1F389}\u{1F60A}
+   e simili): lo studio comunica con un tono professionale, non da chat informale.
 
 Il tuo output finale deve contenere ESCLUSIVAMENTE il testo del messaggio da inviare al
 cliente: NIENTE analisi, premesse, ragionamenti o commenti tra parentesi.`;
@@ -99482,12 +99490,16 @@ var require_nodemailer = __commonJS({
 var email_exports = {};
 __export(email_exports, {
   addClient: () => addClient,
+  addIgnored: () => addIgnored,
   getEmailStatus: () => getEmailStatus,
   getRecentEmails: () => getRecentEmails,
   listClients: () => listClients,
+  listIgnored: () => listIgnored,
   markEmailAsClient: () => markEmailAsClient,
+  markEmailAsNotClient: () => markEmailAsNotClient,
   markEmailSeen: () => markEmailSeen,
   removeClient: () => removeClient,
+  removeIgnored: () => removeIgnored,
   startEmailPoller: () => startEmailPoller
 });
 function accounts() {
@@ -99570,8 +99582,34 @@ function whitelistedClient(fromAddr) {
     return { match: false, name: null };
   }
 }
+function listIgnored() {
+  try {
+    return db.prepare(`SELECT value, name, created_at FROM email_ignored ORDER BY value`).all();
+  } catch {
+    return [];
+  }
+}
+function addIgnored(value, name) {
+  const v = (value || "").trim().toLowerCase();
+  if (!v) return;
+  db.prepare(`INSERT INTO email_ignored (value, name) VALUES (?, ?) ON CONFLICT(value) DO UPDATE SET name = COALESCE(excluded.name, email_ignored.name)`).run(v, name || null);
+}
+function removeIgnored(value) {
+  db.prepare(`DELETE FROM email_ignored WHERE value = ?`).run((value || "").trim().toLowerCase());
+}
+function ignoredSender(fromAddr) {
+  const f = (fromAddr || "").toLowerCase();
+  if (!f) return false;
+  const domain = "@" + (f.split("@")[1] || "");
+  try {
+    return !!db.prepare(`SELECT 1 FROM email_ignored WHERE value = ? OR value = ? LIMIT 1`).get(f, domain);
+  } catch {
+    return false;
+  }
+}
 function classify(subject, fromAddr, body) {
   if (whitelistedClient(fromAddr).match) return "lavoro";
+  if (ignoredSender(fromAddr)) return "ignorata";
   if (isAutomatedSender(fromAddr)) return "automatica";
   const hay = `${subject} ${body}`.toLowerCase();
   if (WORK_KW.some((k) => hay.includes(k))) return "lavoro";
@@ -99783,8 +99821,17 @@ function markEmailSeen(id) {
 function markEmailAsClient(id) {
   const row = db.prepare(`SELECT from_addr, from_name FROM incoming_emails WHERE id = ?`).get(id);
   if (!row?.from_addr) return false;
+  removeIgnored(row.from_addr);
   addClient(row.from_addr, row.from_name || null);
   db.prepare(`UPDATE incoming_emails SET category = 'lavoro', matched_client = COALESCE(matched_client, ?) WHERE lower(from_addr) = lower(?)`).run(row.from_name || null, row.from_addr);
+  return true;
+}
+function markEmailAsNotClient(id) {
+  const row = db.prepare(`SELECT from_addr, from_name FROM incoming_emails WHERE id = ?`).get(id);
+  if (!row?.from_addr) return false;
+  removeClient(row.from_addr);
+  addIgnored(row.from_addr, row.from_name || null);
+  db.prepare(`UPDATE incoming_emails SET category = 'ignorata', matched_client = NULL WHERE lower(from_addr) = lower(?)`).run(row.from_addr);
   return true;
 }
 async function pollAll() {
@@ -99852,6 +99899,15 @@ var init_email = __esm({
   -- in whitelist \xE8 SEMPRE 'lavoro' (cliente), a prescindere dalle parole chiave.
   CREATE TABLE IF NOT EXISTS email_clients (
     value TEXT PRIMARY KEY,   -- indirizzo completo (mario@x.it) o dominio (@studioX.it)
+    name TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+
+  -- Blacklist "non cliente": mittenti che lo studio ha marcato esplicitamente da
+  -- IGNORARE come posta (mai 'lavoro', mai notifica, mai risposta automatica),
+  -- anche se il testo contiene parole chiave di lavoro.
+  CREATE TABLE IF NOT EXISTS email_ignored (
+    value TEXT PRIMARY KEY,   -- indirizzo completo o dominio (@dominio.it)
     name TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   );
@@ -100294,6 +100350,43 @@ router.post("/emails/:id/mark-client", async (req, res) => {
   try {
     const m = await Promise.resolve().then(() => (init_email(), email_exports));
     const ok = m.markEmailAsClient(parseInt(req.params.id, 10));
+    res.json({ ok });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+router.get("/emails/ignored", async (_req, res) => {
+  try {
+    const m = await Promise.resolve().then(() => (init_email(), email_exports));
+    res.json({ ignored: m.listIgnored() });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+router.post("/emails/ignored", async (req, res) => {
+  try {
+    const m = await Promise.resolve().then(() => (init_email(), email_exports));
+    const { value, name } = req.body || {};
+    if (!value) return res.status(400).json({ error: "value richiesto" });
+    m.addIgnored(String(value), name ? String(name) : void 0);
+    res.json({ ok: true, ignored: m.listIgnored() });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+router.delete("/emails/ignored/:value", async (req, res) => {
+  try {
+    const m = await Promise.resolve().then(() => (init_email(), email_exports));
+    m.removeIgnored(decodeURIComponent(req.params.value));
+    res.json({ ok: true, ignored: m.listIgnored() });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+router.post("/emails/:id/mark-not-client", async (req, res) => {
+  try {
+    const m = await Promise.resolve().then(() => (init_email(), email_exports));
+    const ok = m.markEmailAsNotClient(parseInt(req.params.id, 10));
     res.json({ ok });
   } catch (e) {
     res.status(500).json({ error: e.message });

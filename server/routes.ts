@@ -131,6 +131,32 @@ router.post('/emails/:id/mark-client', async (req: Request, res: Response) => {
     res.json({ ok });
   } catch (e: any) { res.status(500).json({ error: e.message }); }
 });
+// Blacklist "non cliente" email
+router.get('/emails/ignored', async (_req: Request, res: Response) => {
+  try { const m = await import('./email.js'); res.json({ ignored: m.listIgnored() }); }
+  catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+router.post('/emails/ignored', async (req: Request, res: Response) => {
+  try {
+    const m = await import('./email.js');
+    const { value, name } = req.body || {};
+    if (!value) return res.status(400).json({ error: 'value richiesto' });
+    m.addIgnored(String(value), name ? String(name) : undefined);
+    res.json({ ok: true, ignored: m.listIgnored() });
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+router.delete('/emails/ignored/:value', async (req: Request, res: Response) => {
+  try { const m = await import('./email.js'); m.removeIgnored(decodeURIComponent(req.params.value)); res.json({ ok: true, ignored: m.listIgnored() }); }
+  catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+// Segna una email come "NON cliente": aggiunge il mittente alla blacklist e riclassifica la riga.
+router.post('/emails/:id/mark-not-client', async (req: Request, res: Response) => {
+  try {
+    const m = await import('./email.js');
+    const ok = m.markEmailAsNotClient(parseInt(req.params.id, 10));
+    res.json({ ok });
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
 
 // ─── Debug ───────────────────────────────────────────────────────────────────
 router.get('/debug/laura', (_req: Request, res: Response) => {
