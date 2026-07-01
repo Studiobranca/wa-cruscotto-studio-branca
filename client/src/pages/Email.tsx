@@ -308,12 +308,13 @@ export default function Email() {
                     )}
                     {m.category !== 'lavoro' && (
                       <button onClick={() => markClient.mutate(m.id)} disabled={markClient.isPending}
+                        title="Autorizza le risposte automatiche via email per questo mittente"
                         style={{
                           display: 'flex', alignItems: 'center', gap: 5,
-                          padding: '6px 12px', background: 'var(--bg3)', color: 'var(--text)',
+                          padding: '6px 12px', background: 'var(--bg3)', color: '#1b5e20',
                           border: '1px solid var(--border)', borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: 'pointer',
                         }}>
-                        <UserCheck size={14} /> Segna cliente
+                        <UserCheck size={14} /> È cliente
                       </button>
                     )}
                   </div>

@@ -99976,6 +99976,8 @@ async function maybeAutoReply(acc, row) {
   const fromAddr = (row.from_addr || "").toLowerCase();
   if (!fromAddr || ownAddresses().has(fromAddr)) return null;
   if (isAutomatedSender(fromAddr)) return null;
+  const contact = findContact(fromAddr);
+  if (!contact || contact.type !== "cliente") return null;
   const ageMin = (Date.now() - Date.parse(row.email_date)) / 6e4;
   if (!(ageMin >= 0) || ageMin > replyMaxAgeMin()) return null;
   const key = `email:${fromAddr}`;

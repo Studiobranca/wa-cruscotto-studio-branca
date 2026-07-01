@@ -12,11 +12,14 @@
  *  - SOLA LETTURA in ingresso (non cancella/sposta nulla sul server).
  *  - Auto-risposta SOLO a email recenti (< EMAIL_REPLY_MAX_AGE_MIN, default 120 min) →
  *    al primo giro NON risponde al pregresso già in inbox.
- *  - Auto-risposta SOLO categoria 'lavoro'; MAI a mittenti automatici/noreply; MAI alle
- *    urgenze (need_human) → quelle restano senza risposta automatica e generano un alert
- *    email dedicato a Mariano (rev. 01/07/2026: prima solo appuntamenti/documenti
- *    auto-rispondevano, ora ogni risposta di merito non urgente parte da sola — stessa
- *    logica già attiva su WhatsApp, "allarga la maglia, valuta solo le criticità").
+ *  - Auto-risposta SOLO se il mittente è marcato ESPLICITAMENTE "È cliente" in rubrica
+ *    (pulsante nel Cruscotto → contacts.ts): la categoria 'lavoro' da sola NON basta (può
+ *    derivare da una parola chiave anche per un mittente mai confermato come cliente).
+ *    MAI a mittenti automatici/noreply; MAI alle urgenze (need_human) → quelle restano
+ *    senza risposta automatica e generano un alert email dedicato a Mariano (rev. 01/07/2026:
+ *    prima solo appuntamenti/documenti auto-rispondevano, ora ogni risposta di merito non
+ *    urgente di un cliente confermato parte da sola — stessa logica già attiva su WhatsApp,
+ *    "allarga la maglia, valuta solo le criticità").
  *  - Tutto isolato: si attiva solo con le credenziali via env; un errore qui non tocca il bot.
  */
 import { ImapFlow } from 'imapflow';
@@ -221,6 +224,13 @@ async function maybeAutoReply(acc: MailAccount, row: {
   const fromAddr = (row.from_addr || '').toLowerCase();
   if (!fromAddr || ownAddresses().has(fromAddr)) return null;     // mai a noi stessi
   if (isAutomatedSender(fromAddr)) return null;                   // mai a mittenti automatici
+  // AUTORIZZAZIONE ESPLICITA (rev. 01/07/2026, pulsante "È cliente" nel Cruscotto): la
+  // categoria 'lavoro' da sola NON basta per autorizzare l'invio automatico — può derivare
+  // da una parola chiave anche per un mittente MAI confermato come cliente dallo studio.
+  // Solo un contatto marcato esplicitamente 'cliente' in rubrica autorizza l'auto-risposta;
+  // gli altri restano segnalati (categoria/notifica) ma senza invio automatico.
+  const contact = contacts.findContact(fromAddr);
+  if (!contact || contact.type !== 'cliente') return null;
   // SOLO email recenti → niente risposte al pregresso in inbox al primo giro.
   const ageMin = (Date.now() - Date.parse(row.email_date)) / 60000;
   if (!(ageMin >= 0) || ageMin > replyMaxAgeMin()) return null;
