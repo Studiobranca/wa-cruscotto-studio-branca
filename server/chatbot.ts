@@ -17,6 +17,7 @@ import { createCalendarEvent, updateCalendarEvent, appendEventDescription } from
 import { broadcastEvent } from './sse.js';
 import { resolveIdentities } from './contacts.js';
 import { sanitizeClientText, type SanitizeResult } from './sanitize.js';
+import { detectRegisterFromTranscript } from './register.js';
 
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
 const ANTHROPIC_VERSION = '2023-06-01';
@@ -805,7 +806,15 @@ export async function generateReplyCore(
     ? `\n\nCANALE = EMAIL. Stai rispondendo via email a un messaggio che il cliente ha inviato allo studio (spesso ALLEGANDO documenti). Scrivi una email cordiale e completa: saluto iniziale ("Gentile ...,"), corpo, chiusura con firma. Quando chiedi documenti o ne confermi la ricezione, di' di inviarli "${dest}". FORMATTAZIONE: qui la regola 6 sul *singolo asterisco* NON si applica — l'email è testo semplice, nessun carattere di enfasi verrà interpretato. NON usare asterischi, cancelletti o altri simboli Markdown per grassetto/enfasi/titoli: scrivi in prosa piana, ordinata in paragrafi brevi, con eventuali elenchi puntati solo col trattino "- ". Nessuna emoji nelle email (canale formale). Per il resto valgono tutte le regole (orari, dedup, zero-errori, niente quantificazioni del singolo caso).`
     : '';
 
-  const system = `${SYSTEM_PROMPT}\n\nData odierna: ${todayStr} (${todayISO}). Usa SEMPRE date coerenti con oggi e non inventare l'anno.${apptBlock}${channelNote}`;
+  // REGISTRO tu/Lei (regola 3): rilevato in modo deterministico dai messaggi del
+  // cliente e imposto esplicitamente al modello (il solo prompt non bastava). Su EMAIL
+  // si usa sempre il Lei (canale formale). Nel dubbio → Lei.
+  const reg = channel === 'email' ? 'lei' : detectRegisterFromTranscript(userContent);
+  const registerBlock = reg === 'tu'
+    ? `\n\n⚠️ REGISTRO DA USARE: il cliente ti dà del TU. Rispondi TUTTO il messaggio dandogli del tu (verbi e pronomi alla 2ª persona singolare: "ti", "tu", "puoi", "ti aspetto"). NON passare al Lei.`
+    : `\n\n⚠️ REGISTRO DA USARE: usa il Lei (registro formale di cortesia) per tutto il messaggio.`;
+
+  const system = `${SYSTEM_PROMPT}\n\nData odierna: ${todayStr} (${todayISO}). Usa SEMPRE date coerenti con oggi e non inventare l'anno.${registerBlock}${apptBlock}${channelNote}`;
 
   for (let loop = 0; loop < MAX_TOOL_LOOPS; loop++) {
     let data: any;

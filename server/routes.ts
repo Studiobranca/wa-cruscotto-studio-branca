@@ -70,7 +70,7 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.9.14', built: new Date().toISOString() });
+  res.json({ version: '2.9.15', built: new Date().toISOString() });
 });
 
 // ─── Autocheck (self-test + autocorrezione) ──────────────────────────────────
@@ -781,6 +781,32 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
 
     const timestamp = new Date(momment).toISOString();
     const now = new Date().toISOString();
+
+    // ─── DEDUP eco fromMe (fix doppio log, rev. 03/07) ────────────────────────
+    // Con notifySentByMe:true Z-API rinvia al webhook anche i messaggi inviati da
+    // noi (fromMe). Ogni risposta del BOT veniva quindi loggata DUE volte: la riga
+    // locale `bot_...` (creata al momento dell'invio) + l'eco Z-API con messageId
+    // esatto. NON è doppia consegna (l'invio è uno solo), ma doppia RIGA. Se l'eco
+    // corrisponde a un invio bot già loggato di recente, non la re-inseriamo.
+    // Le risposte MANUALI di Mariano dal telefono NON hanno una riga `bot_` gemella
+    // → non vengono deduplicate (restano tracciate, come da regola #10).
+    if (fromMe && content && content.trim()) {
+      const since = new Date(Date.now() - 180000).toISOString();
+      const echoOf = db.prepare(
+        `SELECT id FROM live_messages
+           WHERE phone = ? AND direction = 'sent' AND message_id LIKE 'bot_%'
+             AND TRIM(content) = TRIM(?) AND created_at >= ? LIMIT 1`
+      ).get(phone, content, since) as any;
+      if (echoOf) {
+        // Non re-inserire la riga, ma tieni allineato il conteggio invii della
+        // conversazione (che prima veniva incrementato proprio dall'eco).
+        db.prepare(
+          `UPDATE conversations SET last_message = ?, last_message_at = ?, total_sent = total_sent + 1 WHERE phone = ?`
+        ).run(content, new Date(momment).toISOString(), phone);
+        console.log(`[Webhook] Eco fromMe deduplicata per ${phone} (invio bot già loggato #${echoOf.id}).`);
+        return res.json({ ok: true, deduped: true });
+      }
+    }
 
     // Save message
     const groupName = isGroup ? (body.groupName || body.name || phone) : null;

@@ -103,8 +103,8 @@ var require_depd = __commonJS({
       return deprecate;
     }
     function eehaslisteners(emitter, type) {
-      var count = typeof emitter.listenerCount !== "function" ? emitter.listeners(type).length : emitter.listenerCount(type);
-      return count > 0;
+      var count2 = typeof emitter.listenerCount !== "function" ? emitter.listeners(type).length : emitter.listenerCount(type);
+      return count2 > 0;
     }
     function isignored(namespace) {
       if (process.noDeprecation) {
@@ -17127,16 +17127,16 @@ var require_urlencoded = __commonJS({
       }
     }
     function parameterCount(body, limit) {
-      var count = 0;
+      var count2 = 0;
       var index = -1;
       do {
-        count++;
-        if (count > limit) {
+        count2++;
+        if (count2 > limit) {
           return void 0;
         }
         index = body.indexOf("&", index + 1);
       } while (index !== -1);
-      return count;
+      return count2;
     }
     function parser(name) {
       var mod = parsers[name];
@@ -20853,8 +20853,8 @@ var require_send = __commonJS({
       return typeof res.getHeaderNames !== "function" ? Object.keys(res._headers || {}) : res.getHeaderNames();
     }
     function hasListeners(emitter, type) {
-      var count = typeof emitter.listenerCount !== "function" ? emitter.listeners(type).length : emitter.listenerCount(type);
-      return count > 0;
+      var count2 = typeof emitter.listenerCount !== "function" ? emitter.listeners(type).length : emitter.listenerCount(type);
+      return count2 > 0;
     }
     function headersSent(res) {
       return typeof res.headersSent !== "boolean" ? Boolean(res._header) : res.headersSent;
@@ -22543,13 +22543,13 @@ var require_mediaType = __commonJS({
       return spec.q > 0;
     }
     function quoteCount(string) {
-      var count = 0;
+      var count2 = 0;
       var index = 0;
       while ((index = string.indexOf('"', index)) !== -1) {
-        count++;
+        count2++;
         index++;
       }
-      return count;
+      return count2;
     }
     function splitKeyValuePair(str) {
       var index = str.indexOf("=");
@@ -25102,6 +25102,72 @@ var init_sanitize = __esm({
   }
 });
 
+// server/register.ts
+function count(text, markers) {
+  return markers.reduce((n, re) => n + (re.test(text) ? 1 : 0), 0);
+}
+function detectRegister(clientText) {
+  const t = String(clientText || "");
+  if (!t.trim()) return "unknown";
+  const tu = count(t, TU_MARKERS);
+  const lei = count(t, LEI_MARKERS);
+  if (tu > lei) return "tu";
+  if (lei > tu) return "lei";
+  return "unknown";
+}
+function detectRegisterFromTranscript(transcript) {
+  const lines = String(transcript || "").match(/\[CLIENTE\][^\n]*/g) || [];
+  const clientText = lines.map((l) => l.replace(/^\[CLIENTE\]\s*/, "")).join("\n");
+  return detectRegister(clientText);
+}
+var TU_MARKERS, LEI_MARKERS;
+var init_register = __esm({
+  "server/register.ts"() {
+    "use strict";
+    TU_MARKERS = [
+      /\bti\b/i,
+      /\btu\b/i,
+      /\btuo\b/i,
+      /\btua\b/i,
+      /\btuoi\b/i,
+      /\btue\b/i,
+      /\bte\b/i,
+      /\bciao\b/i,
+      /\bsei\b/i,
+      /\bhai\b/i,
+      /\bpuoi\b/i,
+      /\bfai\b/i,
+      /\bvuoi\b/i,
+      /\bdevi\b/i,
+      /\bsai\b/i,
+      /\bdimmi\b/i,
+      /\bfammi\b/i,
+      /\bscusami\b/i,
+      /\bfacci\b/i,
+      /\bmandami\b/i
+    ];
+    LEI_MARKERS = [
+      /\blei\b/i,
+      /\bpuò\b/i,
+      /\bla ringrazio\b/i,
+      /\ble allego\b/i,
+      /\ble invio\b/i,
+      /\bla prego\b/i,
+      /\bla saluto\b/i,
+      /\bmi dica\b/i,
+      /\bvoglia\b/i,
+      /\bgentile\b/i,
+      /\bsalve\b/i,
+      /\bcortese/i,
+      /\bdistinti saluti\b/i,
+      /\bcordiali saluti\b/i,
+      /\ble chiedo\b/i,
+      /\ble sarei grato\b/i,
+      /\battendo un suo\b/i
+    ];
+  }
+});
+
 // server/chatbot.ts
 function recordDocNote(phone, summary) {
   db_default.prepare(`INSERT INTO bot_doc_notes (phone, summary) VALUES (?, ?)`).run(phone, summary);
@@ -25459,9 +25525,15 @@ APPUNTAMENTO IN ATTESA DI CONFERMA per questo cliente: ${pendingAppt.date} alle 
   const channelNote = channel === "email" ? `
 
 CANALE = EMAIL. Stai rispondendo via email a un messaggio che il cliente ha inviato allo studio (spesso ALLEGANDO documenti). Scrivi una email cordiale e completa: saluto iniziale ("Gentile ...,"), corpo, chiusura con firma. Quando chiedi documenti o ne confermi la ricezione, di' di inviarli "${dest}". FORMATTAZIONE: qui la regola 6 sul *singolo asterisco* NON si applica \u2014 l'email \xE8 testo semplice, nessun carattere di enfasi verr\xE0 interpretato. NON usare asterischi, cancelletti o altri simboli Markdown per grassetto/enfasi/titoli: scrivi in prosa piana, ordinata in paragrafi brevi, con eventuali elenchi puntati solo col trattino "- ". Nessuna emoji nelle email (canale formale). Per il resto valgono tutte le regole (orari, dedup, zero-errori, niente quantificazioni del singolo caso).` : "";
+  const reg = channel === "email" ? "lei" : detectRegisterFromTranscript(userContent);
+  const registerBlock = reg === "tu" ? `
+
+\u26A0\uFE0F REGISTRO DA USARE: il cliente ti d\xE0 del TU. Rispondi TUTTO il messaggio dandogli del tu (verbi e pronomi alla 2\xAA persona singolare: "ti", "tu", "puoi", "ti aspetto"). NON passare al Lei.` : `
+
+\u26A0\uFE0F REGISTRO DA USARE: usa il Lei (registro formale di cortesia) per tutto il messaggio.`;
   const system = `${SYSTEM_PROMPT}
 
-Data odierna: ${todayStr} (${todayISO}). Usa SEMPRE date coerenti con oggi e non inventare l'anno.${apptBlock}${channelNote}`;
+Data odierna: ${todayStr} (${todayISO}). Usa SEMPRE date coerenti con oggi e non inventare l'anno.${registerBlock}${apptBlock}${channelNote}`;
   for (let loop = 0; loop < MAX_TOOL_LOOPS; loop++) {
     let data;
     try {
@@ -25699,6 +25771,7 @@ var init_chatbot = __esm({
     init_sse();
     init_contacts();
     init_sanitize();
+    init_register();
     ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
     ANTHROPIC_VERSION = "2023-06-01";
     DEFAULT_MODEL = "claude-sonnet-4-6";
@@ -70519,15 +70592,15 @@ var require_imap_flow = __commonJS({
         if (!untagged || !untagged.command || isNaN(untagged.command)) {
           return;
         }
-        let count = Number(untagged.command);
-        if (count === this.mailbox.exists) {
+        let count2 = Number(untagged.command);
+        if (count2 === this.mailbox.exists) {
           return;
         }
         let prevCount = this.mailbox.exists;
-        this.mailbox.exists = count;
+        this.mailbox.exists = count2;
         this.emit("exists", {
           path: this.mailbox.path,
-          count,
+          count: count2,
           prevCount
         });
       }
@@ -100684,7 +100757,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.9.14", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.9.15", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/selftest", (_req, res) => {
   res.json(getLastSelfCheck() || { note: "mai eseguito" });
@@ -101340,6 +101413,21 @@ _(Originale: ${textToTranslate})_`;
     }
     const timestamp = new Date(momment).toISOString();
     const now = (/* @__PURE__ */ new Date()).toISOString();
+    if (fromMe && content && content.trim()) {
+      const since = new Date(Date.now() - 18e4).toISOString();
+      const echoOf = db_default.prepare(
+        `SELECT id FROM live_messages
+           WHERE phone = ? AND direction = 'sent' AND message_id LIKE 'bot_%'
+             AND TRIM(content) = TRIM(?) AND created_at >= ? LIMIT 1`
+      ).get(phone, content, since);
+      if (echoOf) {
+        db_default.prepare(
+          `UPDATE conversations SET last_message = ?, last_message_at = ?, total_sent = total_sent + 1 WHERE phone = ?`
+        ).run(content, new Date(momment).toISOString(), phone);
+        console.log(`[Webhook] Eco fromMe deduplicata per ${phone} (invio bot gi\xE0 loggato #${echoOf.id}).`);
+        return res.json({ ok: true, deduped: true });
+      }
+    }
     const groupName = isGroup ? body.groupName || body.name || phone : null;
     const effectiveSenderName = isGroup ? senderName || body.participantPhone || phone : senderName || phone;
     db_default.prepare(`
