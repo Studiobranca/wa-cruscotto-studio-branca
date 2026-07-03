@@ -20,6 +20,7 @@ import {
 import {
   generateDraft,
   saveDraft,
+  sanitizeReply,
   getPendingDrafts,
   getDraft,
   markDraftSent,
@@ -69,7 +70,7 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.9.13', built: new Date().toISOString() });
+  res.json({ version: '2.9.14', built: new Date().toISOString() });
 });
 
 // ─── Autocheck (self-test + autocorrezione) ──────────────────────────────────
@@ -980,17 +981,41 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
             // Messaggio di cortesia auto SOLO se autoSend è attivo. Con autoSend OFF
             // (default) il bot NON scrive nulla di propria iniziativa ai clienti.
             if (isAutoSendEnabled() && outcome.result?.draftText && !courtesySentToday(phone)) {
-              const id = saveDraft({ phone, contactName: cName, incoming: content, result: outcome.result });
-              const r = await approveDraftCore(id, { force: true });
-              if (r.ok) markCourtesySent(phone);
-              broadcastEvent('bot_draft', { id, phone, contactName: cName, needsHuman: false, autoSent: r.ok, personal: true });
-              console.log(`[Chatbot] Cortesia (non-lavoro) ${r.ok ? 'inviata' : 'NON inviata'} a ${cName} (${phone})`);
+              // Guardrail anche sulla cortesia: se il testo non è sicuro, non inviarlo.
+              const sanC = sanitizeReply(outcome.result.draftText);
+              if (!sanC.safe) {
+                console.warn(`[Sanitizer] Cortesia per ${cName} (${phone}) non isolabile in sicurezza → NON inviata.`);
+              } else {
+                if (sanC.changed) outcome.result.draftText = sanC.clean;
+                const id = saveDraft({ phone, contactName: cName, incoming: content, result: outcome.result });
+                const r = await approveDraftCore(id, { force: true });
+                if (r.ok) markCourtesySent(phone);
+                broadcastEvent('bot_draft', { id, phone, contactName: cName, needsHuman: false, autoSent: r.ok, personal: true });
+                console.log(`[Chatbot] Cortesia (non-lavoro) ${r.ok ? 'inviata' : 'NON inviata'} a ${cName} (${phone})`);
+              }
             } else {
               console.log(`[Chatbot] Messaggio personale — ${cName} (${phone}) (nessun invio: autoSend off o cortesia già inviata)`);
             }
           } else if (outcome?.kind === 'work' && outcome.result) {
             recordClassification(messageId, phone, day, 'work');
             const res = outcome.result;
+            // ─── GUARDRAIL anti-leak ragionamento/nome-tool (problema 1, rev. 03/07) ───
+            // Prima di QUALSIASI auto-invio, ripulisci il testo: se il modello ha lasciato
+            // un preambolo di ragionamento o un nome di strumento interno, va rimosso. Se
+            // il testo-cliente NON è isolabile in sicurezza, NON si auto-invia: la risposta
+            // resta BOZZA needs_human (revisione dal Cruscotto) — comportamento di sicurezza
+            // preferito visto che l'auto-invio è ON.
+            const wouldAutoSend = (!!res.appointmentFlow && !res.needsHuman && isAutoAppointmentsEnabled())
+              || (isAutoSendEnabled() && !res.needsHuman);
+            let sanitizerDiverted = false;
+            const san = sanitizeReply(res.draftText);
+            if (!san.safe) {
+              if (wouldAutoSend) { res.needsHuman = true; sanitizerDiverted = true; }
+              console.warn(`[Sanitizer] ${cName} (${phone}): testo NON isolabile in sicurezza (rimossi=${san.removed.length}, tool residuo=${san.residualTool}) → ${wouldAutoSend ? 'deviato a BOZZA needs_human, testo grezzo NON inviato' : 'resta bozza da revisionare'}.`);
+            } else if (san.changed) {
+              res.draftText = san.clean;
+              console.warn(`[Sanitizer] ${cName} (${phone}): rimosso preambolo di ragionamento (${san.removed.length} blocco/i) prima dell'invio.`);
+            }
             const id = saveDraft({ phone, contactName: cName, incoming: content, result: res });
             // APPUNTAMENTI in autonomia: il flusso agenda (proposta/conferma/spostamento)
             // parte da solo DOPO aver incrociato Google Calendar — automatismo voluto e
@@ -998,8 +1023,8 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
             // risposte di merito restano BOZZA salvo autoSend globale (lucchettato). Le
             // urgenze (need_human) non partono mai da sole.
             const isUrgent = res.needsHuman;
-            const autonomousAppt = !!res.appointmentFlow && !isUrgent && isAutoAppointmentsEnabled();
-            const globalAuto = isAutoSendEnabled() && !isUrgent;
+            const autonomousAppt = !!res.appointmentFlow && !isUrgent && isAutoAppointmentsEnabled() && !sanitizerDiverted;
+            const globalAuto = isAutoSendEnabled() && !isUrgent && !sanitizerDiverted;
             if (autonomousAppt || globalAuto) {
               // Appuntamento autonomo: NON forzare (l'agenda viene ricontrollata in
               // approveDraftCore → niente sovrapposizioni). autoSend globale: invio forzato.

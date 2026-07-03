@@ -25054,6 +25054,54 @@ var init_contacts = __esm({
   }
 });
 
+// server/sanitize.ts
+function buildToolRe(toolNames) {
+  const names = (toolNames || []).filter(Boolean).map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  if (names.length === 0) return null;
+  return new RegExp("\\b(" + names.join("|") + ")\\b", "i");
+}
+function isReasoning(par, toolRe) {
+  const p = (par || "").trim();
+  if (!p) return false;
+  if (toolRe && toolRe.test(p)) return true;
+  return META_MARKERS.some((re) => re.test(p));
+}
+function sanitizeClientText(raw, toolNames) {
+  const original = String(raw ?? "");
+  const toolRe = buildToolRe(toolNames);
+  const paras = original.split(/\n{2,}/);
+  const removed = [];
+  let i = 0;
+  while (i < paras.length && isReasoning(paras[i], toolRe)) {
+    removed.push(paras[i].trim());
+    i++;
+  }
+  const clean = paras.slice(i).join("\n\n").trim();
+  const residualTool = !!toolRe && toolRe.test(clean);
+  const changed = removed.length > 0;
+  const firstRemainingIsReasoning = clean ? isReasoning(clean.split(/\n{2,}/)[0], toolRe) : true;
+  const safe = clean.length >= 20 && !residualTool && !firstRemainingIsReasoning;
+  return { clean, original, removed, residualTool, changed, safe };
+}
+var META_MARKERS;
+var init_sanitize = __esm({
+  "server/sanitize.ts"() {
+    "use strict";
+    META_MARKERS = [
+      /\b(la|il)\s+client[ei]\b/i,
+      // "la cliente"/"il cliente": 3ª persona sul destinatario
+      /\bl['’]utente\b/i,
+      /\bnon\s+(chiamo|invoco|chiamer[oò])\b/i,
+      // meta sull'uso degli strumenti
+      /\bnon\s+è\s+una\s+conferma\b/i,
+      // analisi del messaggio del cliente
+      /\bavviso\s+con\s+garbo\b/i,
+      // "stage direction" del modello
+      /\b(chiamo|invoco|uso)\s+(il\s+|lo\s+|la\s+)?(tool|strumento|funzione)\b/i
+    ];
+  }
+});
+
 // server/chatbot.ts
 function recordDocNote(phone, summary) {
   db_default.prepare(`INSERT INTO bot_doc_notes (phone, summary) VALUES (?, ?)`).run(phone, summary);
@@ -25211,6 +25259,9 @@ function shouldNotifyControl() {
   if (m === "off") return false;
   if (m === "always") return true;
   return !isBusinessHoursRome();
+}
+function sanitizeReply(raw) {
+  return sanitizeClientText(raw, BOT_TOOL_NAMES);
 }
 function buildTranscript(phone, contactName) {
   const rows = db_default.prepare(`
@@ -25637,7 +25688,7 @@ Rispondi "OK ${id} FORZA" per confermare comunque l'appuntamento.`;
   if (!r.ok) return `\u274C ${r.message}`;
   return `\u2705 Inviato a ${r.contactName || d.phone}.${r.hadEvent ? " Appuntamento [DA CONFERMARE] in agenda." : ""}`;
 }
-var ANTHROPIC_URL, ANTHROPIC_VERSION, DEFAULT_MODEL, MAX_TOOL_LOOPS, HISTORY_LIMIT, SYSTEM_PROMPT, TOOLS, BREVO_URL, ALERT_SENDER;
+var ANTHROPIC_URL, ANTHROPIC_VERSION, DEFAULT_MODEL, MAX_TOOL_LOOPS, HISTORY_LIMIT, SYSTEM_PROMPT, TOOLS, BOT_TOOL_NAMES, BREVO_URL, ALERT_SENDER;
 var init_chatbot = __esm({
   "server/chatbot.ts"() {
     "use strict";
@@ -25647,6 +25698,7 @@ var init_chatbot = __esm({
     init_integrations();
     init_sse();
     init_contacts();
+    init_sanitize();
     ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
     ANTHROPIC_VERSION = "2023-06-01";
     DEFAULT_MODEL = "claude-sonnet-4-6";
@@ -25839,8 +25891,23 @@ REGOLE GENERALI:
    una conferma), MAI pi\xF9 di una nello stesso messaggio e MAI emoji decorative o giocose (\u{1F389}\u{1F60A}
    e simili): lo studio comunica con un tono professionale, non da chat informale.
 
-Il tuo output finale deve contenere ESCLUSIVAMENTE il testo del messaggio da inviare al
-cliente: NIENTE analisi, premesse, ragionamenti o commenti tra parentesi.`;
+SOLO IL TESTO PER IL CLIENTE (INDEROGABILE \u2014 la tua risposta viene inviata cos\xEC com'\xE8):
+- Il blocco di testo che produci come risposta deve contenere ESCLUSIVAMENTE le parole
+  rivolte al cliente, esattamente come le legger\xE0 lui. Comincia direttamente dal saluto o
+  dalla frase per il cliente.
+- \xC8 VIETATO scrivere nel testo qualsiasi: ragionamento, analisi del messaggio del cliente,
+  spiegazione di cosa stai facendo o perch\xE9, meta-commento, premessa, note per lo studio,
+  didascalie o commenti tra parentesi. Esempi VIETATI da NON scrivere mai:
+  "La cliente non ha confermato...", "Il 'va bene' \xE8 ambiguo...", "Avviso con garbo e propongo...",
+  "Non chiamo confirm_appointment", "Non faccio propose_booking".
+- \xC8 VIETATO nominare nel testo gli strumenti/funzioni interni (get_availability, propose_booking,
+  confirm_appointment, need_human, check_walkin_now, note_documents, already_handled,
+  ignore_personal, find_previous_requests) o qualunque nome di funzione/tool.
+- Le decisioni operative (proporre/confermare/spostare un appuntamento, segnalare un'urgenza,
+  classificare un messaggio) si prendono ESCLUSIVAMENTE chiamando i tool con la tool-call
+  apposita: NON vanno descritte, motivate o annunciate nel testo per il cliente.
+- Se hai bisogno di ragionare, fallo tramite le tool-call e i loro risultati, mai nel testo
+  finale. Il testo finale \xE8 solo ci\xF2 che il cliente deve leggere: nient'altro.`;
     TOOLS = [
       {
         name: "get_availability",
@@ -25922,6 +25989,7 @@ cliente: NIENTE analisi, premesse, ragionamenti o commenti tra parentesi.`;
         }
       }
     ];
+    BOT_TOOL_NAMES = TOOLS.map((t) => t.name);
     db_default.exec(`
   CREATE TABLE IF NOT EXISTS bot_msg_class (
     message_id TEXT PRIMARY KEY,
@@ -100001,6 +100069,16 @@ ${row.body}`;
     return null;
   }
   if (!res.draftText) return null;
+  const san = sanitizeReply(res.draftText);
+  if (!san.safe) {
+    console.warn(`[Sanitizer] Email ${fromAddr}: risposta non isolabile in sicurezza (rimossi=${san.removed.length}, tool residuo=${san.residualTool}) \u2192 NON auto-inviata.`);
+    await notifyUrgentEmail(row, "Risposta automatica bloccata dal guardrail anti-ragionamento: da gestire a mano.");
+    return null;
+  }
+  if (san.changed) {
+    res.draftText = san.clean;
+    console.warn(`[Sanitizer] Email ${fromAddr}: rimosso preambolo di ragionamento (${san.removed.length} blocco/i) prima dell'invio.`);
+  }
   const isAppt = !!res.appointmentFlow || !!res.proposedEvent;
   const isDoc = !!res.docNoted;
   try {
@@ -100606,7 +100684,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.9.13", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.9.14", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/selftest", (_req, res) => {
   res.json(getLastSelfCheck() || { note: "mai eseguito" });
@@ -101445,21 +101523,40 @@ Da confermare.`,
           if (outcome?.kind === "personal") {
             recordClassification(messageId, phone, day, "personal");
             if (isAutoSendEnabled() && outcome.result?.draftText && !courtesySentToday(phone)) {
-              const id = saveDraft({ phone, contactName: cName, incoming: content, result: outcome.result });
-              const r = await approveDraftCore(id, { force: true });
-              if (r.ok) markCourtesySent(phone);
-              broadcastEvent("bot_draft", { id, phone, contactName: cName, needsHuman: false, autoSent: r.ok, personal: true });
-              console.log(`[Chatbot] Cortesia (non-lavoro) ${r.ok ? "inviata" : "NON inviata"} a ${cName} (${phone})`);
+              const sanC = sanitizeReply(outcome.result.draftText);
+              if (!sanC.safe) {
+                console.warn(`[Sanitizer] Cortesia per ${cName} (${phone}) non isolabile in sicurezza \u2192 NON inviata.`);
+              } else {
+                if (sanC.changed) outcome.result.draftText = sanC.clean;
+                const id = saveDraft({ phone, contactName: cName, incoming: content, result: outcome.result });
+                const r = await approveDraftCore(id, { force: true });
+                if (r.ok) markCourtesySent(phone);
+                broadcastEvent("bot_draft", { id, phone, contactName: cName, needsHuman: false, autoSent: r.ok, personal: true });
+                console.log(`[Chatbot] Cortesia (non-lavoro) ${r.ok ? "inviata" : "NON inviata"} a ${cName} (${phone})`);
+              }
             } else {
               console.log(`[Chatbot] Messaggio personale \u2014 ${cName} (${phone}) (nessun invio: autoSend off o cortesia gi\xE0 inviata)`);
             }
           } else if (outcome?.kind === "work" && outcome.result) {
             recordClassification(messageId, phone, day, "work");
             const res2 = outcome.result;
+            const wouldAutoSend = !!res2.appointmentFlow && !res2.needsHuman && isAutoAppointmentsEnabled() || isAutoSendEnabled() && !res2.needsHuman;
+            let sanitizerDiverted = false;
+            const san = sanitizeReply(res2.draftText);
+            if (!san.safe) {
+              if (wouldAutoSend) {
+                res2.needsHuman = true;
+                sanitizerDiverted = true;
+              }
+              console.warn(`[Sanitizer] ${cName} (${phone}): testo NON isolabile in sicurezza (rimossi=${san.removed.length}, tool residuo=${san.residualTool}) \u2192 ${wouldAutoSend ? "deviato a BOZZA needs_human, testo grezzo NON inviato" : "resta bozza da revisionare"}.`);
+            } else if (san.changed) {
+              res2.draftText = san.clean;
+              console.warn(`[Sanitizer] ${cName} (${phone}): rimosso preambolo di ragionamento (${san.removed.length} blocco/i) prima dell'invio.`);
+            }
             const id = saveDraft({ phone, contactName: cName, incoming: content, result: res2 });
             const isUrgent = res2.needsHuman;
-            const autonomousAppt = !!res2.appointmentFlow && !isUrgent && isAutoAppointmentsEnabled();
-            const globalAuto = isAutoSendEnabled() && !isUrgent;
+            const autonomousAppt = !!res2.appointmentFlow && !isUrgent && isAutoAppointmentsEnabled() && !sanitizerDiverted;
+            const globalAuto = isAutoSendEnabled() && !isUrgent && !sanitizerDiverted;
             if (autonomousAppt || globalAuto) {
               const r = await approveDraftCore(id, { force: globalAuto && !autonomousAppt });
               if (r.ok) {

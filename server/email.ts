@@ -26,7 +26,7 @@ import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import nodemailer from 'nodemailer';
 import { db } from './db.js';
-import { generateReplyCore, materializeProposedEvent, getControlNumber, sendStudioAlertEmail } from './chatbot.js';
+import { generateReplyCore, materializeProposedEvent, getControlNumber, sendStudioAlertEmail, sanitizeReply } from './chatbot.js';
 import { sendTextMessage } from './zapi.js';
 import * as contacts from './contacts.js';
 
@@ -253,6 +253,19 @@ async function maybeAutoReply(acc: MailAccount, row: {
     return null;
   }
   if (!res.draftText) return null;
+  // GUARDRAIL anti-leak (problema 1): mai auto-inviare ragionamento/nomi-tool. Se il
+  // testo non è isolabile in sicurezza, NON si risponde in automatico: si avvisa
+  // Mariano e l'email resta da gestire a mano dal Cruscotto.
+  const san = sanitizeReply(res.draftText);
+  if (!san.safe) {
+    console.warn(`[Sanitizer] Email ${fromAddr}: risposta non isolabile in sicurezza (rimossi=${san.removed.length}, tool residuo=${san.residualTool}) → NON auto-inviata.`);
+    await notifyUrgentEmail(row, 'Risposta automatica bloccata dal guardrail anti-ragionamento: da gestire a mano.');
+    return null;
+  }
+  if (san.changed) {
+    res.draftText = san.clean;
+    console.warn(`[Sanitizer] Email ${fromAddr}: rimosso preambolo di ragionamento (${san.removed.length} blocco/i) prima dell'invio.`);
+  }
   const isAppt = !!res.appointmentFlow || !!res.proposedEvent;
   const isDoc = !!res.docNoted;
 

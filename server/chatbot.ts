@@ -16,6 +16,7 @@ import { sendTextMessage } from './zapi.js';
 import { createCalendarEvent, updateCalendarEvent, appendEventDescription } from './integrations.js';
 import { broadcastEvent } from './sse.js';
 import { resolveIdentities } from './contacts.js';
+import { sanitizeClientText, type SanitizeResult } from './sanitize.js';
 
 const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
 const ANTHROPIC_VERSION = '2023-06-01';
@@ -433,8 +434,23 @@ REGOLE GENERALI:
    una conferma), MAI più di una nello stesso messaggio e MAI emoji decorative o giocose (🎉😊
    e simili): lo studio comunica con un tono professionale, non da chat informale.
 
-Il tuo output finale deve contenere ESCLUSIVAMENTE il testo del messaggio da inviare al
-cliente: NIENTE analisi, premesse, ragionamenti o commenti tra parentesi.`;
+SOLO IL TESTO PER IL CLIENTE (INDEROGABILE — la tua risposta viene inviata così com'è):
+- Il blocco di testo che produci come risposta deve contenere ESCLUSIVAMENTE le parole
+  rivolte al cliente, esattamente come le leggerà lui. Comincia direttamente dal saluto o
+  dalla frase per il cliente.
+- È VIETATO scrivere nel testo qualsiasi: ragionamento, analisi del messaggio del cliente,
+  spiegazione di cosa stai facendo o perché, meta-commento, premessa, note per lo studio,
+  didascalie o commenti tra parentesi. Esempi VIETATI da NON scrivere mai:
+  "La cliente non ha confermato...", "Il 'va bene' è ambiguo...", "Avviso con garbo e propongo...",
+  "Non chiamo confirm_appointment", "Non faccio propose_booking".
+- È VIETATO nominare nel testo gli strumenti/funzioni interni (get_availability, propose_booking,
+  confirm_appointment, need_human, check_walkin_now, note_documents, already_handled,
+  ignore_personal, find_previous_requests) o qualunque nome di funzione/tool.
+- Le decisioni operative (proporre/confermare/spostare un appuntamento, segnalare un'urgenza,
+  classificare un messaggio) si prendono ESCLUSIVAMENTE chiamando i tool con la tool-call
+  apposita: NON vanno descritte, motivate o annunciate nel testo per il cliente.
+- Se hai bisogno di ragionare, fallo tramite le tool-call e i loro risultati, mai nel testo
+  finale. Il testo finale è solo ciò che il cliente deve leggere: nient'altro.`;
 
 const TOOLS = [
   {
@@ -517,6 +533,20 @@ const TOOLS = [
     },
   },
 ];
+
+// Nomi REALI degli strumenti interni, ricavati dalle definizioni sopra: usati dal
+// guardrail per non lasciarne traccia nel testo inviato al cliente. Derivati (non a
+// mano) così restano automaticamente in sincronia se si aggiunge/rimuove un tool.
+export const BOT_TOOL_NAMES: string[] = TOOLS.map((t) => t.name);
+
+/**
+ * Ripulisce una risposta prima dell'invio, usando i nomi-tool reali di questo bot.
+ * Vedi server/sanitize.ts. Se `safe` è false il chiamante NON deve auto-inviare:
+ * la risposta va lasciata come BOZZA da revisionare a mano.
+ */
+export function sanitizeReply(raw: string): SanitizeResult {
+  return sanitizeClientText(raw, BOT_TOOL_NAMES);
+}
 
 // ─── Cronologia conversazione → trascritto ───────────────────────────────────
 function buildTranscript(phone: string, contactName: string): string {
