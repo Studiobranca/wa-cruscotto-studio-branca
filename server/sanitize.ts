@@ -31,6 +31,13 @@ const META_MARKERS: RegExp[] = [
   /\bnon\s+è\s+una\s+conferma\b/i,       // analisi del messaggio del cliente
   /\bavviso\s+con\s+garbo\b/i,           // "stage direction" del modello
   /\b(chiamo|invoco|uso)\s+(il\s+|lo\s+|la\s+)?(tool|strumento|funzione)\b/i,
+  // Analisi dello storico riferita al cliente (leak del 06/07: "Dallo storico risulta
+  // che Rossella ha parlato… non emerge che abbia inviato…") — meta-ragionamento, mai
+  // testo per il cliente.
+  /\bdallo\s+storico\b/i,
+  /\bnello\s+storico\b/i,
+  /\bdalla\s+conversazione\s+risulta\b/i,
+  /\bnon\s+emerge\s+che\b/i,
 ];
 
 function buildToolRe(toolNames: string[]): RegExp | null {

@@ -47,6 +47,7 @@ import {
   notifyUrgentByEmail,
 } from './chatbot.js';
 import { runDailyDigest, getFlowHealth, repairWebhook, runSelfCheck, getLastSelfCheck } from './maintenance.js';
+import { decideWorkAutoSend } from './autosend.js';
 
 const router = Router();
 
@@ -70,7 +71,7 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.9.15', built: new Date().toISOString() });
+  res.json({ version: '2.9.16', built: new Date().toISOString() });
 });
 
 // ─── Autocheck (self-test + autocorrezione) ──────────────────────────────────
@@ -1048,16 +1049,24 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
             // circoscritto, governato da isAutoAppointmentsEnabled (default ON). Le altre
             // risposte di merito restano BOZZA salvo autoSend globale (lucchettato). Le
             // urgenze (need_human) non partono mai da sole.
-            const isUrgent = res.needsHuman;
-            const autonomousAppt = !!res.appointmentFlow && !isUrgent && isAutoAppointmentsEnabled() && !sanitizerDiverted;
-            const globalAuto = isAutoSendEnabled() && !isUrgent && !sanitizerDiverted;
-            if (autonomousAppt || globalAuto) {
+            // ─── DECISIONE AUTO-INVIO (rev. 03/07, post-incidente 06/07) ──────────────
+            // In AUTONOMIA parte SOLO il flusso APPUNTAMENTI (agenda già incrociata).
+            // OGNI risposta di MERITO e OGNI URGENZA restano BOZZA. Nel dubbio → BOZZA.
+            // Rimosso il vecchio auto-invio generale del merito (`globalAuto`/bot_auto_send):
+            // causava invii non voluti. Logica in server/autosend.ts (pura, testata).
+            const decision = decideWorkAutoSend({
+              appointmentFlow: !!res.appointmentFlow,
+              needsHuman: !!res.needsHuman,
+              autoApptEnabled: isAutoAppointmentsEnabled(),
+              sanitizerDiverted,
+            });
+            if (decision === 'appointment-auto') {
               // Appuntamento autonomo: NON forzare (l'agenda viene ricontrollata in
-              // approveDraftCore → niente sovrapposizioni). autoSend globale: invio forzato.
-              const r = await approveDraftCore(id, { force: globalAuto && !autonomousAppt });
+              // approveDraftCore → niente sovrapposizioni sugli slot).
+              const r = await approveDraftCore(id, { force: false });
               if (r.ok) {
                 broadcastEvent('bot_draft', { id, phone, contactName: cName, needsHuman: false, autoSent: true });
-                console.log(`[Chatbot] ${autonomousAppt ? 'Appuntamento autonomo' : 'Auto-risposta'} a ${cName} (${phone})${r.hadEvent ? ' + appuntamento DA CONFERMARE' : ''}`);
+                console.log(`[Chatbot] Appuntamento autonomo a ${cName} (${phone})${r.hadEvent ? ' + appuntamento DA CONFERMARE' : ''}`);
               } else if (r.conflict) {
                 // Slot occupatosi tra la proposta e l'invio: lascia la bozza in attesa nel Cruscotto.
                 broadcastEvent('bot_draft', { id, phone, contactName: cName, needsHuman: false, conflict: true });

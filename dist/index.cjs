@@ -25097,7 +25097,14 @@ var init_sanitize = __esm({
       // analisi del messaggio del cliente
       /\bavviso\s+con\s+garbo\b/i,
       // "stage direction" del modello
-      /\b(chiamo|invoco|uso)\s+(il\s+|lo\s+|la\s+)?(tool|strumento|funzione)\b/i
+      /\b(chiamo|invoco|uso)\s+(il\s+|lo\s+|la\s+)?(tool|strumento|funzione)\b/i,
+      // Analisi dello storico riferita al cliente (leak del 06/07: "Dallo storico risulta
+      // che Rossella ha parlato… non emerge che abbia inviato…") — meta-ragionamento, mai
+      // testo per il cliente.
+      /\bdallo\s+storico\b/i,
+      /\bnello\s+storico\b/i,
+      /\bdalla\s+conversazione\s+risulta\b/i,
+      /\bnon\s+emerge\s+che\b/i
     ];
   }
 });
@@ -100740,6 +100747,14 @@ function startMaintenance() {
   console.log("[Maintenance] Scheduler avviato (digest 20:30 + watchdog flusso).");
 }
 
+// server/autosend.ts
+function decideWorkAutoSend(i) {
+  if (i.needsHuman) return "draft";
+  if (i.sanitizerDiverted) return "draft";
+  if (i.appointmentFlow && i.autoApptEnabled) return "appointment-auto";
+  return "draft";
+}
+
 // server/routes.ts
 var router = (0, import_express.Router)();
 try {
@@ -100757,7 +100772,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.9.15", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.9.16", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/selftest", (_req, res) => {
   res.json(getLastSelfCheck() || { note: "mai eseguito" });
@@ -101642,14 +101657,17 @@ Da confermare.`,
               console.warn(`[Sanitizer] ${cName} (${phone}): rimosso preambolo di ragionamento (${san.removed.length} blocco/i) prima dell'invio.`);
             }
             const id = saveDraft({ phone, contactName: cName, incoming: content, result: res2 });
-            const isUrgent = res2.needsHuman;
-            const autonomousAppt = !!res2.appointmentFlow && !isUrgent && isAutoAppointmentsEnabled() && !sanitizerDiverted;
-            const globalAuto = isAutoSendEnabled() && !isUrgent && !sanitizerDiverted;
-            if (autonomousAppt || globalAuto) {
-              const r = await approveDraftCore(id, { force: globalAuto && !autonomousAppt });
+            const decision = decideWorkAutoSend({
+              appointmentFlow: !!res2.appointmentFlow,
+              needsHuman: !!res2.needsHuman,
+              autoApptEnabled: isAutoAppointmentsEnabled(),
+              sanitizerDiverted
+            });
+            if (decision === "appointment-auto") {
+              const r = await approveDraftCore(id, { force: false });
               if (r.ok) {
                 broadcastEvent("bot_draft", { id, phone, contactName: cName, needsHuman: false, autoSent: true });
-                console.log(`[Chatbot] ${autonomousAppt ? "Appuntamento autonomo" : "Auto-risposta"} a ${cName} (${phone})${r.hadEvent ? " + appuntamento DA CONFERMARE" : ""}`);
+                console.log(`[Chatbot] Appuntamento autonomo a ${cName} (${phone})${r.hadEvent ? " + appuntamento DA CONFERMARE" : ""}`);
               } else if (r.conflict) {
                 broadcastEvent("bot_draft", { id, phone, contactName: cName, needsHuman: false, conflict: true });
                 console.warn(`[Chatbot] Slot in conflitto per ${cName} (${phone}): bozza #${id} resta in attesa di revisione.`);

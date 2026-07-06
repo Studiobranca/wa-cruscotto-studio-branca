@@ -71,5 +71,21 @@ r = sanitizeClientText(toolInCoda, TOOLS);
 check('toolInCoda residualTool rilevato', r.residualTool === true);
 check('toolInCoda NON safe', r.safe === false);
 
+// 7) Leak del 06/07 (Rossella): analisi dello storico che nomina il cliente → NON safe.
+const rossanaLeak = `Dallo storico risulta che Rossella ha parlato più volte delle buste paga e del pignoramento, ma non emerge che abbia mai inviato fisicamente i documenti (buste paga, atto di pignoramento, comunicazioni Mediolanum).`;
+r = sanitizeClientText(rossanaLeak, TOOLS);
+check('rossanaLeak NON safe', r.safe === false, `clean="${r.clean.slice(0,40)}"`);
+
+// 8) Stesso leak come preambolo prima del testo cliente → rimosso, resta il testo pulito.
+const rossanaLeakPreambolo = `Dallo storico risulta che Rossella ha parlato più volte delle buste paga, ma non emerge che abbia inviato i documenti.
+
+Ciao Rossella! Per procedere ho bisogno che tu ci invii le buste paga e l'atto di pignoramento su questa chat.
+
+Assistente Virtuale — Studio Tributario Branca`;
+r = sanitizeClientText(rossanaLeakPreambolo, TOOLS);
+check('rossanaLeakPreambolo safe dopo pulizia', r.safe === true);
+check('rossanaLeakPreambolo clean inizia con "Ciao Rossella!"', r.clean.startsWith('Ciao Rossella!'), r.clean.slice(0, 30));
+check('rossanaLeakPreambolo SENZA "Dallo storico"', !/Dallo storico|non emerge/i.test(r.clean));
+
 console.log(`\n${fails === 0 ? 'TUTTI I TEST OK' : fails + ' TEST FALLITI'}`);
 process.exit(fails === 0 ? 0 : 1);
