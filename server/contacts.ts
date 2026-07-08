@@ -135,6 +135,30 @@ export function resolveIdentities(key: string): { phone: string | null; email: s
   return { phone: key, email: row?.value || null };
 }
 
+/**
+ * REGOLA INDEROGABILE (Mariano, 08/07/2026): i contatti VIP/high (viplist = familiari,
+ * privati, rapporti personali) NON vanno MAI risposti né gestiti dal bot, su NESSUN
+ * canale e da NESSUN automatismo (bozze, auto-risposte email, promemoria, lista
+ * d'attesa). Li gestisce SOLO Mariano di persona.
+ *
+ * Questo è il guard strutturale unico: accetta una chiave contatto (telefono WhatsApp
+ * o "email:indirizzo"), risolve l'ALTRO canale collegato in rubrica e ritorna true se
+ * UNA QUALSIASI delle identità risulta vip/high in conversations. In dubbio (errore
+ * db, identità non risolvibile) ritorna false SOLO su assenza di riscontro: un VIP
+ * riconoscibile non deve mai passare.
+ */
+export function isVipContact(key: string): boolean {
+  try {
+    const { phone } = resolveIdentities(key);
+    const candidates = [key, phone].filter((k): k is string => !!k && !k.startsWith('email:'));
+    for (const p of candidates) {
+      const row = db.prepare(`SELECT priority FROM conversations WHERE phone = ?`).get(p) as any;
+      if (row && (row.priority === 'vip' || row.priority === 'high')) return true;
+    }
+    return false;
+  } catch { return false; }
+}
+
 /** Scheda contatto: aggrega appuntamenti, note documenti, cronologia email e WhatsApp. */
 export function getContactProfile(value: string): any {
   const v = (value || '').trim().toLowerCase();

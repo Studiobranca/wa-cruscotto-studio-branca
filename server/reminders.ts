@@ -27,6 +27,7 @@ import db from './db.js';
 import { getAvailability, formatAvailabilityIT } from './appointments.js';
 import { sendTextMessage } from './zapi.js';
 import { getControlNumber, getWaitlist, markWaitlistNotified } from './chatbot.js';
+import { isVipContact } from './contacts.js';
 import {
   channelOfKey, inReminderWindow, inRecallWindow, inSlaWindow,
   isTooFresh, sqliteToMs, reminderMessageIT, waitlistRecallMessageIT, slaAlertText,
@@ -81,6 +82,10 @@ export async function runReminders(force = false): Promise<{ sent: number; skipp
   `).all(tomorrow) as any[];
   let sent = 0, skipped = 0;
   for (const a of rows) {
+    // VIP/high (regola inderogabile 08/07/2026): nessun automatismo verso di loro,
+    // nemmeno il promemoria — anche se marcati VIP DOPO la presa dell'appuntamento.
+    // Non si marca reminder_sent: l'appuntamento resta visibile, lo gestisce Mariano.
+    if (isVipContact(a.phone)) { skipped++; continue; }
     // Appuntamento preso da poche ore: il cliente lo ha fresco, niente promemoria.
     if (!force && isTooFresh(a.created_at, Date.now())) { skipped++; continue; }
     const text = reminderMessageIT(a, channelOfKey(a.phone).channel);
@@ -114,6 +119,8 @@ export async function runWaitlistRecall(force = false): Promise<{ notified: numb
   const avail = formatAvailabilityIT(slots);
   let notified = 0;
   for (const w of pending.slice(0, 10)) {
+    // VIP/high: mai ricontatto automatico; la voce resta in_attesa per Mariano.
+    if (isVipContact(w.phone)) continue;
     const text = waitlistRecallMessageIT(w.contact_name, w.reason, avail, channelOfKey(w.phone).channel);
     const ok = await deliver(w.phone, text, 'Nuove disponibilità per un appuntamento — Studio Tributario Branca');
     if (ok) { markWaitlistNotified(w.id); notified++; }

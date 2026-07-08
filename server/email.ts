@@ -251,6 +251,13 @@ async function maybeAutoReply(acc: MailAccount, row: {
   // gli altri restano segnalati (categoria/notifica) ma senza invio automatico.
   const contact = contacts.findContact(fromAddr);
   if (!contact || contact.type !== 'cliente') return null;
+  // VIP/high (regola inderogabile 08/07/2026): MAI risposte/gestione automatica, su nessun
+  // canale — anche se il mittente è un cliente confermato. Doppio strato: generateReplyCore
+  // ha lo stesso guard, ma qui si esce prima e resta l'avviso "in attesa" a Mariano.
+  if (contacts.isVipContact(`email:${fromAddr}`)) {
+    console.log(`[Email] Mittente VIP/high (${fromAddr}): nessuna auto-risposta, gestisce Mariano.`);
+    return null;
+  }
   // SOLO email recenti → niente risposte al pregresso in inbox al primo giro.
   const ageMin = (Date.now() - Date.parse(row.email_date)) / 60000;
   if (!(ageMin >= 0) || ageMin > replyMaxAgeMin()) return null;

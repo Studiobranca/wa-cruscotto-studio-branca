@@ -15,7 +15,7 @@ import { getAvailability, formatAvailabilityIT, isSlotBusy, getNowStatus, format
 import { sendTextMessage } from './zapi.js';
 import { createCalendarEvent, updateCalendarEvent, appendEventDescription } from './integrations.js';
 import { broadcastEvent } from './sse.js';
-import { resolveIdentities } from './contacts.js';
+import { resolveIdentities, isVipContact } from './contacts.js';
 import { sanitizeClientText, type SanitizeResult } from './sanitize.js';
 import { detectRegisterFromTranscript } from './register.js';
 
@@ -875,6 +875,16 @@ export async function generateDraft(phone: string, contactName: string): Promise
 export async function generateReplyCore(
   key: string, contactName: string, userContent: string, channel: 'whatsapp' | 'email' = 'whatsapp',
 ): Promise<DraftOutcome | null> {
+  // ─── GUARD VIP STRUTTURALE (regola inderogabile di Mariano, 08/07/2026) ──────
+  // I contatti VIP/high li gestisce SOLO Mariano di persona: il bot non genera
+  // NULLA per loro (né bozza, né auto-risposta, né cortesia), su nessun canale.
+  // Il webhook WhatsApp li esclude già a monte (priority vip/high); questo è il
+  // punto di blocco UNICO che copre anche il canale EMAIL (dove il guard mancava)
+  // e qualunque chiamante futuro.
+  if (isVipContact(key)) {
+    console.log(`[Chatbot] Contatto VIP/high (${contactName} — ${key}): nessuna generazione, gestisce Mariano.`);
+    return null;
+  }
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
     console.warn('[Chatbot] ANTHROPIC_API_KEY non configurata: bozza non generata.');

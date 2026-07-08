@@ -24922,6 +24922,7 @@ __export(contacts_exports, {
   autoMatchPhone: () => autoMatchPhone,
   findContact: () => findContact,
   getContactProfile: () => getContactProfile,
+  isVipContact: () => isVipContact,
   listContacts: () => listContacts,
   removeContact: () => removeContact,
   resolveIdentities: () => resolveIdentities,
@@ -24992,6 +24993,19 @@ function resolveIdentities(key) {
   }
   const row = db.prepare(`SELECT value FROM email_contacts WHERE phone = ? LIMIT 1`).get(key);
   return { phone: key, email: row?.value || null };
+}
+function isVipContact(key) {
+  try {
+    const { phone } = resolveIdentities(key);
+    const candidates = [key, phone].filter((k) => !!k && !k.startsWith("email:"));
+    for (const p of candidates) {
+      const row = db.prepare(`SELECT priority FROM conversations WHERE phone = ?`).get(p);
+      if (row && (row.priority === "vip" || row.priority === "high")) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
 }
 function getContactProfile(value) {
   const v = (value || "").trim().toLowerCase();
@@ -25560,6 +25574,10 @@ async function generateDraft(phone, contactName) {
   return generateReplyCore(phone, contactName, buildTranscript(phone, contactName), "whatsapp");
 }
 async function generateReplyCore(key, contactName, userContent, channel = "whatsapp") {
+  if (isVipContact(key)) {
+    console.log(`[Chatbot] Contatto VIP/high (${contactName} \u2014 ${key}): nessuna generazione, gestisce Mariano.`);
+    return null;
+  }
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
     console.warn("[Chatbot] ANTHROPIC_API_KEY non configurata: bozza non generata.");
@@ -100267,6 +100285,10 @@ async function maybeAutoReply(acc, row) {
   if (isAutomatedSender(fromAddr)) return null;
   const contact = findContact(fromAddr);
   if (!contact || contact.type !== "cliente") return null;
+  if (isVipContact(`email:${fromAddr}`)) {
+    console.log(`[Email] Mittente VIP/high (${fromAddr}): nessuna auto-risposta, gestisce Mariano.`);
+    return null;
+  }
   const ageMin = (Date.now() - Date.parse(row.email_date)) / 6e4;
   if (!(ageMin >= 0) || ageMin > replyMaxAgeMin()) return null;
   const key = `email:${fromAddr}`;
@@ -100669,6 +100691,7 @@ init_db();
 init_appointments();
 init_zapi();
 init_chatbot();
+init_contacts();
 
 // server/reminders_logic.ts
 var SEGRETERIA = "0909797187";
@@ -100820,6 +100843,10 @@ async function runReminders(force = false) {
   `).all(tomorrow);
   let sent = 0, skipped = 0;
   for (const a of rows) {
+    if (isVipContact(a.phone)) {
+      skipped++;
+      continue;
+    }
     if (!force && isTooFresh(a.created_at, Date.now())) {
       skipped++;
       continue;
@@ -100855,6 +100882,7 @@ async function runWaitlistRecall(force = false) {
   const avail = formatAvailabilityIT(slots);
   let notified = 0;
   for (const w of pending.slice(0, 10)) {
+    if (isVipContact(w.phone)) continue;
     const text = waitlistRecallMessageIT(w.contact_name, w.reason, avail, channelOfKey(w.phone).channel);
     const ok = await deliver(w.phone, text, "Nuove disponibilit\xE0 per un appuntamento \u2014 Studio Tributario Branca");
     if (ok) {
@@ -101209,7 +101237,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.10.0", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.10.1", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/selftest", (_req, res) => {
   res.json(getLastSelfCheck() || { note: "mai eseguito" });
