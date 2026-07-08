@@ -180,6 +180,25 @@ function transporterFor(acc: MailAccount) {
   });
 }
 
+/** Email "di servizio" a un cliente (promemoria appuntamento, richiamo lista d'attesa —
+ *  reminders.ts): usa la prima casella configurata; NON è la risposta a un thread.
+ *  Ritorna false (senza sollevare) se nessuna casella è configurata o l'invio fallisce. */
+export async function sendStudioEmail(to: string, subject: string, body: string): Promise<boolean> {
+  const acc = accounts()[0];
+  if (!acc || !to) return false;
+  try {
+    const t = transporterFor(acc);
+    await t.sendMail({
+      from: `"Studio Tributario Branca" <${acc.user}>`,
+      to, subject, text: `${body}${SIGN}`,
+    });
+    return true;
+  } catch (e: any) {
+    console.error('[Email] invio di servizio fallito:', e.message);
+    return false;
+  }
+}
+
 async function sendReply(acc: MailAccount, to: string, subject: string, body: string, inReplyTo?: string): Promise<void> {
   const t = transporterFor(acc);
   const subj = /^re:/i.test(subject) ? subject : `Re: ${subject}`;

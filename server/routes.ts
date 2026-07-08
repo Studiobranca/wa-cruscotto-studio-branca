@@ -45,8 +45,11 @@ import {
   courtesySentToday,
   markCourtesySent,
   notifyUrgentByEmail,
+  getWaitlist,
+  closeWaitlistEntry,
 } from './chatbot.js';
 import { runDailyDigest, getFlowHealth, repairWebhook, runSelfCheck, getLastSelfCheck } from './maintenance.js';
+import { runReminders, runWaitlistRecall, runSlaCheck, getRemindersStatus } from './reminders.js';
 import { decideWorkAutoSend } from './autosend.js';
 
 const router = Router();
@@ -71,7 +74,7 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.9.16', built: new Date().toISOString() });
+  res.json({ version: '2.10.0', built: new Date().toISOString() });
 });
 
 // ─── Autocheck (self-test + autocorrezione) ──────────────────────────────────
@@ -1537,6 +1540,37 @@ router.post('/bot/appointments/:id/cancel', async (req: Request, res: Response) 
     console.error('[Bot appointment cancel] Error:', err);
     res.status(500).json({ error: err.message });
   }
+});
+
+// ─── Lista d'attesa + job promemoria/SLA (v2.10) ─────────────────────────────
+router.get('/bot/waitlist', (req: Request, res: Response) => {
+  try {
+    const status = req.query.status ? String(req.query.status) : undefined;
+    res.json(getWaitlist(status));
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+router.post('/bot/waitlist/:id/close', (req: Request, res: Response) => {
+  try {
+    closeWaitlistEntry(parseInt(req.params.id, 10));
+    res.json({ success: true });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+router.get('/bot/reminders/status', (_req: Request, res: Response) => {
+  try { res.json(getRemindersStatus()); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// Trigger manuale dei job (diagnostica / recupero): forza fuori dalle finestre orarie.
+router.post('/bot/jobs/:job/run', async (req: Request, res: Response) => {
+  try {
+    const job = String(req.params.job);
+    if (job === 'reminders') return res.json(await runReminders(true));
+    if (job === 'waitlist') return res.json(await runWaitlistRecall(true));
+    if (job === 'sla') return res.json(await runSlaCheck(true));
+    res.status(400).json({ error: `Job sconosciuto: ${job} (validi: reminders, waitlist, sla)` });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
 // ─── MANUTENZIONE: digest giornaliero + watchdog flusso ──────────────────────

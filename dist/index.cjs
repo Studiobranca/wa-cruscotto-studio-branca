@@ -25176,6 +25176,25 @@ var init_register = __esm({
 });
 
 // server/chatbot.ts
+function addToWaitlist(phone, contactName, reason) {
+  const ex = db_default.prepare(`SELECT id FROM bot_waitlist WHERE phone = ? AND status = 'in_attesa'`).get(phone);
+  if (ex) {
+    db_default.prepare(`UPDATE bot_waitlist SET reason = ?, contact_name = COALESCE(?, contact_name) WHERE id = ?`).run(reason, contactName, ex.id);
+    return ex.id;
+  }
+  const info = db_default.prepare(`INSERT INTO bot_waitlist (phone, contact_name, reason) VALUES (?, ?, ?)`).run(phone, contactName, reason);
+  return Number(info.lastInsertRowid);
+}
+function getWaitlist(status) {
+  if (status) return db_default.prepare(`SELECT * FROM bot_waitlist WHERE status = ? ORDER BY created_at ASC`).all(status);
+  return db_default.prepare(`SELECT * FROM bot_waitlist ORDER BY created_at ASC`).all();
+}
+function markWaitlistNotified(id) {
+  db_default.prepare(`UPDATE bot_waitlist SET status = 'ricontattato', notified_at = datetime('now') WHERE id = ?`).run(id);
+}
+function closeWaitlistEntry(id) {
+  db_default.prepare(`UPDATE bot_waitlist SET status = 'chiuso' WHERE id = ?`).run(id);
+}
 function recordDocNote(phone, summary) {
   db_default.prepare(`INSERT INTO bot_doc_notes (phone, summary) VALUES (?, ?)`).run(phone, summary);
 }
@@ -25230,6 +25249,14 @@ function getPendingAppointments() {
 }
 function getAppointmentById(id) {
   return db_default.prepare(`SELECT * FROM bot_appointments WHERE id = ?`).get(id) || null;
+}
+function getActiveFutureAppointments(phone) {
+  const today = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Rome" }).format(/* @__PURE__ */ new Date());
+  return db_default.prepare(`
+    SELECT * FROM bot_appointments
+    WHERE phone = ? AND status IN ('da_confermare','confermato') AND date >= ?
+    ORDER BY date ASC, start ASC
+  `).all(phone, today);
 }
 async function confirmAppointmentRow(appt, opts = {}) {
   let calOk = false;
@@ -25419,6 +25446,9 @@ async function runTool(name, input, out, phone) {
     out.appointmentFlow = true;
     const days = Math.min(Math.max(parseInt(input?.days, 10) || 14, 1), 30);
     const { slots, calendarChecked } = await getAvailability(days);
+    if (!slots.length) {
+      return `${calendarChecked ? "" : "(agenda non verificata su Calendar) "}NESSUNA disponibilit\xE0 nei prossimi ${days} giorni (agenda piena o chiusura dello studio). NON proporre MAI date o orari a mano. Proponi al cliente la LISTA D'ATTESA: se accetta di essere ricontattato quando si libereranno nuove date, chiama add_to_waitlist con il motivo dell'appuntamento; verr\xE0 ricontattato in automatico su questo stesso canale. Nel frattempo pu\xF2 inviare la documentazione su questa chat o via email.`;
+    }
     const txt = formatAvailabilityIT(slots);
     const iso = slots.slice(0, 12).map((s) => `${s.date} ${s.start}`).join("; ");
     return `${calendarChecked ? "" : "(agenda non verificata su Calendar) "}Prossime disponibilit\xE0 (da mostrare al cliente):
@@ -25459,6 +25489,41 @@ Slot con data esatta da usare in propose_booking (date=YYYY-MM-DD, start=HH:MM):
     }
     const r = await confirmAppointmentRow(appt, { notify: true });
     return `Appuntamento confermato e ${r.calendarUpdated ? "agenda aggiornata" : "segnalato al Dott. Branca"}. Scrivi al cliente un breve messaggio che CONFERMA l'appuntamento del ${appt.date} alle ${appt.start}, ringrazia, e \u2014 se l'incontro riguarda documenti da esaminare \u2014 RIBADISCI che deve inviarli PRIMA dell'appuntamento (su questa chat WhatsApp oppure via email a studiobranca@tiscali.it o studiobranca@icloud.com), cos\xEC potranno essere visionati e discussi durante l'incontro; indica che lo studio \xE8 in Via Operai 102, Barcellona P.G. (ME).`;
+  }
+  if (name === "cancel_appointment") {
+    out.appointmentFlow = true;
+    const appts = getActiveFutureAppointments(phone);
+    if (!appts.length) {
+      return "Non risulta alcun appuntamento futuro da disdire per questo cliente: NON confermare alcuna disdetta; se serve chiedi con garbo a quale appuntamento si riferisce.";
+    }
+    for (const a of appts) {
+      try {
+        await cancelAppointmentRow(a);
+      } catch (e) {
+        console.error("[Chatbot] disdetta appuntamento:", e.message);
+      }
+    }
+    const first = appts[0];
+    const motivo = String(input?.reason || "").trim().slice(0, 200);
+    try {
+      await sendTextMessage(
+        getControlNumber(),
+        `\u274C ${first.contact_name || phone} ha DISDETTO l'appuntamento:
+\u{1F4C5} ${first.date} ore ${first.start} \u2014 ${first.reason || "Appuntamento"}${motivo ? `
+Motivo: ${motivo}` : ""}
+Agenda aggiornata (evento annullato).`
+      );
+    } catch (e) {
+      console.error("[Chatbot] notifica disdetta fallita:", e.message);
+    }
+    return `Appuntamento del ${first.date} alle ${first.start} DISDETTO e agenda aggiornata. Scrivi al cliente un breve messaggio che conferma la disdetta, ringrazia, e resta a disposizione per fissare un nuovo appuntamento quando vorr\xE0 (se indica gi\xE0 una nuova preferenza, usa get_availability per proporre slot reali).`;
+  }
+  if (name === "add_to_waitlist") {
+    out.appointmentFlow = true;
+    const reason = String(input?.reason || "Appuntamento").trim().slice(0, 200) || "Appuntamento";
+    const c = db_default.prepare(`SELECT contact_name FROM conversations WHERE phone = ?`).get(phone);
+    addToWaitlist(phone, c?.contact_name || null, reason);
+    return "Cliente inserito in lista d'attesa. Comunicagli che al momento non ci sono disponibilit\xE0 in agenda, che \xE8 stato inserito in lista d'attesa e che verr\xE0 ricontattato su questo stesso canale con le prime date disponibili appena si libereranno. Nel frattempo pu\xF2 inviare la documentazione utile su questa chat o via email a studiobranca@tiscali.it o studiobranca@icloud.com, cos\xEC sar\xE0 gi\xE0 valutata.";
   }
   if (name === "need_human") {
     out.needsHuman = true;
@@ -25519,7 +25584,7 @@ async function generateReplyCore(key, contactName, userContent, channel = "whats
 
 \u26A0\uFE0F QUESTO CLIENTE HA GI\xC0 UN APPUNTAMENTO CONFERMATO IN AGENDA: ${upcomingAppt.date} alle ${upcomingAppt.start}${upcomingAppt.reason ? ` (${upcomingAppt.reason})` : ""}.
 - NON proporre e NON fissare un nuovo appuntamento per la stessa questione: l'appuntamento c'\xE8 gi\xE0. Ricordaglielo con garbo (data e ora).
-- Solo se il cliente chiede ESPLICITAMENTE di SPOSTARLO, usa get_availability per riproporre nuovi slot; se chiede di DISDIRE, segnala con need_human.
+- Solo se il cliente chiede ESPLICITAMENTE di SPOSTARLO, usa get_availability per riproporre nuovi slot (alla registrazione del nuovo con propose_booking il vecchio si annulla da solo); se chiede di DISDIRE senza riprogrammare, chiama cancel_appointment.
 - Se serve, ricorda che la documentazione utile va inviata ${dest} PRIMA dell'incontro.`;
   } else if (pendingAppt) {
     apptBlock = `
@@ -25527,7 +25592,7 @@ async function generateReplyCore(key, contactName, userContent, channel = "whats
 APPUNTAMENTO IN ATTESA DI CONFERMA per questo cliente: ${pendingAppt.date} alle ${pendingAppt.start}${pendingAppt.reason ? ` (${pendingAppt.reason})` : ""}.
 - NON proporre un secondo appuntamento per la stessa cosa: ce n'\xE8 gi\xE0 uno in attesa.
 - Se nell'ULTIMO messaggio il cliente CONFERMA che pu\xF2 venire (es. "confermo", "s\xEC va bene", "ci sono", "perfetto", "ok per quel giorno"), chiama confirm_appointment e poi conferma con garbo.
-- Se invece chiede di SPOSTARE l'orario, usa get_availability per riproporre nuovi slot; se vuole DISDIRE o \xE8 incerto, NON chiamare confirm_appointment.`;
+- Se invece chiede di SPOSTARE l'orario, usa get_availability per riproporre nuovi slot; se vuole DISDIRE, chiama cancel_appointment; se \xE8 incerto, NON chiamare confirm_appointment.`;
   }
   const channelNote = channel === "email" ? `
 
@@ -25654,6 +25719,17 @@ async function approveDraftCore(id, opts) {
   return { ok: true, status: 200, calendar, contactName: d.contact_name, hadEvent: !!d.proposed_event };
 }
 async function materializeProposedEvent(key, contactName, ev, channel = "whatsapp") {
+  for (const prev of getActiveFutureAppointments(key)) {
+    try {
+      await cancelAppointmentRow(prev);
+    } catch (e) {
+      console.error("[Chatbot] annullo appuntamento precedente:", e.message);
+    }
+  }
+  try {
+    db_default.prepare(`UPDATE bot_waitlist SET status = 'chiuso' WHERE phone = ? AND status IN ('in_attesa','ricontattato')`).run(key);
+  } catch {
+  }
   const docNotes = getUnattachedDocNotes(key);
   const docBlock = docNotes.length ? `
 
@@ -25815,6 +25891,22 @@ var init_chatbot = __esm({
   );
   CREATE INDEX IF NOT EXISTS idx_bot_appt_phone ON bot_appointments(phone, status);
 `);
+    try {
+      db_default.exec(`ALTER TABLE bot_appointments ADD COLUMN reminder_sent INTEGER DEFAULT 0`);
+    } catch {
+    }
+    db_default.exec(`
+  CREATE TABLE IF NOT EXISTS bot_waitlist (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    phone TEXT NOT NULL,
+    contact_name TEXT,
+    reason TEXT,
+    status TEXT DEFAULT 'in_attesa',   -- in_attesa | ricontattato | chiuso
+    created_at TEXT DEFAULT (datetime('now')),
+    notified_at TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_bot_waitlist_status ON bot_waitlist(status);
+`);
     db_default.exec(`
   CREATE TABLE IF NOT EXISTS bot_doc_notes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -25875,6 +25967,15 @@ GESTIONE OPERATIVA:
   reali (incrocia gi\xE0 l'agenda Google e gli orari studio); quando il cliente sceglie uno slot
   chiama propose_booking; se in un secondo momento conferma di poter venire chiama
   confirm_appointment. Non serve l'approvazione dello studio per concordare data e ora.
+  SPOSTAMENTO: se il cliente chiede di spostare un appuntamento esistente, usa get_availability
+  e poi propose_booking sul nuovo slot \u2014 il vecchio appuntamento viene annullato in automatico
+  alla registrazione del nuovo. DISDETTA: se il cliente vuole ANNULLARE l'appuntamento senza
+  riprogrammarlo ora, chiama cancel_appointment (libera l'agenda e avvisa lo studio), poi
+  conferma con garbo la disdetta e resta a disposizione per una nuova data.
+  LISTA D'ATTESA: se get_availability NON restituisce alcuno slot (agenda piena o chiusura),
+  NON proporre mai date a mano: proponi al cliente di essere inserito in lista d'attesa e, se
+  accetta, chiama add_to_waitlist col motivo \u2014 verr\xE0 ricontattato in automatico su questo
+  stesso canale appena si libereranno nuove date.
 - RICHIESTA DI PASSARE SUBITO/ORA in studio (in autonomia, diverso da un appuntamento futuro:
   "posso passare adesso/subito/in giornata?", NON "vorrei un appuntamento"): chiama SEMPRE
   check_walkin_now (mai a intuito, sempre incrociando l'agenda reale e l'orario di lavoro) e
@@ -25909,7 +26010,9 @@ GESTIONE OPERATIVA:
     mer/ven 9:00\u201313:00.
   \u2022 10\u201325 luglio 2026: ORARIO UNICO 9:00\u201314:00 tutti i feriali.
   \u2022 26 luglio\u201331 agosto 2026: studio CHIUSO, NON fissare alcun appuntamento in questo periodo
-    (se il cliente chiede, spiega che si riprende dal 1\xB0 settembre e proponi date da settembre).
+    (se il cliente chiede, spiega che si riprende dal 1\xB0 settembre e proponi date da settembre;
+    se get_availability non restituisce slot proponibili, offri la lista d'attesa \u2014
+    add_to_waitlist \u2014 cos\xEC sar\xE0 ricontattato in automatico alla riapertura).
   \u2022 settembre 2026: di nuovo orario STANDARD.
   MAI sabato e domenica, MAI feste comandate. In ogni caso fidati SEMPRE degli slot reali di
   get_availability (incrocia gi\xE0 l'agenda Google del Dott. Branca).
@@ -25981,8 +26084,9 @@ SOLO IL TESTO PER IL CLIENTE (INDEROGABILE \u2014 la tua risposta viene inviata 
   "La cliente non ha confermato...", "Il 'va bene' \xE8 ambiguo...", "Avviso con garbo e propongo...",
   "Non chiamo confirm_appointment", "Non faccio propose_booking".
 - \xC8 VIETATO nominare nel testo gli strumenti/funzioni interni (get_availability, propose_booking,
-  confirm_appointment, need_human, check_walkin_now, note_documents, already_handled,
-  ignore_personal, find_previous_requests) o qualunque nome di funzione/tool.
+  confirm_appointment, cancel_appointment, add_to_waitlist, need_human, check_walkin_now,
+  note_documents, already_handled, ignore_personal, find_previous_requests) o qualunque nome
+  di funzione/tool.
 - Le decisioni operative (proporre/confermare/spostare un appuntamento, segnalare un'urgenza,
   classificare un messaggio) si prendono ESCLUSIVAMENTE chiamando i tool con la tool-call
   apposita: NON vanno descritte, motivate o annunciate nel testo per il cliente.
@@ -26021,6 +26125,23 @@ SOLO IL TESTO PER IL CLIENTE (INDEROGABILE \u2014 la tua risposta viene inviata 
         input_schema: {
           type: "object",
           properties: {}
+        }
+      },
+      {
+        name: "cancel_appointment",
+        description: "DISDICE l'appuntamento futuro di questo cliente (in attesa di conferma o gi\xE0 confermato) perch\xE9 il cliente ha chiesto di ANNULLARLO e NON vuole riprogrammarlo ora: libera lo slot in agenda e avvisa lo studio. NON usarlo se il cliente vuole SPOSTARE l'appuntamento: in quel caso usa get_availability e poi propose_booking (il vecchio appuntamento viene annullato automaticamente alla registrazione del nuovo).",
+        input_schema: {
+          type: "object",
+          properties: { reason: { type: "string", description: "Motivo della disdetta riferito dal cliente (facoltativo)" } }
+        }
+      },
+      {
+        name: "add_to_waitlist",
+        description: "Inserisce il cliente nella LISTA D'ATTESA dello studio quando get_availability NON ha restituito alcuna disponibilit\xE0 (chiusura estiva o agenda piena) e il cliente vuole comunque un appuntamento: appena si libereranno nuove date verr\xE0 ricontattato in automatico su questo stesso canale. Chiamalo SOLO dopo get_availability senza slot e col consenso del cliente a essere ricontattato.",
+        input_schema: {
+          type: "object",
+          properties: { reason: { type: "string", description: `Motivo/oggetto dell'appuntamento richiesto (es. "avviso di accertamento", "dichiarazione redditi")` } },
+          required: ["reason"]
         }
       },
       {
@@ -99989,6 +100110,7 @@ __export(email_exports, {
   markEmailAsFornitore: () => markEmailAsFornitore,
   markEmailAsNotClient: () => markEmailAsNotClient,
   markEmailSeen: () => markEmailSeen,
+  sendStudioEmail: () => sendStudioEmail,
   startEmailPoller: () => startEmailPoller
 });
 function accounts() {
@@ -100088,6 +100210,23 @@ function transporterFor(acc) {
     requireTLS: !acc.smtpSecure,
     ...acc.smtpCiphers ? { tls: { ciphers: acc.smtpCiphers } } : {}
   });
+}
+async function sendStudioEmail(to, subject, body) {
+  const acc = accounts()[0];
+  if (!acc || !to) return false;
+  try {
+    const t = transporterFor(acc);
+    await t.sendMail({
+      from: `"Studio Tributario Branca" <${acc.user}>`,
+      to,
+      subject,
+      text: `${body}${SIGN}`
+    });
+    return true;
+  } catch (e) {
+    console.error("[Email] invio di servizio fallito:", e.message);
+    return false;
+  }
 }
 async function sendReply(acc, to, subject, body, inReplyTo) {
   const t = transporterFor(acc);
@@ -100524,21 +100663,318 @@ init_integrations();
 init_zapi();
 init_sse();
 init_chatbot();
+
+// server/reminders.ts
+init_db();
+init_appointments();
+init_zapi();
+init_chatbot();
+
+// server/reminders_logic.ts
+var SEGRETERIA = "0909797187";
+var FIRMA_WA = "Assistente Virtuale \u2014 Studio Tributario Branca";
+var EMAIL_DOC = "studiobranca@tiscali.it o studiobranca@icloud.com";
+function channelOfKey(key) {
+  if (key.startsWith("email:")) return { channel: "email", address: key.slice(6) };
+  return { channel: "whatsapp", address: key };
+}
+function inReminderWindow(hour) {
+  return hour >= 18 && hour < 21;
+}
+function inRecallWindow(hour) {
+  return hour >= 9 && hour < 18;
+}
+function inSlaWindow(hour) {
+  return hour >= 8 && hour < 20;
+}
+function sqliteToMs(s) {
+  if (!s) return NaN;
+  const iso = s.includes("T") ? s : `${s.replace(" ", "T")}Z`;
+  return Date.parse(iso);
+}
+function isTooFresh(createdAt, nowMs) {
+  const t = sqliteToMs(createdAt);
+  if (isNaN(t)) return false;
+  return nowMs - t < 6 * 36e5;
+}
+var MONTH_IT2 = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"];
+function humanDateIT(ds) {
+  const d = /* @__PURE__ */ new Date(`${ds}T12:00:00Z`);
+  const dow = new Intl.DateTimeFormat("it-IT", { weekday: "long", timeZone: "UTC" }).format(d);
+  return `${dow} ${parseInt(ds.slice(8, 10), 10)} ${MONTH_IT2[parseInt(ds.slice(5, 7), 10) - 1]}`;
+}
+function reminderMessageIT(a, channel) {
+  const nome = (a.contact_name || "").trim();
+  const saluto = nome ? `Gentile ${nome},` : "Gentile cliente,";
+  const quando = `domani, ${humanDateIT(a.date)} alle ${a.start}`;
+  const righe = [saluto, ""];
+  righe.push(`le ricordiamo l'appuntamento di ${quando} presso lo Studio Tributario Branca, Via Operai 102, Barcellona P.G. (ME)${a.reason ? `, in merito a: ${a.reason}` : ""}.`);
+  if (a.status === "da_confermare") {
+    righe.push("");
+    righe.push("L'appuntamento risulta ancora DA CONFERMARE: la preghiamo di rispondere a questo messaggio per confermare che potr\xE0 essere presente, oppure per chiedere di spostarlo.");
+  } else {
+    righe.push("");
+    righe.push("Se dovesse avere un imprevisto e volesse spostare o disdire, pu\xF2 rispondere a questo messaggio.");
+  }
+  righe.push("");
+  righe.push(`Se l'incontro riguarda documenti da esaminare (atti, cartelle, fatture, dichiarazioni, contratti, avvisi), la preghiamo di inviarli PRIMA dell'appuntamento${channel === "whatsapp" ? ` su questa chat oppure via email a ${EMAIL_DOC}` : ` in risposta a questa email`}: solo cos\xEC potranno essere visionati e discussi durante l'incontro.`);
+  righe.push("");
+  righe.push(`Per parlare con la segreteria: ${SEGRETERIA}.`);
+  if (channel === "whatsapp") righe.push(FIRMA_WA);
+  return righe.join("\n");
+}
+function waitlistRecallMessageIT(contactName, reason, availability, channel) {
+  const nome = (contactName || "").trim();
+  const saluto = nome ? `Gentile ${nome},` : "Gentile cliente,";
+  const righe = [saluto, ""];
+  righe.push(`la ricontattiamo dallo Studio Tributario Branca: si sono liberate nuove disponibilit\xE0 per un appuntamento${reason ? `, come da sua richiesta (${reason})` : ""}.`);
+  righe.push("");
+  righe.push("Prime disponibilit\xE0:");
+  righe.push(availability);
+  righe.push("");
+  righe.push(`Pu\xF2 rispondere a questo messaggio indicando il giorno e l'ora che preferisce, e provvederemo a fissare l'appuntamento. Per la segreteria: ${SEGRETERIA}.`);
+  if (channel === "whatsapp") righe.push(FIRMA_WA);
+  return righe.join("\n");
+}
+function ageIT(min) {
+  if (min < 90) return `${Math.round(min)} min`;
+  return `${Math.round(min / 60)} h`;
+}
+function slaAlertText(drafts, emails, sogliaOre) {
+  const parts = [`\u23F0 RISPOSTE IN ATTESA da oltre ${sogliaOre}h:`];
+  if (drafts.length) {
+    parts.push("");
+    parts.push(`Bozze WhatsApp da approvare (${drafts.length}):`);
+    for (const d of drafts.slice(0, 8)) parts.push(`- #${d.id} ${d.who} (da ${ageIT(d.ageMin)}) \u2192 OK ${d.id} / NO ${d.id}`);
+    if (drafts.length > 8) parts.push(`\u2026 e altre ${drafts.length - 8}.`);
+  }
+  if (emails.length) {
+    parts.push("");
+    parts.push(`Email di lavoro senza gestione (${emails.length}):`);
+    for (const e of emails.slice(0, 8)) parts.push(`- ${e.who}: "${e.subject.slice(0, 60)}" (da ${ageIT(e.ageMin)})`);
+    if (emails.length > 8) parts.push(`\u2026 e altre ${emails.length - 8}.`);
+  }
+  parts.push("");
+  parts.push("\u{1F449} Cruscotto per gestirle (avviso unico, non verr\xE0 ripetuto).");
+  return parts.join("\n");
+}
+
+// server/reminders.ts
+function getSetting2(key, def) {
+  try {
+    return db_default.prepare(`SELECT value FROM app_settings WHERE key = ?`).get(key)?.value ?? def;
+  } catch {
+    return def;
+  }
+}
+function setSetting2(key, value) {
+  db_default.prepare(`INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(key, value);
+}
+function remindersEnabled() {
+  return getSetting2("bot_reminders", "1") === "1";
+}
+function waitlistRecallEnabled() {
+  return getSetting2("bot_waitlist_recall", "1") === "1";
+}
+function slaHours() {
+  return parseInt(getSetting2("sla_hours", "4"), 10) || 4;
+}
+function romeNow() {
+  const now = /* @__PURE__ */ new Date();
+  return {
+    iso: new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Rome" }).format(now),
+    hour: parseInt(new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Rome", hour: "2-digit", hour12: false }).format(now), 10)
+  };
+}
+function romeDatePlus(days) {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Rome" }).format(new Date(Date.now() + days * 864e5));
+}
+async function deliver(key, text, emailSubject) {
+  const k = channelOfKey(key);
+  if (k.channel === "whatsapp") {
+    try {
+      await sendTextMessage(k.address, text);
+      return true;
+    } catch (e) {
+      console.error("[Reminders] invio WhatsApp fallito:", e.message);
+      return false;
+    }
+  }
+  try {
+    const mail = await Promise.resolve().then(() => (init_email(), email_exports));
+    return await mail.sendStudioEmail(k.address, emailSubject, text);
+  } catch (e) {
+    console.error("[Reminders] invio email fallito:", e.message);
+    return false;
+  }
+}
+async function runReminders(force = false) {
+  if (!remindersEnabled()) return { sent: 0, skipped: 0 };
+  const { hour } = romeNow();
+  if (!force && !inReminderWindow(hour)) return { sent: 0, skipped: 0 };
+  const tomorrow = romeDatePlus(1);
+  const rows = db_default.prepare(`
+    SELECT * FROM bot_appointments
+    WHERE date = ? AND status IN ('da_confermare','confermato') AND COALESCE(reminder_sent, 0) = 0
+    ORDER BY start ASC
+  `).all(tomorrow);
+  let sent = 0, skipped = 0;
+  for (const a of rows) {
+    if (!force && isTooFresh(a.created_at, Date.now())) {
+      skipped++;
+      continue;
+    }
+    const text = reminderMessageIT(a, channelOfKey(a.phone).channel);
+    const ok = await deliver(a.phone, text, "Promemoria appuntamento \u2014 Studio Tributario Branca");
+    if (ok) {
+      db_default.prepare(`UPDATE bot_appointments SET reminder_sent = 1 WHERE id = ?`).run(a.id);
+      sent++;
+      console.log(`[Reminders] Promemoria appuntamento ${a.date} ${a.start} \u2192 ${a.contact_name || a.phone}`);
+    }
+  }
+  if (sent) {
+    try {
+      await sendTextMessage(getControlNumber(), `\u{1F514} Promemoria inviati per ${sent} appuntament${sent === 1 ? "o" : "i"} di domani (${tomorrow}).`);
+    } catch {
+    }
+  }
+  return { sent, skipped };
+}
+async function runWaitlistRecall(force = false) {
+  if (!waitlistRecallEnabled()) return { notified: 0 };
+  const { iso, hour } = romeNow();
+  if (!force) {
+    if (!inRecallWindow(hour)) return { notified: 0 };
+    if (getSetting2(`waitlist_recall_done_${iso}`, "") === "1") return { notified: 0 };
+  }
+  const pending = getWaitlist("in_attesa");
+  if (!pending.length) return { notified: 0 };
+  const { slots } = await getAvailability(14);
+  if (!slots.length) return { notified: 0 };
+  setSetting2(`waitlist_recall_done_${iso}`, "1");
+  const avail = formatAvailabilityIT(slots);
+  let notified = 0;
+  for (const w of pending.slice(0, 10)) {
+    const text = waitlistRecallMessageIT(w.contact_name, w.reason, avail, channelOfKey(w.phone).channel);
+    const ok = await deliver(w.phone, text, "Nuove disponibilit\xE0 per un appuntamento \u2014 Studio Tributario Branca");
+    if (ok) {
+      markWaitlistNotified(w.id);
+      notified++;
+    }
+  }
+  if (notified) {
+    try {
+      await sendTextMessage(getControlNumber(), `\u{1F4CB} Lista d'attesa: ricontattat${notified === 1 ? "o 1 cliente" : `i ${notified} clienti`} con le nuove disponibilit\xE0 in agenda.`);
+    } catch {
+    }
+  }
+  return { notified };
+}
+async function runSlaCheck(force = false) {
+  const { hour } = romeNow();
+  if (!force && !inSlaWindow(hour)) return { alerted: 0 };
+  const soglia = slaHours();
+  const cutoff = Date.now() - soglia * 36e5;
+  try {
+    db_default.exec(`ALTER TABLE bot_drafts ADD COLUMN sla_notified INTEGER DEFAULT 0`);
+  } catch {
+  }
+  try {
+    db_default.exec(`ALTER TABLE incoming_emails ADD COLUMN sla_notified INTEGER DEFAULT 0`);
+  } catch {
+  }
+  const drafts = db_default.prepare(`
+    SELECT id, phone, contact_name, created_at FROM bot_drafts
+    WHERE status = 'pending' AND COALESCE(sla_notified, 0) = 0
+  `).all().filter((d) => {
+    const t = sqliteToMs(d.created_at);
+    return !isNaN(t) && t < cutoff;
+  });
+  let emails = [];
+  try {
+    emails = db_default.prepare(`
+      SELECT id, from_addr, from_name, subject, email_date FROM incoming_emails
+      WHERE category = 'lavoro' AND COALESCE(replied, 0) = 0 AND COALESCE(seen, 0) = 0
+        AND COALESCE(sla_notified, 0) = 0
+    `).all().filter((e) => {
+      const t = Date.parse(e.email_date);
+      return !isNaN(t) && t < cutoff && t > Date.now() - 7 * 864e5;
+    });
+  } catch {
+  }
+  if (!drafts.length && !emails.length) return { alerted: 0 };
+  const text = slaAlertText(
+    drafts.map((d) => ({ id: d.id, who: d.contact_name || d.phone, ageMin: (Date.now() - sqliteToMs(d.created_at)) / 6e4 })),
+    emails.map((e) => ({ who: e.from_name || e.from_addr, subject: e.subject || "(senza oggetto)", ageMin: (Date.now() - Date.parse(e.email_date)) / 6e4 })),
+    soglia
+  );
+  try {
+    await sendTextMessage(getControlNumber(), text);
+  } catch (e) {
+    console.error("[Reminders] alert SLA fallito:", e.message);
+    return { alerted: 0 };
+  }
+  for (const d of drafts) db_default.prepare(`UPDATE bot_drafts SET sla_notified = 1 WHERE id = ?`).run(d.id);
+  for (const e of emails) {
+    try {
+      db_default.prepare(`UPDATE incoming_emails SET sla_notified = 1 WHERE id = ?`).run(e.id);
+    } catch {
+    }
+  }
+  console.log(`[Reminders] Alert SLA: ${drafts.length} bozze + ${emails.length} email in attesa da >${soglia}h.`);
+  return { alerted: drafts.length + emails.length };
+}
+async function remindersTick() {
+  try {
+    await runReminders();
+  } catch (e) {
+    console.error("[Reminders] promemoria:", e.message);
+  }
+  try {
+    await runWaitlistRecall();
+  } catch (e) {
+    console.error("[Reminders] lista d'attesa:", e.message);
+  }
+  try {
+    await runSlaCheck();
+  } catch (e) {
+    console.error("[Reminders] SLA:", e.message);
+  }
+}
+function getRemindersStatus() {
+  const count2 = (sql) => {
+    try {
+      return db_default.prepare(sql).get()?.c ?? 0;
+    } catch {
+      return 0;
+    }
+  };
+  return {
+    remindersEnabled: remindersEnabled(),
+    waitlistRecallEnabled: waitlistRecallEnabled(),
+    slaHours: slaHours(),
+    tomorrowAppointments: count2(`SELECT COUNT(*) c FROM bot_appointments WHERE date = '${romeDatePlus(1)}' AND status IN ('da_confermare','confermato')`),
+    waitlistPending: count2(`SELECT COUNT(*) c FROM bot_waitlist WHERE status = 'in_attesa'`),
+    waitlistNotified: count2(`SELECT COUNT(*) c FROM bot_waitlist WHERE status = 'ricontattato'`)
+  };
+}
+
+// server/maintenance.ts
 var PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://wa-cruscotto-v2-production.up.railway.app";
 var WEBHOOK_URL = `${PUBLIC_BASE_URL}/api/webhook/message`;
 var STALE_MINUTES = 180;
 var REPAIR_COOLDOWN_MIN = 360;
-function getSetting2(key) {
+function getSetting3(key) {
   try {
     return db_default.prepare(`SELECT value FROM app_settings WHERE key = ?`).get(key)?.value ?? null;
   } catch {
     return null;
   }
 }
-function setSetting2(key, value) {
+function setSetting3(key, value) {
   db_default.prepare(`INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(key, value);
 }
-function romeNow() {
+function romeNow2() {
   const now = /* @__PURE__ */ new Date();
   const iso = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Rome" }).format(now);
   const hour = parseInt(new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Rome", hour: "2-digit", hour12: false }).format(now), 10);
@@ -100547,7 +100983,7 @@ function romeNow() {
   return { iso, hour, dow };
 }
 function isBusinessHours() {
-  const { hour, dow } = romeNow();
+  const { hour, dow } = romeNow2();
   if (dow === 0 || dow === 6) return false;
   return hour >= 9 && hour < 13 || hour >= 15 && hour < 19;
 }
@@ -100586,17 +101022,17 @@ ${lines.join("\n").slice(0, 7500)}` : "Nessuna comunicazione WhatsApp registrata
   return { title, description, total, contacts };
 }
 async function runDailyDigest(dateISO) {
-  const date = dateISO || romeNow().iso;
+  const date = dateISO || romeNow2().iso;
   const { title, description, total } = buildDigest(date);
   if (total === 0) {
-    setSetting2(`digest_done_${date}`, "1");
+    setSetting3(`digest_done_${date}`, "1");
     return { ok: true, date, total: 0, skipped: true };
   }
-  const prevId = getSetting2(`digest_event_${date}`);
+  const prevId = getSetting3(`digest_event_${date}`);
   const r = await upsertAllDayEvent({ title, description, date, eventId: prevId });
   if (r.success && r.eventId) {
-    setSetting2(`digest_event_${date}`, r.eventId);
-    setSetting2(`digest_done_${date}`, "1");
+    setSetting3(`digest_event_${date}`, r.eventId);
+    setSetting3(`digest_done_${date}`, "1");
     return { ok: true, date, total, eventId: r.eventId };
   }
   return { ok: false, date, total, error: r.error };
@@ -100620,13 +101056,13 @@ function getFlowHealth() {
 async function repairWebhook() {
   const previous = await getReceivedWebhook();
   const ok = await setReceivedWebhook(WEBHOOK_URL);
-  setSetting2("last_webhook_repair", (/* @__PURE__ */ new Date()).toISOString());
+  setSetting3("last_webhook_repair", (/* @__PURE__ */ new Date()).toISOString());
   broadcastEvent("flow_repair", { ok, webhook: WEBHOOK_URL, at: (/* @__PURE__ */ new Date()).toISOString() });
   console.log(`[Watchdog] Riparazione webhook: ${ok ? "OK" : "FALLITA"} \u2192 ${WEBHOOK_URL} (precedente: ${previous})`);
   return { ok, previous, set: WEBHOOK_URL };
 }
 function inRepairCooldown() {
-  const last = getSetting2("last_webhook_repair");
+  const last = getSetting3("last_webhook_repair");
   return !!(last && (Date.now() - Date.parse(last)) / 6e4 < REPAIR_COOLDOWN_MIN);
 }
 async function watchdogTick() {
@@ -100665,8 +101101,8 @@ async function runSelfCheck() {
   } catch (e) {
     items.push({ name: "webhook", status: "error", detail: e.message });
   }
-  if (getSetting2("bot_auto_send") === "1" && process.env.BOT_ALLOW_AUTOSEND !== "1") {
-    setSetting2("bot_auto_send", "0");
+  if (getSetting3("bot_auto_send") === "1" && process.env.BOT_ALLOW_AUTOSEND !== "1") {
+    setSetting3("bot_auto_send", "0");
     items.push({ name: "autoSend", status: "fixed", detail: "era ON senza BOT_ALLOW_AUTOSEND \u2192 forzato OFF" });
   } else items.push({ name: "autoSend", status: "ok", detail: isAutoSendEnabled() ? "ON (env autorizzata)" : "OFF" });
   try {
@@ -100691,7 +101127,7 @@ async function runSelfCheck() {
   }
   const at = (/* @__PURE__ */ new Date()).toISOString();
   const issues = items.filter((i) => i.status !== "ok").length;
-  setSetting2("selfcheck_last", JSON.stringify({ at, items, issues }));
+  setSetting3("selfcheck_last", JSON.stringify({ at, items, issues }));
   console.log(`[SelfCheck] ${at} \u2014 ${issues} anomalie/correzioni: ${items.map((i) => `${i.name}:${i.status}`).join(" ")}`);
   const notable = items.filter((i) => i.status !== "ok");
   if (notable.length) {
@@ -100712,7 +101148,7 @@ async function runSelfCheck() {
 }
 function getLastSelfCheck() {
   try {
-    return JSON.parse(getSetting2("selfcheck_last") || "null");
+    return JSON.parse(getSetting3("selfcheck_last") || "null");
   } catch {
     return null;
   }
@@ -100728,23 +101164,24 @@ function startMaintenance() {
   }, 5e3);
   const tick = async () => {
     try {
-      const { iso, hour } = romeNow();
-      if (hour >= 20 && getSetting2(`digest_done_${iso}`) !== "1") {
+      const { iso, hour } = romeNow2();
+      if (hour >= 20 && getSetting3(`digest_done_${iso}`) !== "1") {
         const r = await runDailyDigest(iso);
         console.log(`[Digest] ${iso}: ${r.ok ? `evento aggiornato (${r.total} msg)` : `errore: ${r.error}`}`);
       }
-      if (hour >= 3 && hour < 6 && getSetting2(`selfcheck_done_${iso}`) !== "1") {
-        setSetting2(`selfcheck_done_${iso}`, "1");
+      if (hour >= 3 && hour < 6 && getSetting3(`selfcheck_done_${iso}`) !== "1") {
+        setSetting3(`selfcheck_done_${iso}`, "1");
         await runSelfCheck();
       }
       await watchdogTick();
+      await remindersTick();
     } catch (e) {
       console.error("[Maintenance] tick error:", e.message);
     }
   };
   setInterval(tick, 30 * 60 * 1e3);
   setTimeout(tick, 60 * 1e3);
-  console.log("[Maintenance] Scheduler avviato (digest 20:30 + watchdog flusso).");
+  console.log("[Maintenance] Scheduler avviato (digest 20:30 + watchdog flusso + promemoria/lista d'attesa/SLA).");
 }
 
 // server/autosend.ts
@@ -100772,7 +101209,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.9.16", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.10.0", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/selftest", (_req, res) => {
   res.json(getLastSelfCheck() || { note: "mai eseguito" });
@@ -102046,6 +102483,40 @@ router.post("/bot/appointments/:id/cancel", async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     console.error("[Bot appointment cancel] Error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+router.get("/bot/waitlist", (req, res) => {
+  try {
+    const status = req.query.status ? String(req.query.status) : void 0;
+    res.json(getWaitlist(status));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.post("/bot/waitlist/:id/close", (req, res) => {
+  try {
+    closeWaitlistEntry(parseInt(req.params.id, 10));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.get("/bot/reminders/status", (_req, res) => {
+  try {
+    res.json(getRemindersStatus());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.post("/bot/jobs/:job/run", async (req, res) => {
+  try {
+    const job = String(req.params.job);
+    if (job === "reminders") return res.json(await runReminders(true));
+    if (job === "waitlist") return res.json(await runWaitlistRecall(true));
+    if (job === "sla") return res.json(await runSlaCheck(true));
+    res.status(400).json({ error: `Job sconosciuto: ${job} (validi: reminders, waitlist, sla)` });
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });

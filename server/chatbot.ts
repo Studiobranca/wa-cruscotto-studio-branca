@@ -62,6 +62,45 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_bot_appt_phone ON bot_appointments(phone, status);
 `);
+// Migrazione idempotente (v2.10): flag promemoria "appuntamento di domani" già inviato.
+try { db.exec(`ALTER TABLE bot_appointments ADD COLUMN reminder_sent INTEGER DEFAULT 0`); } catch { /* già presente */ }
+
+// ─── Persistenza: lista d'attesa appuntamenti (v2.10) ─────────────────────────
+// Quando get_availability non ha slot (chiusura estiva, agenda piena) il bot propone
+// la lista d'attesa: appena tornano disponibilità il job runWaitlistRecall (reminders.ts)
+// ricontatta i clienti in ordine di arrivo con le prime date libere.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS bot_waitlist (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    phone TEXT NOT NULL,
+    contact_name TEXT,
+    reason TEXT,
+    status TEXT DEFAULT 'in_attesa',   -- in_attesa | ricontattato | chiuso
+    created_at TEXT DEFAULT (datetime('now')),
+    notified_at TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_bot_waitlist_status ON bot_waitlist(status);
+`);
+/** Inserisce (o aggiorna, se già in attesa) un cliente nella lista d'attesa. */
+export function addToWaitlist(phone: string, contactName: string | null, reason: string): number {
+  const ex = db.prepare(`SELECT id FROM bot_waitlist WHERE phone = ? AND status = 'in_attesa'`).get(phone) as any;
+  if (ex) {
+    db.prepare(`UPDATE bot_waitlist SET reason = ?, contact_name = COALESCE(?, contact_name) WHERE id = ?`).run(reason, contactName, ex.id);
+    return ex.id;
+  }
+  const info = db.prepare(`INSERT INTO bot_waitlist (phone, contact_name, reason) VALUES (?, ?, ?)`).run(phone, contactName, reason);
+  return Number(info.lastInsertRowid);
+}
+export function getWaitlist(status?: string): any[] {
+  if (status) return db.prepare(`SELECT * FROM bot_waitlist WHERE status = ? ORDER BY created_at ASC`).all(status) as any[];
+  return db.prepare(`SELECT * FROM bot_waitlist ORDER BY created_at ASC`).all() as any[];
+}
+export function markWaitlistNotified(id: number): void {
+  db.prepare(`UPDATE bot_waitlist SET status = 'ricontattato', notified_at = datetime('now') WHERE id = ?`).run(id);
+}
+export function closeWaitlistEntry(id: number): void {
+  db.prepare(`UPDATE bot_waitlist SET status = 'chiuso' WHERE id = ?`).run(id);
+}
 
 // ─── Persistenza: note documenti (promemoria in agenda) ───────────────────────
 // Quando il cliente invia documentazione, il bot annota un breve sunto di "a cosa si
@@ -154,6 +193,17 @@ export function getPendingAppointments(): any[] {
 /** Un appuntamento per id. */
 export function getAppointmentById(id: number): any | null {
   return db.prepare(`SELECT * FROM bot_appointments WHERE id = ?`).get(id) as any || null;
+}
+
+/** TUTTI gli appuntamenti futuri attivi (da confermare o confermati) di un contatto:
+ *  usati da cancel_appointment e dallo spostamento (il nuovo slot annulla i vecchi). */
+export function getActiveFutureAppointments(phone: string): any[] {
+  const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Rome' }).format(new Date());
+  return db.prepare(`
+    SELECT * FROM bot_appointments
+    WHERE phone = ? AND status IN ('da_confermare','confermato') AND date >= ?
+    ORDER BY date ASC, start ASC
+  `).all(phone, today) as any[];
 }
 
 /**
@@ -339,6 +389,15 @@ GESTIONE OPERATIVA:
   reali (incrocia già l'agenda Google e gli orari studio); quando il cliente sceglie uno slot
   chiama propose_booking; se in un secondo momento conferma di poter venire chiama
   confirm_appointment. Non serve l'approvazione dello studio per concordare data e ora.
+  SPOSTAMENTO: se il cliente chiede di spostare un appuntamento esistente, usa get_availability
+  e poi propose_booking sul nuovo slot — il vecchio appuntamento viene annullato in automatico
+  alla registrazione del nuovo. DISDETTA: se il cliente vuole ANNULLARE l'appuntamento senza
+  riprogrammarlo ora, chiama cancel_appointment (libera l'agenda e avvisa lo studio), poi
+  conferma con garbo la disdetta e resta a disposizione per una nuova data.
+  LISTA D'ATTESA: se get_availability NON restituisce alcuno slot (agenda piena o chiusura),
+  NON proporre mai date a mano: proponi al cliente di essere inserito in lista d'attesa e, se
+  accetta, chiama add_to_waitlist col motivo — verrà ricontattato in automatico su questo
+  stesso canale appena si libereranno nuove date.
 - RICHIESTA DI PASSARE SUBITO/ORA in studio (in autonomia, diverso da un appuntamento futuro:
   "posso passare adesso/subito/in giornata?", NON "vorrei un appuntamento"): chiama SEMPRE
   check_walkin_now (mai a intuito, sempre incrociando l'agenda reale e l'orario di lavoro) e
@@ -373,7 +432,9 @@ GESTIONE OPERATIVA:
     mer/ven 9:00–13:00.
   • 10–25 luglio 2026: ORARIO UNICO 9:00–14:00 tutti i feriali.
   • 26 luglio–31 agosto 2026: studio CHIUSO, NON fissare alcun appuntamento in questo periodo
-    (se il cliente chiede, spiega che si riprende dal 1° settembre e proponi date da settembre).
+    (se il cliente chiede, spiega che si riprende dal 1° settembre e proponi date da settembre;
+    se get_availability non restituisce slot proponibili, offri la lista d'attesa —
+    add_to_waitlist — così sarà ricontattato in automatico alla riapertura).
   • settembre 2026: di nuovo orario STANDARD.
   MAI sabato e domenica, MAI feste comandate. In ogni caso fidati SEMPRE degli slot reali di
   get_availability (incrocia già l'agenda Google del Dott. Branca).
@@ -445,8 +506,9 @@ SOLO IL TESTO PER IL CLIENTE (INDEROGABILE — la tua risposta viene inviata cos
   "La cliente non ha confermato...", "Il 'va bene' è ambiguo...", "Avviso con garbo e propongo...",
   "Non chiamo confirm_appointment", "Non faccio propose_booking".
 - È VIETATO nominare nel testo gli strumenti/funzioni interni (get_availability, propose_booking,
-  confirm_appointment, need_human, check_walkin_now, note_documents, already_handled,
-  ignore_personal, find_previous_requests) o qualunque nome di funzione/tool.
+  confirm_appointment, cancel_appointment, add_to_waitlist, need_human, check_walkin_now,
+  note_documents, already_handled, ignore_personal, find_previous_requests) o qualunque nome
+  di funzione/tool.
 - Le decisioni operative (proporre/confermare/spostare un appuntamento, segnalare un'urgenza,
   classificare un messaggio) si prendono ESCLUSIVAMENTE chiamando i tool con la tool-call
   apposita: NON vanno descritte, motivate o annunciate nel testo per il cliente.
@@ -486,6 +548,23 @@ const TOOLS = [
     input_schema: {
       type: 'object',
       properties: {},
+    },
+  },
+  {
+    name: 'cancel_appointment',
+    description: 'DISDICE l\'appuntamento futuro di questo cliente (in attesa di conferma o già confermato) perché il cliente ha chiesto di ANNULLARLO e NON vuole riprogrammarlo ora: libera lo slot in agenda e avvisa lo studio. NON usarlo se il cliente vuole SPOSTARE l\'appuntamento: in quel caso usa get_availability e poi propose_booking (il vecchio appuntamento viene annullato automaticamente alla registrazione del nuovo).',
+    input_schema: {
+      type: 'object',
+      properties: { reason: { type: 'string', description: 'Motivo della disdetta riferito dal cliente (facoltativo)' } },
+    },
+  },
+  {
+    name: 'add_to_waitlist',
+    description: 'Inserisce il cliente nella LISTA D\'ATTESA dello studio quando get_availability NON ha restituito alcuna disponibilità (chiusura estiva o agenda piena) e il cliente vuole comunque un appuntamento: appena si libereranno nuove date verrà ricontattato in automatico su questo stesso canale. Chiamalo SOLO dopo get_availability senza slot e col consenso del cliente a essere ricontattato.',
+    input_schema: {
+      type: 'object',
+      properties: { reason: { type: 'string', description: 'Motivo/oggetto dell\'appuntamento richiesto (es. "avviso di accertamento", "dichiarazione redditi")' } },
+      required: ['reason'],
     },
   },
   {
@@ -676,6 +755,9 @@ async function runTool(name: string, input: any, out: DraftResult, phone: string
     out.appointmentFlow = true;
     const days = Math.min(Math.max(parseInt(input?.days, 10) || 14, 1), 30);
     const { slots, calendarChecked } = await getAvailability(days);
+    if (!slots.length) {
+      return `${calendarChecked ? '' : '(agenda non verificata su Calendar) '}NESSUNA disponibilità nei prossimi ${days} giorni (agenda piena o chiusura dello studio). NON proporre MAI date o orari a mano. Proponi al cliente la LISTA D'ATTESA: se accetta di essere ricontattato quando si libereranno nuove date, chiama add_to_waitlist con il motivo dell'appuntamento; verrà ricontattato in automatico su questo stesso canale. Nel frattempo può inviare la documentazione su questa chat o via email.`;
+    }
     const txt = formatAvailabilityIT(slots);
     // Elenco macchina-leggibile con DATA ESATTA (YYYY-MM-DD): il modello DEVE
     // copiare questi valori in propose_booking, mai inventare la data/anno.
@@ -717,6 +799,33 @@ async function runTool(name: string, input: any, out: DraftResult, phone: string
     }
     const r = await confirmAppointmentRow(appt, { notify: true });
     return `Appuntamento confermato e ${r.calendarUpdated ? 'agenda aggiornata' : 'segnalato al Dott. Branca'}. Scrivi al cliente un breve messaggio che CONFERMA l'appuntamento del ${appt.date} alle ${appt.start}, ringrazia, e — se l'incontro riguarda documenti da esaminare — RIBADISCI che deve inviarli PRIMA dell'appuntamento (su questa chat WhatsApp oppure via email a studiobranca@tiscali.it o studiobranca@icloud.com), così potranno essere visionati e discussi durante l'incontro; indica che lo studio è in Via Operai 102, Barcellona P.G. (ME).`;
+  }
+  if (name === 'cancel_appointment') {
+    out.appointmentFlow = true;
+    const appts = getActiveFutureAppointments(phone);
+    if (!appts.length) {
+      return 'Non risulta alcun appuntamento futuro da disdire per questo cliente: NON confermare alcuna disdetta; se serve chiedi con garbo a quale appuntamento si riferisce.';
+    }
+    for (const a of appts) {
+      try { await cancelAppointmentRow(a); }
+      catch (e: any) { console.error('[Chatbot] disdetta appuntamento:', e.message); }
+    }
+    const first = appts[0];
+    const motivo = String(input?.reason || '').trim().slice(0, 200);
+    try {
+      await sendTextMessage(
+        getControlNumber(),
+        `❌ ${first.contact_name || phone} ha DISDETTO l'appuntamento:\n📅 ${first.date} ore ${first.start} — ${first.reason || 'Appuntamento'}${motivo ? `\nMotivo: ${motivo}` : ''}\nAgenda aggiornata (evento annullato).`,
+      );
+    } catch (e: any) { console.error('[Chatbot] notifica disdetta fallita:', e.message); }
+    return `Appuntamento del ${first.date} alle ${first.start} DISDETTO e agenda aggiornata. Scrivi al cliente un breve messaggio che conferma la disdetta, ringrazia, e resta a disposizione per fissare un nuovo appuntamento quando vorrà (se indica già una nuova preferenza, usa get_availability per proporre slot reali).`;
+  }
+  if (name === 'add_to_waitlist') {
+    out.appointmentFlow = true;
+    const reason = String(input?.reason || 'Appuntamento').trim().slice(0, 200) || 'Appuntamento';
+    const c = db.prepare(`SELECT contact_name FROM conversations WHERE phone = ?`).get(phone) as any;
+    addToWaitlist(phone, c?.contact_name || null, reason);
+    return 'Cliente inserito in lista d\'attesa. Comunicagli che al momento non ci sono disponibilità in agenda, che è stato inserito in lista d\'attesa e che verrà ricontattato su questo stesso canale con le prime date disponibili appena si libereranno. Nel frattempo può inviare la documentazione utile su questa chat o via email a studiobranca@tiscali.it o studiobranca@icloud.com, così sarà già valutata.';
   }
   if (name === 'need_human') {
     out.needsHuman = true;
@@ -793,13 +902,13 @@ export async function generateReplyCore(
   if (upcomingAppt && upcomingAppt.status === 'confermato') {
     apptBlock = `\n\n⚠️ QUESTO CLIENTE HA GIÀ UN APPUNTAMENTO CONFERMATO IN AGENDA: ${upcomingAppt.date} alle ${upcomingAppt.start}${upcomingAppt.reason ? ` (${upcomingAppt.reason})` : ''}.
 - NON proporre e NON fissare un nuovo appuntamento per la stessa questione: l'appuntamento c'è già. Ricordaglielo con garbo (data e ora).
-- Solo se il cliente chiede ESPLICITAMENTE di SPOSTARLO, usa get_availability per riproporre nuovi slot; se chiede di DISDIRE, segnala con need_human.
+- Solo se il cliente chiede ESPLICITAMENTE di SPOSTARLO, usa get_availability per riproporre nuovi slot (alla registrazione del nuovo con propose_booking il vecchio si annulla da solo); se chiede di DISDIRE senza riprogrammare, chiama cancel_appointment.
 - Se serve, ricorda che la documentazione utile va inviata ${dest} PRIMA dell'incontro.`;
   } else if (pendingAppt) {
     apptBlock = `\n\nAPPUNTAMENTO IN ATTESA DI CONFERMA per questo cliente: ${pendingAppt.date} alle ${pendingAppt.start}${pendingAppt.reason ? ` (${pendingAppt.reason})` : ''}.
 - NON proporre un secondo appuntamento per la stessa cosa: ce n'è già uno in attesa.
 - Se nell'ULTIMO messaggio il cliente CONFERMA che può venire (es. "confermo", "sì va bene", "ci sono", "perfetto", "ok per quel giorno"), chiama confirm_appointment e poi conferma con garbo.
-- Se invece chiede di SPOSTARE l'orario, usa get_availability per riproporre nuovi slot; se vuole DISDIRE o è incerto, NON chiamare confirm_appointment.`;
+- Se invece chiede di SPOSTARE l'orario, usa get_availability per riproporre nuovi slot; se vuole DISDIRE, chiama cancel_appointment; se è incerto, NON chiamare confirm_appointment.`;
   }
 
   const channelNote = channel === 'email'
@@ -954,6 +1063,15 @@ export async function materializeProposedEvent(
   ev: { date: string; start: string; end: string; reason: string },
   channel: 'whatsapp' | 'email' = 'whatsapp',
 ): Promise<any> {
+  // SPOSTAMENTO (v2.10): il nuovo appuntamento sostituisce quelli attivi precedenti dello
+  // stesso cliente — annullali anche in AGENDA (prima recordAppointment li annullava solo
+  // nel DB e in Calendar restava un evento fantasma [DA CONFERMARE]).
+  for (const prev of getActiveFutureAppointments(key)) {
+    try { await cancelAppointmentRow(prev); }
+    catch (e: any) { console.error('[Chatbot] annullo appuntamento precedente:', e.message); }
+  }
+  // Il cliente ha (ri)ottenuto uno slot: chiudi l'eventuale posizione in lista d'attesa.
+  try { db.prepare(`UPDATE bot_waitlist SET status = 'chiuso' WHERE phone = ? AND status IN ('in_attesa','ricontattato')`).run(key); } catch { /* best-effort */ }
   const docNotes = getUnattachedDocNotes(key);
   const docBlock = docNotes.length ? `\n\n${formatDocNotes(docNotes)}` : '';
   const src = channel === 'email' ? 'assistente email' : 'chatbot WhatsApp';

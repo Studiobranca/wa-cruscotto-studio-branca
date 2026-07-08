@@ -17,6 +17,7 @@ import { upsertAllDayEvent } from './integrations.js';
 import { setReceivedWebhook, getReceivedWebhook, getDevicePhone } from './zapi.js';
 import { broadcastEvent } from './sse.js';
 import { getControlNumber, getAlertEmail, sendStudioAlertEmail, isAutoSendEnabled, waCommandsEnabled, isBotEnabled } from './chatbot.js';
+import { remindersTick } from './reminders.js';
 
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://wa-cruscotto-v2-production.up.railway.app';
 const WEBHOOK_URL = `${PUBLIC_BASE_URL}/api/webhook/message`;
@@ -266,11 +267,14 @@ export function startMaintenance(): void {
       }
       // Watchdog flusso messaggi
       await watchdogTick();
+      // Promemoria appuntamenti + richiamo lista d'attesa + SLA risposte (v2.10).
+      // Internamente già isolato per singolo job (try/catch in remindersTick).
+      await remindersTick();
     } catch (e: any) {
       console.error('[Maintenance] tick error:', e.message);
     }
   };
   setInterval(tick, 30 * 60 * 1000); // ogni 30 min
   setTimeout(tick, 60 * 1000);       // primo giro dopo 1 min
-  console.log('[Maintenance] Scheduler avviato (digest 20:30 + watchdog flusso).');
+  console.log('[Maintenance] Scheduler avviato (digest 20:30 + watchdog flusso + promemoria/lista d\'attesa/SLA).');
 }
