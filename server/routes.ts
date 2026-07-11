@@ -75,7 +75,7 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.10.2', built: new Date().toISOString() });
+  res.json({ version: '2.10.3', built: new Date().toISOString() });
 });
 
 // ─── Autocheck (self-test + autocorrezione) ──────────────────────────────────
@@ -409,6 +409,7 @@ router.get('/conversations/:phone/messages', (req: Request, res: Response) => {
         is_audio as isAudio, audio_url as audioUrl,
         is_image as isImage, image_url as imageUrl, caption,
         original_content as originalContent, detected_language as detectedLanguage,
+        transcription, transcription_status as transcriptionStatus,
         created_at as createdAt
       FROM live_messages
       WHERE phone = ?
@@ -424,6 +425,29 @@ router.get('/conversations/:phone/messages', (req: Request, res: Response) => {
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// ─── Ri-trascrizione vocale (retry/backfill, IDEMPOTENTE) ────────────────────
+// Ritrascrive un singolo messaggio audio. Idempotente: se già trascritto ('ok')
+// non ripete la chiamata STT. Utile per recuperare i vocali con stato failed/empty
+// o quelli antecedenti all'introduzione del campo dedicato. Nessun invio ai clienti.
+router.post('/bot/transcribe/:id', async (req: Request, res: Response) => {
+  try {
+    const id = parseInt(String(req.params.id), 10);
+    const m = db.prepare(`SELECT id, audio_url, is_audio, transcription_status FROM live_messages WHERE id = ?`).get(id) as any;
+    if (!m) return res.status(404).json({ error: 'Messaggio non trovato' });
+    if (!m.is_audio || !m.audio_url) return res.status(400).json({ error: 'Il messaggio non è un vocale o manca l\'URL audio' });
+    if (m.transcription_status === 'ok') return res.json({ id, skipped: true, reason: 'già trascritto', status: 'ok' });
+    const { transcribeAudioUrl } = await import('./transcription.js');
+    const tr = await transcribeAudioUrl(m.audio_url, process.env.DEEPGRAM_API_KEY);
+    if (tr.transcript) {
+      db.prepare(`UPDATE live_messages SET transcription = ?, transcription_status = 'ok', content = ? WHERE id = ?`)
+        .run(tr.transcript, `🎤 ${tr.transcript}`, id);
+    } else {
+      db.prepare(`UPDATE live_messages SET transcription_status = ? WHERE id = ?`).run(tr.status, id);
+    }
+    res.json({ id, status: tr.status, transcript: tr.transcript });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
 // Log globale messaggi (ricevuti + inviati) per l'agenda del cruscotto.
@@ -718,41 +742,22 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
       }
     }
 
-    // Trascrizione Deepgram (richiede DEEPGRAM_API_KEY env var)
-    const deepgramKey = process.env.DEEPGRAM_API_KEY;
-    if (isAudio && audioUrl && deepgramKey) {
-      try {
-        // Scarica audio
-        const audioResp = await fetch(audioUrl);
-        const audioBuffer = await audioResp.arrayBuffer();
-        // Invia a Deepgram nova-2 forzando l'italiano: detect_language sbagliava
-        // sui vocali brevi/rumorosi e produceva trascrizioni in inglese
-        const dgResp = await fetch(
-          'https://api.deepgram.com/v1/listen?model=nova-2&language=it&punctuate=true&smart_format=true',
-          {
-            method: 'POST',
-            headers: {
-              'Authorization': `Token ${deepgramKey}`,
-              'Content-Type': 'audio/ogg; codecs=opus',
-            },
-            body: audioBuffer,
-          }
-        );
-        if (dgResp.ok) {
-          const dgData = await dgResp.json() as any;
-          const transcript = dgData?.results?.channels?.[0]?.alternatives?.[0]?.transcript?.trim();
-          if (transcript) {
-            content = `🎤 ${transcript}`;
-            console.log(`[Deepgram] Trascritto: ${transcript.substring(0, 80)}`);
-          } else {
-            console.log('[Deepgram] Audio ricevuto ma trascrizione vuota (silenzio o rumore)');
-          }
-        } else {
-          const errText = await dgResp.text();
-          console.error('[Deepgram] Errore API:', dgResp.status, errText.substring(0, 100));
-        }
-      } catch (e) {
-        console.error('[Deepgram] Error:', e);
+    // ─── Trascrizione vocali (Deepgram nova-2, italiano) — rev. 11/07/2026 ─────
+    // SOLO lettura/visualizzazione: NON innesca alcun auto-invio (l'invariante resta
+    // in server/autosend.ts). Salvata in campo DEDICATO `transcription` + stato; il
+    // `content` mantiene il prefisso 🎤 per la lettura del bot e la compatibilità UI.
+    let transcription: string | null = null;
+    let transcriptionStatus: string | null = null;
+    if (isAudio && audioUrl) {
+      const { transcribeAudioUrl } = await import('./transcription.js');
+      const tr = await transcribeAudioUrl(audioUrl, process.env.DEEPGRAM_API_KEY);
+      transcriptionStatus = tr.status;
+      if (tr.transcript) {
+        transcription = tr.transcript;
+        content = `🎤 ${tr.transcript}`;
+        console.log(`[Deepgram] Trascritto (${phone}): ${tr.transcript.substring(0, 80)}`);
+      } else {
+        console.log(`[Deepgram] Nessuna trascrizione (${transcriptionStatus}) per ${phone}`);
       }
     }
 
@@ -818,9 +823,9 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
     const effectiveSenderName = isGroup ? (senderName || body.participantPhone || phone) : (senderName || phone);
     db.prepare(`
       INSERT OR IGNORE INTO live_messages 
-        (message_id, phone, contact_name, content, direction, timestamp, is_read, is_audio, audio_url, is_image, image_url, caption, original_content, detected_language, is_group, sender_name, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(messageId, phone, groupName || effectiveSenderName, content, direction, timestamp, fromMe ? 1 : 0, isAudio ? 1 : 0, audioUrl, isImage ? 1 : 0, imageUrl, caption || null, originalContent, detectedLanguage, isGroup ? 1 : 0, effectiveSenderName, now);
+        (message_id, phone, contact_name, content, direction, timestamp, is_read, is_audio, audio_url, is_image, image_url, caption, original_content, detected_language, transcription, transcription_status, is_group, sender_name, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(messageId, phone, groupName || effectiveSenderName, content, direction, timestamp, fromMe ? 1 : 0, isAudio ? 1 : 0, audioUrl, isImage ? 1 : 0, imageUrl, caption || null, originalContent, detectedLanguage, transcription, transcriptionStatus, isGroup ? 1 : 0, effectiveSenderName, now);
 
     // Upsert conversation
     const convName = isGroup ? (body.groupName || body.name || phone) : (senderName || phone);

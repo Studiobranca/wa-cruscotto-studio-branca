@@ -73,6 +73,9 @@ try { db.exec(`UPDATE live_messages SET is_image = 1 WHERE image_url IS NOT NULL
 // Migration: colonne traduzione
 try { db.exec(`ALTER TABLE live_messages ADD COLUMN original_content TEXT`); } catch {}
 try { db.exec(`ALTER TABLE live_messages ADD COLUMN detected_language TEXT`); } catch {}
+// Trascrizione vocali (rev. 11/07/2026): testo dedicato + stato (ok|empty|failed|no_key).
+try { db.exec(`ALTER TABLE live_messages ADD COLUMN transcription TEXT`); } catch {}
+try { db.exec(`ALTER TABLE live_messages ADD COLUMN transcription_status TEXT`); } catch {}
 // Migration: supporto gruppi
 try { db.exec(`ALTER TABLE conversations ADD COLUMN is_group INTEGER DEFAULT 0`); } catch {}
 try { db.exec(`ALTER TABLE live_messages ADD COLUMN is_group INTEGER DEFAULT 0`); } catch {}

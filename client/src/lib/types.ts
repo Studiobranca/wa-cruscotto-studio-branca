@@ -31,6 +31,8 @@ export interface Message {
   caption: string | null;
   originalContent: string | null;
   detectedLanguage: string | null;
+  transcription?: string | null;
+  transcriptionStatus?: string | null;
   createdAt: string;
 }
 

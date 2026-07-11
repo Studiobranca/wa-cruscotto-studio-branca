@@ -315,15 +315,28 @@ export default function Inbox() {
                         <div className="audio-message">
                           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                             <Volume2 size={15} style={{ flexShrink: 0 }} />
-                            {msg.content && msg.content !== '[Messaggio vocale 🎤]' ? (
-                              <span className="audio-transcript">{msg.content}</span>
-                            ) : (
-                              <span style={{ opacity: 0.7, fontSize: 13 }}>Messaggio vocale</span>
-                            )}
+                            <span style={{ opacity: 0.7, fontSize: 13 }}>Messaggio vocale</span>
                           </div>
                           {msg.audioUrl && (
                             <audio controls src={msg.audioUrl} style={{ height: 32, maxWidth: '100%' }} />
                           )}
+                          {(() => {
+                            // Testo trascritto: campo dedicato, con fallback al content (prefisso 🎤)
+                            // per i vocali antecedenti al campo. Se assente → "non disponibile".
+                            const fromContent = msg.content && msg.content.startsWith('🎤')
+                              ? msg.content.replace(/^🎤\s*/, '')
+                              : (msg.content && msg.content !== '[Messaggio vocale 🎤]' ? msg.content : '');
+                            const testo = (msg.transcription || fromContent || '').trim();
+                            return testo ? (
+                              <div className="audio-transcript">
+                                <span style={{ fontWeight: 600 }}>Trascrizione:</span> {testo}
+                              </div>
+                            ) : (
+                              <div className="audio-transcript" style={{ opacity: 0.6, fontStyle: 'italic' }}>
+                                Trascrizione non disponibile
+                              </div>
+                            );
+                          })()}
                         </div>
                       ) : msg.originalContent ? (
                         // Messaggio tradotto

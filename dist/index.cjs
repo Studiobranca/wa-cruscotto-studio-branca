@@ -23967,6 +23967,14 @@ var init_db = __esm({
     } catch {
     }
     try {
+      db.exec(`ALTER TABLE live_messages ADD COLUMN transcription TEXT`);
+    } catch {
+    }
+    try {
+      db.exec(`ALTER TABLE live_messages ADD COLUMN transcription_status TEXT`);
+    } catch {
+    }
+    try {
       db.exec(`ALTER TABLE conversations ADD COLUMN is_group INTEGER DEFAULT 0`);
     } catch {
     }
@@ -100619,6 +100627,73 @@ var init_email = __esm({
   }
 });
 
+// server/transcription.ts
+var transcription_exports = {};
+__export(transcription_exports, {
+  classifyTranscription: () => classifyTranscription,
+  parseDeepgramTranscript: () => parseDeepgramTranscript,
+  transcribeAudioUrl: () => transcribeAudioUrl,
+  transcriptionLabel: () => transcriptionLabel
+});
+function parseDeepgramTranscript(json) {
+  const t = json?.results?.channels?.[0]?.alternatives?.[0]?.transcript;
+  if (typeof t !== "string") return null;
+  const trimmed = t.trim();
+  return trimmed.length ? trimmed : null;
+}
+function classifyTranscription(hasKey, httpOk, transcript) {
+  if (!hasKey) return { status: "no_key", transcript: null };
+  if (!httpOk) return { status: "failed", transcript: null };
+  if (!transcript) return { status: "empty", transcript: null };
+  return { status: "ok", transcript };
+}
+function transcriptionLabel(status) {
+  switch (status) {
+    case "ok":
+      return "";
+    case "empty":
+      return "Trascrizione non disponibile (audio silenzioso o non riconosciuto)";
+    case "failed":
+      return "Trascrizione non disponibile (errore del servizio)";
+    case "no_key":
+      return "Trascrizione non configurata";
+    default:
+      return "Trascrizione non disponibile";
+  }
+}
+async function transcribeAudioUrl(audioUrl, apiKey) {
+  if (!apiKey) return { status: "no_key", transcript: null };
+  try {
+    const audioResp = await fetch(audioUrl);
+    if (!audioResp.ok) {
+      console.error("[Deepgram] download audio HTTP", audioResp.status);
+      return { status: "failed", transcript: null };
+    }
+    const buf = await audioResp.arrayBuffer();
+    const dg = await fetch(DG_URL, {
+      method: "POST",
+      headers: { Authorization: `Token ${apiKey}`, "Content-Type": "audio/ogg; codecs=opus" },
+      body: buf
+    });
+    if (!dg.ok) {
+      console.error("[Deepgram] API HTTP", dg.status);
+      return { status: "failed", transcript: null };
+    }
+    const data = await dg.json();
+    return classifyTranscription(true, true, parseDeepgramTranscript(data));
+  } catch (e) {
+    console.error("[Deepgram] errore trascrizione:", e?.message);
+    return { status: "failed", transcript: null };
+  }
+}
+var DG_URL;
+var init_transcription = __esm({
+  "server/transcription.ts"() {
+    "use strict";
+    DG_URL = "https://api.deepgram.com/v1/listen?model=nova-2&language=it&punctuate=true&smart_format=true";
+  }
+});
+
 // server/index.ts
 var server_exports = {};
 __export(server_exports, {
@@ -101413,7 +101488,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.10.2", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.10.3", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/selftest", (_req, res) => {
   res.json(getLastSelfCheck() || { note: "mai eseguito" });
@@ -101756,6 +101831,7 @@ router.get("/conversations/:phone/messages", (req, res) => {
         is_audio as isAudio, audio_url as audioUrl,
         is_image as isImage, image_url as imageUrl, caption,
         original_content as originalContent, detected_language as detectedLanguage,
+        transcription, transcription_status as transcriptionStatus,
         created_at as createdAt
       FROM live_messages
       WHERE phone = ?
@@ -101765,6 +101841,25 @@ router.get("/conversations/:phone/messages", (req, res) => {
     db_default.prepare(`UPDATE live_messages SET is_read = 1 WHERE phone = ? AND is_read = 0`).run(phone);
     db_default.prepare(`UPDATE conversations SET unread_count = 0 WHERE phone = ?`).run(phone);
     res.json(messages.reverse());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.post("/bot/transcribe/:id", async (req, res) => {
+  try {
+    const id = parseInt(String(req.params.id), 10);
+    const m = db_default.prepare(`SELECT id, audio_url, is_audio, transcription_status FROM live_messages WHERE id = ?`).get(id);
+    if (!m) return res.status(404).json({ error: "Messaggio non trovato" });
+    if (!m.is_audio || !m.audio_url) return res.status(400).json({ error: "Il messaggio non \xE8 un vocale o manca l'URL audio" });
+    if (m.transcription_status === "ok") return res.json({ id, skipped: true, reason: "gi\xE0 trascritto", status: "ok" });
+    const { transcribeAudioUrl: transcribeAudioUrl2 } = await Promise.resolve().then(() => (init_transcription(), transcription_exports));
+    const tr = await transcribeAudioUrl2(m.audio_url, process.env.DEEPGRAM_API_KEY);
+    if (tr.transcript) {
+      db_default.prepare(`UPDATE live_messages SET transcription = ?, transcription_status = 'ok', content = ? WHERE id = ?`).run(tr.transcript, `\u{1F3A4} ${tr.transcript}`, id);
+    } else {
+      db_default.prepare(`UPDATE live_messages SET transcription_status = ? WHERE id = ?`).run(tr.status, id);
+    }
+    res.json({ id, status: tr.status, transcript: tr.transcript });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -102008,37 +102103,18 @@ router.post("/webhook/message", async (req, res) => {
         console.error("[DocVision] webhook immagine:", e.message);
       }
     }
-    const deepgramKey = process.env.DEEPGRAM_API_KEY;
-    if (isAudio && audioUrl && deepgramKey) {
-      try {
-        const audioResp = await fetch(audioUrl);
-        const audioBuffer = await audioResp.arrayBuffer();
-        const dgResp = await fetch(
-          "https://api.deepgram.com/v1/listen?model=nova-2&language=it&punctuate=true&smart_format=true",
-          {
-            method: "POST",
-            headers: {
-              "Authorization": `Token ${deepgramKey}`,
-              "Content-Type": "audio/ogg; codecs=opus"
-            },
-            body: audioBuffer
-          }
-        );
-        if (dgResp.ok) {
-          const dgData = await dgResp.json();
-          const transcript = dgData?.results?.channels?.[0]?.alternatives?.[0]?.transcript?.trim();
-          if (transcript) {
-            content = `\u{1F3A4} ${transcript}`;
-            console.log(`[Deepgram] Trascritto: ${transcript.substring(0, 80)}`);
-          } else {
-            console.log("[Deepgram] Audio ricevuto ma trascrizione vuota (silenzio o rumore)");
-          }
-        } else {
-          const errText = await dgResp.text();
-          console.error("[Deepgram] Errore API:", dgResp.status, errText.substring(0, 100));
-        }
-      } catch (e) {
-        console.error("[Deepgram] Error:", e);
+    let transcription = null;
+    let transcriptionStatus = null;
+    if (isAudio && audioUrl) {
+      const { transcribeAudioUrl: transcribeAudioUrl2 } = await Promise.resolve().then(() => (init_transcription(), transcription_exports));
+      const tr = await transcribeAudioUrl2(audioUrl, process.env.DEEPGRAM_API_KEY);
+      transcriptionStatus = tr.status;
+      if (tr.transcript) {
+        transcription = tr.transcript;
+        content = `\u{1F3A4} ${tr.transcript}`;
+        console.log(`[Deepgram] Trascritto (${phone}): ${tr.transcript.substring(0, 80)}`);
+      } else {
+        console.log(`[Deepgram] Nessuna trascrizione (${transcriptionStatus}) per ${phone}`);
       }
     }
     let originalContent = null;
@@ -102088,9 +102164,9 @@ _(Originale: ${textToTranslate})_`;
     const effectiveSenderName = isGroup ? senderName || body.participantPhone || phone : senderName || phone;
     db_default.prepare(`
       INSERT OR IGNORE INTO live_messages 
-        (message_id, phone, contact_name, content, direction, timestamp, is_read, is_audio, audio_url, is_image, image_url, caption, original_content, detected_language, is_group, sender_name, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(messageId, phone, groupName || effectiveSenderName, content, direction, timestamp, fromMe ? 1 : 0, isAudio ? 1 : 0, audioUrl, isImage ? 1 : 0, imageUrl, caption || null, originalContent, detectedLanguage, isGroup ? 1 : 0, effectiveSenderName, now);
+        (message_id, phone, contact_name, content, direction, timestamp, is_read, is_audio, audio_url, is_image, image_url, caption, original_content, detected_language, transcription, transcription_status, is_group, sender_name, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(messageId, phone, groupName || effectiveSenderName, content, direction, timestamp, fromMe ? 1 : 0, isAudio ? 1 : 0, audioUrl, isImage ? 1 : 0, imageUrl, caption || null, originalContent, detectedLanguage, transcription, transcriptionStatus, isGroup ? 1 : 0, effectiveSenderName, now);
     const convName = isGroup ? body.groupName || body.name || phone : senderName || phone;
     db_default.prepare(`
       INSERT INTO conversations (phone, contact_name, last_message, last_message_at, unread_count, total_received, total_sent, is_group)
