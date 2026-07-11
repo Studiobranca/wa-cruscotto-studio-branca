@@ -32,6 +32,7 @@ import { selectExpiredProposals, selectPendingOutcome } from './agenda_logic.js'
 import { composeBriefing, type BriefingData } from './briefing_logic.js';
 import { getImminentDeadlines } from './deadlines.js';
 import { composeDeadlineDigest } from './deadlines_logic.js';
+import { smsEnabled, sendSmsIfEnabled } from './sms.js';
 import {
   channelOfKey, inReminderWindow, inRecallWindow, inSlaWindow,
   isTooFresh, sqliteToMs, reminderMessageIT, waitlistRecallMessageIT, slaAlertText,
@@ -66,7 +67,16 @@ async function deliver(key: string, text: string, emailSubject: string): Promise
   const k = channelOfKey(key);
   if (k.channel === 'whatsapp') {
     try { await sendTextMessage(k.address, text); return true; }
-    catch (e: any) { console.error('[Reminders] invio WhatsApp fallito:', e.message); return false; }
+    catch (e: any) {
+      console.error('[Reminders] invio WhatsApp fallito:', e.message);
+      // FALLBACK SMS (solo promemoria, dietro feature-flag SMS_PROVIDER; OFF di default).
+      if (smsEnabled()) {
+        const r = await sendSmsIfEnabled(k.address, text);
+        if (r.ok) { console.log(`[Reminders] fallback SMS inviato a ${k.address}`); return true; }
+        console.error('[Reminders] fallback SMS non riuscito:', r.error || r.skipped);
+      }
+      return false;
+    }
   }
   try {
     const mail = await import('./email.js');

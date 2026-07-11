@@ -101130,6 +101130,72 @@ function getImminentDeadlines(todayISO, withinDays = 7) {
   return selectImminentDeadlines(rows, todayISO, withinDays);
 }
 
+// server/sms_logic.ts
+function toE164(raw, defaultCC = "39") {
+  let d = String(raw || "").replace(/[^\d+]/g, "");
+  if (d.startsWith("+")) d = d.slice(1);
+  d = d.replace(/\D/g, "");
+  if (d.startsWith("00")) d = d.slice(2);
+  if (!d) return null;
+  if (d.startsWith(defaultCC) && d.length >= 11) return `+${d}`;
+  if (d.startsWith("3") && d.length >= 9 && d.length <= 10) return `+${defaultCC}${d}`;
+  if (d.length >= 8) return `+${d}`;
+  return null;
+}
+
+// server/sms.ts
+function smsEnabled() {
+  return !!(process.env.SMS_PROVIDER && String(process.env.SMS_PROVIDER).trim());
+}
+var SkebbyProvider = class {
+  constructor() {
+    this.name = "skebby";
+  }
+  async send(to, text) {
+    const user = process.env.SKEBBY_USER, pass = process.env.SKEBBY_PASS;
+    const sender = process.env.SKEBBY_SENDER || "Studio Branca";
+    if (!user || !pass) return { ok: false, error: "SKEBBY_USER/SKEBBY_PASS mancanti" };
+    try {
+      const auth = await fetch(`https://api.skebby.it/API/v1.0/REST/login?username=${encodeURIComponent(user)}&password=${encodeURIComponent(pass)}`);
+      if (!auth.ok) return { ok: false, error: `login Skebby fallito (${auth.status})` };
+      const [userKey, sessionKey] = (await auth.text()).split(";");
+      const r = await fetch("https://api.skebby.it/API/v1.0/REST/sms", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", user_key: userKey, Session_key: sessionKey },
+        body: JSON.stringify({ message_type: "GP", message: text, sender, recipient: [to] })
+      });
+      const jd = await r.json().catch(() => null);
+      return r.ok ? { ok: true, id: jd?.order_id } : { ok: false, error: `invio Skebby fallito (${r.status})` };
+    } catch (e) {
+      return { ok: false, error: e?.message };
+    }
+  }
+};
+function getSmsProvider() {
+  if (!smsEnabled()) return null;
+  if (String(process.env.SMS_PROVIDER).toLowerCase() === "skebby") return new SkebbyProvider();
+  return null;
+}
+async function sendSmsIfEnabled(phone, text) {
+  const p = getSmsProvider();
+  if (!p) return { ok: false, skipped: "sms-disabilitato (SMS_PROVIDER non impostato)" };
+  const to = toE164(phone);
+  if (!to) return { ok: false, error: "numero non valido per E.164" };
+  try {
+    return await p.send(to, text);
+  } catch (e) {
+    return { ok: false, error: e?.message };
+  }
+}
+function smsStatus() {
+  return {
+    enabled: smsEnabled(),
+    provider: process.env.SMS_PROVIDER || null,
+    sender: process.env.SKEBBY_SENDER || null,
+    hasCredentials: !!(process.env.SKEBBY_USER && process.env.SKEBBY_PASS)
+  };
+}
+
 // server/reminders_logic.ts
 var SEGRETERIA = "0909797187";
 var FIRMA_WA = "Assistente Virtuale \u2014 Studio Tributario Branca";
@@ -101302,6 +101368,14 @@ async function deliver(key, text, emailSubject) {
       return true;
     } catch (e) {
       console.error("[Reminders] invio WhatsApp fallito:", e.message);
+      if (smsEnabled()) {
+        const r = await sendSmsIfEnabled(k.address, text);
+        if (r.ok) {
+          console.log(`[Reminders] fallback SMS inviato a ${k.address}`);
+          return true;
+        }
+        console.error("[Reminders] fallback SMS non riuscito:", r.error || r.skipped);
+      }
       return false;
     }
   }
@@ -102187,7 +102261,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.11.3", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.11.4", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/selftest", (_req, res) => {
   res.json(getLastSelfCheck() || { note: "mai eseguito" });
@@ -103519,6 +103593,13 @@ router.get("/bot/briefing", (_req, res) => {
     const data = getBriefingData();
     const { text, empty } = composeBriefing(data);
     res.json({ preview: text, empty, data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.get("/bot/sms/status", (_req, res) => {
+  try {
+    res.json(smsStatus());
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

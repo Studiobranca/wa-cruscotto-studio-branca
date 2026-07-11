@@ -60,6 +60,7 @@ import { approveEmailDraft, rejectEmailDraft } from './email.js';
 import { getAllAppointments, setAppointmentOutcome, getAppointmentRow } from './chatbot.js';
 import { selectPendingOutcome, isValidOutcome } from './agenda_logic.js';
 import { createChecklist, getChecklist, getChecklistGrouped, markDocReceived, buildDocRequestText } from './practices.js';
+import { smsStatus } from './sms.js';
 
 const router = Router();
 
@@ -83,7 +84,7 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.11.3', built: new Date().toISOString() });
+  res.json({ version: '2.11.4', built: new Date().toISOString() });
 });
 
 // ─── Autocheck (self-test + autocorrezione) ──────────────────────────────────
@@ -1607,6 +1608,12 @@ router.get('/bot/briefing', (_req: Request, res: Response) => {
     const { text, empty } = composeBriefing(data);
     res.json({ preview: text, empty, data });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── SMS (scaffold): stato configurazione. OFF finché SMS_PROVIDER non è impostato ──
+router.get('/bot/sms/status', (_req: Request, res: Response) => {
+  try { res.json(smsStatus()); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
 // ─── MONITORAGGIO: stato consolidato + check manuale (nessun invio ai clienti) ──
