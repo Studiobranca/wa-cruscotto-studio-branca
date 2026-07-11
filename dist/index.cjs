@@ -101920,6 +101920,89 @@ init_emaildrafts();
 init_email();
 init_chatbot();
 init_agenda_logic();
+
+// server/practices.ts
+init_db();
+
+// server/practices_logic.ts
+function missingDocs(rows) {
+  return rows.filter((r) => r.status !== "ricevuto");
+}
+function checklistProgress(rows) {
+  const total = rows.length;
+  const received = rows.filter((r) => r.status === "ricevuto").length;
+  return { total, received, missing: total - received, complete: total > 0 && received === total };
+}
+function composeDocRequest(pratica, missing, contactName) {
+  const nome = contactName ? ` ${contactName}` : "";
+  const lista = missing.map((d) => `- ${d}`).join("\n");
+  return `Gentile${nome}, per procedere con la pratica "${pratica}" ci servono ancora questi documenti:
+${lista}
+
+Pu\xF2 inviarli su questa chat WhatsApp oppure via email a studiobranca@tiscali.it o studiobranca@icloud.com.
+
+Per qualsiasi necessit\xE0 pu\xF2 chiamare lo 0909797187 negli orari di segreteria.
+Assistente Virtuale \u2014 Studio Tributario Branca`;
+}
+
+// server/practices.ts
+db_default.exec(`
+  CREATE TABLE IF NOT EXISTS doc_checklist (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_key TEXT NOT NULL,        -- telefono o email:<addr>
+    contact_name TEXT,
+    pratica TEXT NOT NULL,
+    doc_name TEXT NOT NULL,
+    status TEXT DEFAULT 'richiesto', -- richiesto | ricevuto
+    fascicolo TEXT,                  -- riferimento/percorso fascicolo (opzionale)
+    note TEXT,
+    created_at TEXT DEFAULT (datetime('now')),
+    received_at TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_doc_checklist_client ON doc_checklist(client_key, pratica);
+`);
+function createChecklist(clientKey, pratica, docs, opts = {}) {
+  const ins = db_default.prepare(`INSERT INTO doc_checklist (client_key, contact_name, pratica, doc_name, fascicolo) VALUES (?, ?, ?, ?, ?)`);
+  const ids = [];
+  for (const d of docs) {
+    const name = String(d || "").trim();
+    if (!name) continue;
+    ids.push(Number(ins.run(clientKey, opts.contactName || null, pratica, name, opts.fascicolo || null).lastInsertRowid));
+  }
+  return ids;
+}
+function getChecklist(clientKey, pratica) {
+  let sql = `SELECT * FROM doc_checklist WHERE 1=1`;
+  const args = [];
+  if (clientKey) {
+    sql += ` AND client_key = ?`;
+    args.push(clientKey);
+  }
+  if (pratica) {
+    sql += ` AND pratica = ?`;
+    args.push(pratica);
+  }
+  sql += ` ORDER BY pratica, id`;
+  return db_default.prepare(sql).all(...args);
+}
+function getChecklistGrouped(clientKey) {
+  const rows = getChecklist(clientKey);
+  const byPratica = {};
+  for (const r of rows) (byPratica[r.pratica] = byPratica[r.pratica] || []).push(r);
+  return Object.entries(byPratica).map(([pratica, docs]) => ({ pratica, docs, progress: checklistProgress(docs) }));
+}
+function markDocReceived(id) {
+  const info = db_default.prepare(`UPDATE doc_checklist SET status = 'ricevuto', received_at = datetime('now') WHERE id = ? AND status != 'ricevuto'`).run(id);
+  return info.changes > 0;
+}
+function buildDocRequestText(clientKey, pratica) {
+  const rows = getChecklist(clientKey, pratica);
+  const miss = missingDocs(rows);
+  const contactName = rows[0]?.contact_name || null;
+  return { text: composeDocRequest(pratica, miss.map((m) => m.doc_name), contactName), missing: miss.map((m) => m.doc_name), contactName };
+}
+
+// server/routes.ts
 var router = (0, import_express.Router)();
 try {
   const bad = db_default.prepare(`SELECT id, timestamp FROM live_messages WHERE timestamp LIKE '+%'`).all();
@@ -101936,7 +102019,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.11.0", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.11.1", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/selftest", (_req, res) => {
   res.json(getLastSelfCheck() || { note: "mai eseguito" });
@@ -103267,6 +103350,55 @@ router.get("/bot/briefing", (_req, res) => {
     const data = getBriefingData();
     const { text, empty } = composeBriefing(data);
     res.json({ preview: text, empty, data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.post("/bot/practices/checklist", (req, res) => {
+  try {
+    const { clientKey, pratica, docs, contactName, fascicolo } = req.body || {};
+    if (!clientKey || !pratica || !Array.isArray(docs) || !docs.length) {
+      return res.status(400).json({ error: "clientKey, pratica e docs[] richiesti" });
+    }
+    const ids = createChecklist(String(clientKey), String(pratica), docs, { contactName, fascicolo });
+    res.json({ ok: true, ids, count: ids.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.get("/bot/practices/checklist", (req, res) => {
+  try {
+    const client = req.query.client ? String(req.query.client) : void 0;
+    const pratica = req.query.pratica ? String(req.query.pratica) : void 0;
+    if (client && !pratica) return res.json(getChecklistGrouped(client));
+    res.json(getChecklist(client, pratica));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.post("/bot/practices/checklist/:id/received", (req, res) => {
+  try {
+    res.json({ ok: markDocReceived(parseInt(String(req.params.id), 10)) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.post("/bot/practices/request-draft", (req, res) => {
+  try {
+    const { clientKey, pratica } = req.body || {};
+    if (!clientKey || !pratica) return res.status(400).json({ error: "clientKey e pratica richiesti" });
+    const { text, missing, contactName } = buildDocRequestText(String(clientKey), String(pratica));
+    if (!missing.length) return res.json({ ok: true, draftId: null, note: "Nessun documento mancante: niente da richiedere." });
+    let draftId = null;
+    let channel = "whatsapp";
+    const key = String(clientKey);
+    if (key.startsWith("email:")) {
+      channel = "email";
+      draftId = saveEmailDraft({ toAddr: key.slice(6), toName: contactName, subject: `Documenti pratica ${pratica}`, draftText: text, needsHuman: false });
+    } else {
+      draftId = saveDraft({ phone: key, contactName: contactName || key, incoming: `[richiesta documenti ${pratica}]`, result: { draftText: text, proposedEvent: null, needsHuman: false } });
+    }
+    res.json({ ok: true, draftId, channel, missing, preview: text });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

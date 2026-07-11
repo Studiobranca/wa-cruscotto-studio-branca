@@ -54,10 +54,11 @@ import { composeBriefing } from './briefing_logic.js';
 import { summarizeConversation } from './summary.js';
 import { decideWorkAutoSend } from './autosend.js';
 import { recordBotSend, getSentLog, getSentLogSummary } from './sentlog.js';
-import { getEmailDrafts, getEmailSentLog, getEmailSentSummary } from './emaildrafts.js';
+import { getEmailDrafts, getEmailSentLog, getEmailSentSummary, saveEmailDraft } from './emaildrafts.js';
 import { approveEmailDraft, rejectEmailDraft } from './email.js';
 import { getAllAppointments, setAppointmentOutcome, getAppointmentRow } from './chatbot.js';
 import { selectPendingOutcome, isValidOutcome } from './agenda_logic.js';
+import { createChecklist, getChecklist, getChecklistGrouped, markDocReceived, buildDocRequestText } from './practices.js';
 
 const router = Router();
 
@@ -81,7 +82,7 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.11.0', built: new Date().toISOString() });
+  res.json({ version: '2.11.1', built: new Date().toISOString() });
 });
 
 // ─── Autocheck (self-test + autocorrezione) ──────────────────────────────────
@@ -1603,6 +1604,49 @@ router.get('/bot/briefing', (_req: Request, res: Response) => {
     const data = getBriefingData();
     const { text, empty } = composeBriefing(data);
     res.json({ preview: text, empty, data });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── PRATICHE: checklist documenti (richiesta al cliente SEMPRE come BOZZA) ──
+router.post('/bot/practices/checklist', (req: Request, res: Response) => {
+  try {
+    const { clientKey, pratica, docs, contactName, fascicolo } = req.body || {};
+    if (!clientKey || !pratica || !Array.isArray(docs) || !docs.length) {
+      return res.status(400).json({ error: 'clientKey, pratica e docs[] richiesti' });
+    }
+    const ids = createChecklist(String(clientKey), String(pratica), docs, { contactName, fascicolo });
+    res.json({ ok: true, ids, count: ids.length });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+router.get('/bot/practices/checklist', (req: Request, res: Response) => {
+  try {
+    const client = req.query.client ? String(req.query.client) : undefined;
+    const pratica = req.query.pratica ? String(req.query.pratica) : undefined;
+    if (client && !pratica) return res.json(getChecklistGrouped(client));
+    res.json(getChecklist(client, pratica));
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+router.post('/bot/practices/checklist/:id/received', (req: Request, res: Response) => {
+  try { res.json({ ok: markDocReceived(parseInt(String(req.params.id), 10)) }); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+// Genera la richiesta documenti mancanti come BOZZA (mai auto-inviata). WhatsApp (phone)
+// → bozza WhatsApp; email:<addr> → bozza email. L'invio parte solo dall'approvazione.
+router.post('/bot/practices/request-draft', (req: Request, res: Response) => {
+  try {
+    const { clientKey, pratica } = req.body || {};
+    if (!clientKey || !pratica) return res.status(400).json({ error: 'clientKey e pratica richiesti' });
+    const { text, missing, contactName } = buildDocRequestText(String(clientKey), String(pratica));
+    if (!missing.length) return res.json({ ok: true, draftId: null, note: 'Nessun documento mancante: niente da richiedere.' });
+    let draftId: number | null = null; let channel = 'whatsapp';
+    const key = String(clientKey);
+    if (key.startsWith('email:')) {
+      channel = 'email';
+      draftId = saveEmailDraft({ toAddr: key.slice(6), toName: contactName, subject: `Documenti pratica ${pratica}`, draftText: text, needsHuman: false });
+    } else {
+      draftId = saveDraft({ phone: key, contactName: contactName || key, incoming: `[richiesta documenti ${pratica}]`, result: { draftText: text, proposedEvent: null, needsHuman: false } });
+    }
+    res.json({ ok: true, draftId, channel, missing, preview: text });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
