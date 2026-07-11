@@ -14,10 +14,11 @@
 
 import db from './db.js';
 import { upsertAllDayEvent } from './integrations.js';
-import { setReceivedWebhook, getReceivedWebhook, getDevicePhone } from './zapi.js';
+import { setReceivedWebhook, getReceivedWebhook, getDevicePhone, zapiGet, sendTextMessage } from './zapi.js';
 import { broadcastEvent } from './sse.js';
 import { getControlNumber, getAlertEmail, sendStudioAlertEmail, isAutoSendEnabled, waCommandsEnabled, isBotEnabled } from './chatbot.js';
 import { remindersTick } from './reminders.js';
+import { evaluateZapiHealth, decideMonitorAlert } from './monitor_logic.js';
 
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://wa-cruscotto-v2-production.up.railway.app';
 const WEBHOOK_URL = `${PUBLIC_BASE_URL}/api/webhook/message`;
@@ -240,6 +241,47 @@ export function getLastSelfCheck(): any {
   try { return JSON.parse(getSetting('selfcheck_last') || 'null'); } catch { return null; }
 }
 
+// ─── MONITORAGGIO SESSIONE Z-API + allarmi (rev. 11/07/2026) ─────────────────
+// Complementare al watchdog (che ripara il WEBHOOK): qui controlliamo la SESSIONE
+// Z-API (device/telefono). Se cade, l'alert va via EMAIL (Brevo) — canale affidabile
+// proprio perché WhatsApp è ciò che è rotto — con cooldown; alla ripresa, notifica di
+// ripristino. Nessun doppione col selftest notturno (che verifica invarianti interni).
+export async function runMonitoring(force = false): Promise<{ healthy: boolean; reason: string; action: string }> {
+  let status: any = null;
+  try { status = await zapiGet('status'); } catch { status = null; }
+  const { healthy, reason } = evaluateZapiHealth(status);
+  const lastState = (getSetting('monitor_zapi_state') as 'up' | 'down' | null) || undefined;
+  const lastAtRaw = getSetting('monitor_zapi_alert_at');
+  const lastAlertMs = lastAtRaw ? Date.parse(lastAtRaw) : null;
+  const { action, newState } = decideMonitorAlert(healthy, lastState || undefined, (lastAlertMs != null && !isNaN(lastAlertMs)) ? lastAlertMs : null, Date.now());
+  setSetting('monitor_zapi_state', newState);
+  if (action === 'alert-down') {
+    setSetting('monitor_zapi_alert_at', new Date().toISOString());
+    const html = `<h2 style="color:#b00020">⚠️ Sessione WhatsApp (Z-API) NON attiva</h2>
+      <p>${reason}</p>
+      <p>Il bot potrebbe non ricevere/inviare messaggi WhatsApp. <b>RUNBOOK</b>: riconnetti la
+      sessione Z-API (riscansiona il QR nella dashboard Z-API), poi verifica
+      <code>/api/bot/zapi-info</code> e <code>/api/bot/flow-health</code>.</p>`;
+    await sendStudioAlertEmail('🔴 WhatsApp/Z-API disconnesso — Studio Branca', html).catch(() => {});
+    console.warn('[Monitor] Z-API DOWN:', reason);
+  } else if (action === 'alert-recovered') {
+    try { await sendTextMessage(getControlNumber(), '✅ Sessione WhatsApp (Z-API) di nuovo attiva.'); } catch { /* best-effort */ }
+    await sendStudioAlertEmail('✅ WhatsApp/Z-API ripristinato — Studio Branca', '<p>La sessione Z-API è tornata attiva.</p>').catch(() => {});
+    console.log('[Monitor] Z-API RECOVERED');
+  }
+  return { healthy, reason, action };
+}
+
+/** Stato consolidato per diagnostica (sola lettura). */
+export function getMonitorStatus(): any {
+  return {
+    zapiState: getSetting('monitor_zapi_state') || 'unknown',
+    lastZapiAlertAt: getSetting('monitor_zapi_alert_at'),
+    flow: getFlowHealth(),
+    lastSelfCheck: getLastSelfCheck(),
+  };
+}
+
 // ─── Scheduler interno ───────────────────────────────────────────────────────
 export function startMaintenance(): void {
   // All'avvio: assicura che il webhook Z-API sia registrato con notifySentByMe,
@@ -270,6 +312,8 @@ export function startMaintenance(): void {
       // Promemoria appuntamenti + richiamo lista d'attesa + SLA risposte (v2.10).
       // Internamente già isolato per singolo job (try/catch in remindersTick).
       await remindersTick();
+      // Monitoraggio sessione Z-API (alert via email se il device cade).
+      try { await runMonitoring(); } catch (e: any) { console.error('[Monitor] tick:', e.message); }
     } catch (e: any) {
       console.error('[Maintenance] tick error:', e.message);
     }

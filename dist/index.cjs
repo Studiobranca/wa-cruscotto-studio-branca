@@ -101663,6 +101663,23 @@ function getRemindersStatus() {
   };
 }
 
+// server/monitor_logic.ts
+function evaluateZapiHealth(s) {
+  if (!s) return { healthy: true, reason: "stato non disponibile (nessun allarme: possibile blip di rete)" };
+  if (s.connected === false) return { healthy: false, reason: "sessione Z-API disconnessa (connected=false)" };
+  if (s.smartphoneConnected === false) return { healthy: false, reason: "telefono scollegato (smartphoneConnected=false)" };
+  return { healthy: true, reason: "ok" };
+}
+function decideMonitorAlert(healthy, lastState, lastAlertMs, nowMs, cooldownMin = 180) {
+  if (!healthy) {
+    const cool = lastAlertMs != null && nowMs - lastAlertMs < cooldownMin * 6e4;
+    if (lastState === "down" && cool) return { action: "none", newState: "down" };
+    return { action: "alert-down", newState: "down" };
+  }
+  if (lastState === "down") return { action: "alert-recovered", newState: "up" };
+  return { action: "none", newState: "up" };
+}
+
 // server/maintenance.ts
 var PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://wa-cruscotto-v2-production.up.railway.app";
 var WEBHOOK_URL = `${PUBLIC_BASE_URL}/api/webhook/message`;
@@ -101857,6 +101874,48 @@ function getLastSelfCheck() {
     return null;
   }
 }
+async function runMonitoring(force = false) {
+  let status = null;
+  try {
+    status = await zapiGet("status");
+  } catch {
+    status = null;
+  }
+  const { healthy, reason } = evaluateZapiHealth(status);
+  const lastState = getSetting3("monitor_zapi_state") || void 0;
+  const lastAtRaw = getSetting3("monitor_zapi_alert_at");
+  const lastAlertMs = lastAtRaw ? Date.parse(lastAtRaw) : null;
+  const { action, newState } = decideMonitorAlert(healthy, lastState || void 0, lastAlertMs != null && !isNaN(lastAlertMs) ? lastAlertMs : null, Date.now());
+  setSetting3("monitor_zapi_state", newState);
+  if (action === "alert-down") {
+    setSetting3("monitor_zapi_alert_at", (/* @__PURE__ */ new Date()).toISOString());
+    const html = `<h2 style="color:#b00020">\u26A0\uFE0F Sessione WhatsApp (Z-API) NON attiva</h2>
+      <p>${reason}</p>
+      <p>Il bot potrebbe non ricevere/inviare messaggi WhatsApp. <b>RUNBOOK</b>: riconnetti la
+      sessione Z-API (riscansiona il QR nella dashboard Z-API), poi verifica
+      <code>/api/bot/zapi-info</code> e <code>/api/bot/flow-health</code>.</p>`;
+    await sendStudioAlertEmail("\u{1F534} WhatsApp/Z-API disconnesso \u2014 Studio Branca", html).catch(() => {
+    });
+    console.warn("[Monitor] Z-API DOWN:", reason);
+  } else if (action === "alert-recovered") {
+    try {
+      await sendTextMessage(getControlNumber(), "\u2705 Sessione WhatsApp (Z-API) di nuovo attiva.");
+    } catch {
+    }
+    await sendStudioAlertEmail("\u2705 WhatsApp/Z-API ripristinato \u2014 Studio Branca", "<p>La sessione Z-API \xE8 tornata attiva.</p>").catch(() => {
+    });
+    console.log("[Monitor] Z-API RECOVERED");
+  }
+  return { healthy, reason, action };
+}
+function getMonitorStatus() {
+  return {
+    zapiState: getSetting3("monitor_zapi_state") || "unknown",
+    lastZapiAlertAt: getSetting3("monitor_zapi_alert_at"),
+    flow: getFlowHealth(),
+    lastSelfCheck: getLastSelfCheck()
+  };
+}
 function startMaintenance() {
   setTimeout(async () => {
     try {
@@ -101879,6 +101938,11 @@ function startMaintenance() {
       }
       await watchdogTick();
       await remindersTick();
+      try {
+        await runMonitoring();
+      } catch (e) {
+        console.error("[Monitor] tick:", e.message);
+      }
     } catch (e) {
       console.error("[Maintenance] tick error:", e.message);
     }
@@ -102123,7 +102187,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.11.2", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.11.3", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/selftest", (_req, res) => {
   res.json(getLastSelfCheck() || { note: "mai eseguito" });
@@ -103455,6 +103519,20 @@ router.get("/bot/briefing", (_req, res) => {
     const data = getBriefingData();
     const { text, empty } = composeBriefing(data);
     res.json({ preview: text, empty, data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.get("/bot/monitor", (_req, res) => {
+  try {
+    res.json(getMonitorStatus());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.post("/bot/monitor/check", async (_req, res) => {
+  try {
+    res.json(await runMonitoring(true));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

@@ -48,7 +48,7 @@ import {
   getWaitlist,
   closeWaitlistEntry,
 } from './chatbot.js';
-import { runDailyDigest, getFlowHealth, repairWebhook, runSelfCheck, getLastSelfCheck } from './maintenance.js';
+import { runDailyDigest, getFlowHealth, repairWebhook, runSelfCheck, getLastSelfCheck, getMonitorStatus, runMonitoring } from './maintenance.js';
 import { runReminders, runWaitlistRecall, runSlaCheck, getRemindersStatus, runDraftAging, getAgingView, runAppointmentCleanup, getBriefingData, runMorningBriefing, runDeadlineReminders } from './reminders.js';
 import { createDeadline, listDeadlines, completeDeadline, deleteDeadline, getImminentDeadlines } from './deadlines.js';
 import { composeBriefing } from './briefing_logic.js';
@@ -83,7 +83,7 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.11.2', built: new Date().toISOString() });
+  res.json({ version: '2.11.3', built: new Date().toISOString() });
 });
 
 // ─── Autocheck (self-test + autocorrezione) ──────────────────────────────────
@@ -1607,6 +1607,16 @@ router.get('/bot/briefing', (_req: Request, res: Response) => {
     const { text, empty } = composeBriefing(data);
     res.json({ preview: text, empty, data });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── MONITORAGGIO: stato consolidato + check manuale (nessun invio ai clienti) ──
+router.get('/bot/monitor', (_req: Request, res: Response) => {
+  try { res.json(getMonitorStatus()); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+router.post('/bot/monitor/check', async (_req: Request, res: Response) => {
+  try { res.json(await runMonitoring(true)); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
 // ─── SCADENZARIO ADEMPIMENTI (promemoria SOLO interni; nessun invio ai clienti) ──
