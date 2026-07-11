@@ -32,6 +32,7 @@ import {
   channelOfKey, inReminderWindow, inRecallWindow, inSlaWindow,
   isTooFresh, sqliteToMs, reminderMessageIT, waitlistRecallMessageIT, slaAlertText,
 } from './reminders_logic.js';
+import { selectAgingDrafts, agingDigestText, type AgingOpts } from './aging_logic.js';
 
 // ─── Settings (app_settings, come maintenance.ts) ────────────────────────────
 function getSetting(key: string, def: string): string {
@@ -183,12 +184,62 @@ export async function runSlaCheck(force = false): Promise<{ alerted: number }> {
   return { alerted: drafts.length + emails.length };
 }
 
+// ═══ 4) AGING BOZZE — DIGEST BACKLOG (rev. 11/07/2026) ═══════════════════════
+// Complementare allo SLA (one-shot a ~4h). Qui: 1 DIGEST/giorno del backlog ANCORA
+// aperto, con priorità alle URGENZE ferme oltre 24h (le altre oltre 48h) + gli
+// appuntamenti [DA CONFERMARE] già passati/in giornata. Solo notifica al numero di
+// controllo (Mariano): NESSUN messaggio ai clienti. Idempotente 1×/giorno.
+export function draftAgingEnabled(): boolean { return getSetting('bot_draft_aging', '1') === '1'; }
+function agingOpts(): AgingOpts {
+  return {
+    urgentHours: parseInt(getSetting('aging_urgent_hours', '24'), 10) || 24,
+    normalHours: parseInt(getSetting('aging_normal_hours', '48'), 10) || 48,
+  };
+}
+function overdueProposedAppointments(todayISO: string): { who: string; date: string; start: string }[] {
+  try {
+    return (db.prepare(`
+      SELECT phone, contact_name, date, start FROM bot_appointments
+      WHERE status = 'da_confermare' AND date <= ? ORDER BY date ASC, start ASC
+    `).all(todayISO) as any[]).map((a) => ({ who: a.contact_name || a.phone, date: a.date, start: a.start }));
+  } catch { return []; }
+}
+export async function runDraftAging(force = false): Promise<{ alerted: number }> {
+  if (!draftAgingEnabled()) return { alerted: 0 };
+  const { iso, hour } = romeNow();
+  if (!force) {
+    if (hour < 8 || hour > 21) return { alerted: 0 };            // niente notifiche notturne
+    if (getSetting(`draft_aging_done_${iso}`, '') === '1') return { alerted: 0 }; // 1×/giorno
+  }
+  const opts = agingOpts();
+  const drafts = db.prepare(`SELECT id, phone, contact_name, needs_human, created_at FROM bot_drafts WHERE status = 'pending'`).all() as any[];
+  const sel = selectAgingDrafts(drafts, Date.now(), opts);
+  const overdue = overdueProposedAppointments(iso);
+  if (!sel.count && !overdue.length) { if (!force) setSetting(`draft_aging_done_${iso}`, '1'); return { alerted: 0 }; }
+  const text = agingDigestText(sel, overdue, opts);
+  try { await sendTextMessage(getControlNumber(), text); }
+  catch (e: any) { console.error('[Reminders] alert aging fallito:', e.message); return { alerted: 0 }; }
+  if (!force) setSetting(`draft_aging_done_${iso}`, '1');
+  console.log(`[Reminders] Aging bozze: ${sel.urgent.length} urgenti + ${sel.normal.length} normali + ${overdue.length} appuntamenti da confermare scaduti.`);
+  return { alerted: sel.count + overdue.length };
+}
+
+/** Vista prioritaria di sola lettura (nessun invio) — per endpoint /api/bot/drafts/aging. */
+export function getAgingView(): any {
+  const opts = agingOpts();
+  const { iso } = romeNow();
+  const drafts = db.prepare(`SELECT id, phone, contact_name, needs_human, created_at FROM bot_drafts WHERE status = 'pending'`).all() as any[];
+  const sel = selectAgingDrafts(drafts, Date.now(), opts);
+  return { opts, ...sel, overdueAppointments: overdueProposedAppointments(iso), totalPending: drafts.length };
+}
+
 /** Un giro di tutti i job: chiamato dal tick di maintenance (ogni 30 min). Ogni job è
  *  isolato in try/catch: un errore qui non deve MAI toccare digest/watchdog/bot. */
 export async function remindersTick(): Promise<void> {
   try { await runReminders(); } catch (e: any) { console.error('[Reminders] promemoria:', e.message); }
   try { await runWaitlistRecall(); } catch (e: any) { console.error('[Reminders] lista d\'attesa:', e.message); }
   try { await runSlaCheck(); } catch (e: any) { console.error('[Reminders] SLA:', e.message); }
+  try { await runDraftAging(); } catch (e: any) { console.error('[Reminders] aging bozze:', e.message); }
 }
 
 /** Stato sintetico per Cruscotto/diagnostica. */

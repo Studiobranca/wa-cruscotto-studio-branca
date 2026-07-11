@@ -19996,14 +19996,14 @@ var require_etag = __commonJS({
   "node_modules/etag/index.js"(exports2, module2) {
     "use strict";
     module2.exports = etag;
-    var crypto = require("crypto");
+    var crypto2 = require("crypto");
     var Stats = require("fs").Stats;
     var toString = Object.prototype.toString;
     function entitytag(entity) {
       if (entity.length === 0) {
         return '"0-2jmj7l5rSw0yVb/vlWAYkK/YBwk"';
       }
-      var hash = crypto.createHash("sha1").update(entity, "utf8").digest("base64").substring(0, 27);
+      var hash = crypto2.createHash("sha1").update(entity, "utf8").digest("base64").substring(0, 27);
       var len = typeof entity === "string" ? Buffer.byteLength(entity, "utf8") : entity.length;
       return '"' + len.toString(16) + "-" + hash + '"';
     }
@@ -22896,11 +22896,11 @@ var require_request = __commonJS({
 // node_modules/cookie-signature/index.js
 var require_cookie_signature = __commonJS({
   "node_modules/cookie-signature/index.js"(exports2) {
-    var crypto = require("crypto");
+    var crypto2 = require("crypto");
     exports2.sign = function(val, secret) {
       if ("string" !== typeof val) throw new TypeError("Cookie value must be provided as a string.");
       if (null == secret) throw new TypeError("Secret key must be provided.");
-      return val + "." + crypto.createHmac("sha256", secret).update(val).digest("base64").replace(/\=+$/, "");
+      return val + "." + crypto2.createHmac("sha256", secret).update(val).digest("base64").replace(/\=+$/, "");
     };
     exports2.unsign = function(val, secret) {
       if ("string" !== typeof val) throw new TypeError("Signed cookie string must be provided.");
@@ -22909,7 +22909,7 @@ var require_cookie_signature = __commonJS({
       return sha1(mac) == sha1(val) ? str : false;
     };
     function sha1(str) {
-      return crypto.createHash("sha1").update(str).digest("hex");
+      return crypto2.createHash("sha1").update(str).digest("hex");
     }
   }
 });
@@ -69688,7 +69688,7 @@ var require_imap_flow = __commonJS({
     "use strict";
     var tls = require("tls");
     var net = require("net");
-    var crypto = require("crypto");
+    var crypto2 = require("crypto");
     var { EventEmitter } = require("events");
     var logger = require_logger();
     var libmime = require_libmime();
@@ -69959,7 +69959,7 @@ var require_imap_flow = __commonJS({
         this.emit("error", err);
       }
       getRandomId() {
-        let rid = BigInt("0x" + crypto.randomBytes(13).toString("hex")).toString(36);
+        let rid = BigInt("0x" + crypto2.randomBytes(13).toString("hex")).toString(36);
         if (rid.length < 20) {
           rid = "0".repeat(20 - rid.length) + rid;
         }
@@ -73307,14 +73307,14 @@ var require_punycode2 = __commonJS({
 var require_stream_hash = __commonJS({
   "node_modules/mailparser/lib/stream-hash.js"(exports2, module2) {
     "use strict";
-    var crypto = require("crypto");
+    var crypto2 = require("crypto");
     var Transform = require("stream").Transform;
     var StreamHash = class extends Transform {
       constructor(attachment, algo) {
         super();
         this.attachment = attachment;
         this.algo = (algo || "md5").toLowerCase();
-        this.hash = crypto.createHash(algo);
+        this.hash = crypto2.createHash(algo);
         this.byteCount = 0;
       }
       _transform(chunk, encoding, done) {
@@ -92918,7 +92918,7 @@ var require_le_unix = __commonJS({
 var require_mime_node2 = __commonJS({
   "node_modules/nodemailer/lib/mime-node/index.js"(exports2, module2) {
     "use strict";
-    var crypto = require("crypto");
+    var crypto2 = require("crypto");
     var fs2 = require("fs");
     var punycode = require_punycode3();
     var { PassThrough } = require("stream");
@@ -92937,7 +92937,7 @@ var require_mime_node2 = __commonJS({
       constructor(contentType, options) {
         this.nodeCounter = 0;
         options = options || {};
-        this.baseBoundary = options.baseBoundary || crypto.randomBytes(8).toString("hex");
+        this.baseBoundary = options.baseBoundary || crypto2.randomBytes(8).toString("hex");
         this.boundaryPrefix = options.boundaryPrefix || "--_NmP";
         this.disableFileAccess = !!options.disableFileAccess;
         this.disableUrlAccess = !!options.disableUrlAccess;
@@ -93893,8 +93893,8 @@ var require_mime_node2 = __commonJS({
       _generateMessageId() {
         return "<" + [2, 2, 2, 6].reduce(
           // crux to generate UUID-like random strings
-          (prev, len) => prev + "-" + crypto.randomBytes(len).toString("hex"),
-          crypto.randomBytes(4).toString("hex")
+          (prev, len) => prev + "-" + crypto2.randomBytes(len).toString("hex"),
+          crypto2.randomBytes(4).toString("hex")
         ) + "@" + // try to use the domain of the FROM address or fallback to server hostname
         (this.getEnvelope().from || this.hostname || "localhost").split("@").pop() + ">";
       }
@@ -94524,14 +94524,14 @@ var require_relaxed_body = __commonJS({
   "node_modules/nodemailer/lib/dkim/relaxed-body.js"(exports2, module2) {
     "use strict";
     var { Transform } = require("stream");
-    var crypto = require("crypto");
+    var crypto2 = require("crypto");
     var RelaxedBody = class extends Transform {
       constructor(options) {
         super();
         options = options || {};
         this.chunkBuffer = [];
         this.chunkBufferLen = 0;
-        this.bodyHash = crypto.createHash(options.hashAlgo || "sha256");
+        this.bodyHash = crypto2.createHash(options.hashAlgo || "sha256");
         this.remainder = "";
         this.byteLength = 0;
         this.debug = options.debug;
@@ -94634,7 +94634,7 @@ var require_sign2 = __commonJS({
     "use strict";
     var punycode = require_punycode3();
     var mimeFuncs = require_mime_funcs();
-    var crypto = require("crypto");
+    var crypto2 = require("crypto");
     module2.exports = (headers, hashAlgo, bodyHash, options) => {
       options = options || {};
       const defaultFieldNames = "From:Sender:Reply-To:Subject:Date:Message-ID:To:Cc:MIME-Version:Content-Type:Content-Transfer-Encoding:Content-ID:Content-Description:Resent-Date:Resent-From:Resent-Sender:Resent-To:Resent-Cc:Resent-Message-ID:In-Reply-To:References:List-Id:List-Help:List-Unsubscribe:List-Subscribe:List-Post:List-Owner:List-Archive";
@@ -94642,7 +94642,7 @@ var require_sign2 = __commonJS({
       const canonicalizedHeaderData = relaxedHeaders(headers, fieldNames, options.skipFields);
       const dkimHeader = generateDKIMHeader(options.domainName, options.keySelector, canonicalizedHeaderData.fieldNames, hashAlgo, bodyHash);
       canonicalizedHeaderData.headers += "dkim-signature:" + relaxedHeaderLine(dkimHeader);
-      const signer = crypto.createSign(("rsa-" + hashAlgo).toUpperCase());
+      const signer = crypto2.createSign(("rsa-" + hashAlgo).toUpperCase());
       signer.update(canonicalizedHeaderData.headers);
       let signature;
       try {
@@ -94711,7 +94711,7 @@ var require_dkim = __commonJS({
     var { PassThrough } = require("stream");
     var fs2 = require("fs");
     var path3 = require("path");
-    var crypto = require("crypto");
+    var crypto2 = require("crypto");
     var DKIM_ALGO = "sha256";
     var MAX_MESSAGE_SIZE = 2 * 1024 * 1024;
     var DKIMSigner = class {
@@ -94724,7 +94724,7 @@ var require_dkim = __commonJS({
         this.chunks = [];
         this.chunklen = 0;
         this.readPos = 0;
-        this.cachePath = this.cacheDir ? path3.join(this.cacheDir, "message." + Date.now() + "-" + crypto.randomBytes(14).toString("hex")) : false;
+        this.cachePath = this.cacheDir ? path3.join(this.cacheDir, "message." + Date.now() + "-" + crypto2.randomBytes(14).toString("hex")) : false;
         this.cache = false;
         this.headers = false;
         this.bodyHash = false;
@@ -95293,7 +95293,7 @@ var require_mailer = __commonJS({
     var MailMessage = require_mail_message();
     var net = require("net");
     var dns = require("dns");
-    var crypto = require("crypto");
+    var crypto2 = require("crypto");
     var Mail = class extends EventEmitter {
       constructor(transporter, options, defaults) {
         super();
@@ -95635,7 +95635,7 @@ var require_mailer = __commonJS({
             html = (html || "").toString().replace(
               /(<img\b[^<>]{0,1024} src\s{0,20}=[\s"']{0,20})(data:([^;]+);[^"'>\s]+)/gi,
               (match, prefix, dataUri, mimeType) => {
-                const cid = crypto.randomBytes(10).toString("hex") + "@localhost";
+                const cid = crypto2.randomBytes(10).toString("hex") + "@localhost";
                 if (!mail.data.attachments) {
                   mail.data.attachments = [];
                 }
@@ -95762,7 +95762,7 @@ var require_smtp_connection = __commonJS({
     var net = require("net");
     var tls = require("tls");
     var os = require("os");
-    var crypto = require("crypto");
+    var crypto2 = require("crypto");
     var DataStream = require_data_stream();
     var { PassThrough } = require("stream");
     var shared = require_shared();
@@ -95782,7 +95782,7 @@ var require_smtp_connection = __commonJS({
     var SMTPConnection = class extends EventEmitter {
       constructor(options) {
         super(options);
-        this.id = crypto.randomBytes(8).toString("base64").replace(/\W/g, "");
+        this.id = crypto2.randomBytes(8).toString("base64").replace(/\W/g, "");
         this.stage = "init";
         this.options = options || {};
         this.secureConnection = !!this.options.secure;
@@ -96967,7 +96967,7 @@ var require_smtp_connection = __commonJS({
           );
         }
         const base64decoded = Buffer.from(challengeMatch[1], "base64").toString("ascii");
-        const hmacMD5 = crypto.createHmac("md5", this._auth.credentials.pass);
+        const hmacMD5 = crypto2.createHmac("md5", this._auth.credentials.pass);
         hmacMD5.update(base64decoded);
         const prepended = this._auth.credentials.user + " " + hmacMD5.digest("hex");
         this._responseActions.push((str2) => {
@@ -97260,7 +97260,7 @@ var require_xoauth2 = __commonJS({
     "use strict";
     var { Stream } = require("stream");
     var nmfetch = require_fetch2();
-    var crypto = require("crypto");
+    var crypto2 = require("crypto");
     var shared = require_shared();
     var errors = require_errors2();
     var XOAuth2 = class extends Stream {
@@ -97606,7 +97606,7 @@ var require_xoauth2 = __commonJS({
        */
       jwtSignRS256(payload) {
         payload = ['{"alg":"RS256","typ":"JWT"}', JSON.stringify(payload)].map((val) => this.toBase64URL(val)).join(".");
-        const signature = crypto.createSign("RSA-SHA256").update(payload).sign(this.options.privateKey);
+        const signature = crypto2.createSign("RSA-SHA256").update(payload).sign(this.options.privateKey);
         return payload + "." + this.toBase64URL(signature);
       }
     };
@@ -100782,6 +100782,51 @@ function slaAlertText(drafts, emails, sogliaOre) {
   return parts.join("\n");
 }
 
+// server/aging_logic.ts
+function parseTs(s) {
+  if (!s) return NaN;
+  const iso = s.includes("T") ? s : s.replace(" ", "T") + (s.length <= 19 ? "Z" : "");
+  const t = Date.parse(iso);
+  return isNaN(t) ? Date.parse(s) : t;
+}
+function ageHours(created_at, nowMs) {
+  const t = parseTs(created_at);
+  return isNaN(t) ? 0 : (nowMs - t) / 36e5;
+}
+function selectAgingDrafts(drafts, nowMs, opts = { urgentHours: 24, normalHours: 48 }) {
+  const urgent = [];
+  const normal = [];
+  for (const d of drafts) {
+    const h = ageHours(d.created_at, nowMs);
+    const nh = d.needs_human === 1 || d.needs_human === true;
+    const item = { id: d.id, who: d.contact_name || d.phone, ageH: Math.round(h), needsHuman: !!nh };
+    if (nh && h >= opts.urgentHours) urgent.push(item);
+    else if (!nh && h >= opts.normalHours) normal.push(item);
+  }
+  urgent.sort((a, b) => b.ageH - a.ageH);
+  normal.sort((a, b) => b.ageH - a.ageH);
+  return { urgent, normal, count: urgent.length + normal.length };
+}
+function agingDigestText(sel, overdueAppts, opts) {
+  const L = ["\u23F3 *Bozze in attesa da tempo* \u2014 da revisionare nel Cruscotto (Bozze Bot)."];
+  if (sel.urgent.length) {
+    L.push(`
+\u{1F534} *${sel.urgent.length} URGENZE* ferme da oltre ${opts.urgentHours}h:`);
+    for (const u of sel.urgent.slice(0, 10)) L.push(`- #${u.id} ${u.who} (~${u.ageH}h)`);
+  }
+  if (sel.normal.length) {
+    L.push(`
+\u{1F7E1} *${sel.normal.length} bozze* ferme da oltre ${opts.normalHours}h:`);
+    for (const n of sel.normal.slice(0, 10)) L.push(`- #${n.id} ${n.who} (~${n.ageH}h)`);
+  }
+  if (overdueAppts.length) {
+    L.push(`
+\u{1F4C5} *${overdueAppts.length} appuntament${overdueAppts.length === 1 ? "o" : "i"} [DA CONFERMARE]* gi\xE0 passat${overdueAppts.length === 1 ? "o" : "i"} o in giornata:`);
+    for (const a of overdueAppts.slice(0, 10)) L.push(`- ${a.who} \u2014 ${a.date} ${a.start}`);
+  }
+  return L.join("\n");
+}
+
 // server/reminders.ts
 function getSetting2(key, def) {
   try {
@@ -100952,6 +100997,58 @@ async function runSlaCheck(force = false) {
   console.log(`[Reminders] Alert SLA: ${drafts.length} bozze + ${emails.length} email in attesa da >${soglia}h.`);
   return { alerted: drafts.length + emails.length };
 }
+function draftAgingEnabled() {
+  return getSetting2("bot_draft_aging", "1") === "1";
+}
+function agingOpts() {
+  return {
+    urgentHours: parseInt(getSetting2("aging_urgent_hours", "24"), 10) || 24,
+    normalHours: parseInt(getSetting2("aging_normal_hours", "48"), 10) || 48
+  };
+}
+function overdueProposedAppointments(todayISO) {
+  try {
+    return db_default.prepare(`
+      SELECT phone, contact_name, date, start FROM bot_appointments
+      WHERE status = 'da_confermare' AND date <= ? ORDER BY date ASC, start ASC
+    `).all(todayISO).map((a) => ({ who: a.contact_name || a.phone, date: a.date, start: a.start }));
+  } catch {
+    return [];
+  }
+}
+async function runDraftAging(force = false) {
+  if (!draftAgingEnabled()) return { alerted: 0 };
+  const { iso, hour } = romeNow();
+  if (!force) {
+    if (hour < 8 || hour > 21) return { alerted: 0 };
+    if (getSetting2(`draft_aging_done_${iso}`, "") === "1") return { alerted: 0 };
+  }
+  const opts = agingOpts();
+  const drafts = db_default.prepare(`SELECT id, phone, contact_name, needs_human, created_at FROM bot_drafts WHERE status = 'pending'`).all();
+  const sel = selectAgingDrafts(drafts, Date.now(), opts);
+  const overdue = overdueProposedAppointments(iso);
+  if (!sel.count && !overdue.length) {
+    if (!force) setSetting2(`draft_aging_done_${iso}`, "1");
+    return { alerted: 0 };
+  }
+  const text = agingDigestText(sel, overdue, opts);
+  try {
+    await sendTextMessage(getControlNumber(), text);
+  } catch (e) {
+    console.error("[Reminders] alert aging fallito:", e.message);
+    return { alerted: 0 };
+  }
+  if (!force) setSetting2(`draft_aging_done_${iso}`, "1");
+  console.log(`[Reminders] Aging bozze: ${sel.urgent.length} urgenti + ${sel.normal.length} normali + ${overdue.length} appuntamenti da confermare scaduti.`);
+  return { alerted: sel.count + overdue.length };
+}
+function getAgingView() {
+  const opts = agingOpts();
+  const { iso } = romeNow();
+  const drafts = db_default.prepare(`SELECT id, phone, contact_name, needs_human, created_at FROM bot_drafts WHERE status = 'pending'`).all();
+  const sel = selectAgingDrafts(drafts, Date.now(), opts);
+  return { opts, ...sel, overdueAppointments: overdueProposedAppointments(iso), totalPending: drafts.length };
+}
 async function remindersTick() {
   try {
     await runReminders();
@@ -100967,6 +101064,11 @@ async function remindersTick() {
     await runSlaCheck();
   } catch (e) {
     console.error("[Reminders] SLA:", e.message);
+  }
+  try {
+    await runDraftAging();
+  } catch (e) {
+    console.error("[Reminders] aging bozze:", e.message);
   }
 }
 function getRemindersStatus() {
@@ -101220,6 +101322,80 @@ function decideWorkAutoSend(i) {
   return "draft";
 }
 
+// server/sentlog.ts
+init_db();
+
+// server/sentlog_logic.ts
+var import_node_crypto = __toESM(require("node:crypto"), 1);
+function hashText(text) {
+  return import_node_crypto.default.createHash("sha256").update(String(text ?? "")).digest("hex").slice(0, 16);
+}
+function buildSentEntry(e, nowISO) {
+  const text = String(e.text ?? "");
+  return {
+    phone: String(e.phone ?? ""),
+    contact_name: e.contactName ?? null,
+    kind: e.kind,
+    draft_id: e.draftId ?? null,
+    text_hash: hashText(text),
+    text_preview: text.replace(/\s+/g, " ").trim().slice(0, 140),
+    created_at: nowISO
+  };
+}
+
+// server/sentlog.ts
+db_default.exec(`
+  CREATE TABLE IF NOT EXISTS bot_sent_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    phone TEXT,
+    contact_name TEXT,
+    kind TEXT,                 -- 'appointment' | 'courtesy'
+    draft_id INTEGER,
+    text_hash TEXT,
+    text_preview TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_bot_sent_log_created ON bot_sent_log(created_at);
+`);
+function recordBotSend(e) {
+  try {
+    const r = buildSentEntry(e, (/* @__PURE__ */ new Date()).toISOString());
+    db_default.prepare(`
+      INSERT INTO bot_sent_log (phone, contact_name, kind, draft_id, text_hash, text_preview, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(r.phone, r.contact_name, r.kind, r.draft_id, r.text_hash, r.text_preview, r.created_at);
+  } catch (err) {
+    console.error("[SentLog] insert fallito:", err?.message);
+  }
+}
+function getSentLog(sinceISO, limit = 200) {
+  const since = sinceISO || new Date(Date.now() - 7 * 864e5).toISOString();
+  const lim = Math.min(Math.max(Number(limit) || 200, 1), 1e3);
+  try {
+    return db_default.prepare(`
+      SELECT id, phone, contact_name AS contactName, kind, draft_id AS draftId,
+             text_hash AS textHash, text_preview AS textPreview, created_at AS createdAt
+      FROM bot_sent_log WHERE created_at >= ? ORDER BY created_at DESC LIMIT ?
+    `).all(since, lim);
+  } catch {
+    return [];
+  }
+}
+function getSentLogSummary(sinceISO) {
+  const since = sinceISO || new Date(Date.now() - 7 * 864e5).toISOString();
+  const byKind = {};
+  let total = 0;
+  try {
+    const rows = db_default.prepare(`SELECT kind, COUNT(*) AS c FROM bot_sent_log WHERE created_at >= ? GROUP BY kind`).all(since);
+    for (const r of rows) {
+      byKind[r.kind || "unknown"] = r.c;
+      total += r.c;
+    }
+  } catch {
+  }
+  return { since, total, byKind };
+}
+
 // server/routes.ts
 var router = (0, import_express.Router)();
 try {
@@ -101237,7 +101413,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.10.1", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.10.2", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/selftest", (_req, res) => {
   res.json(getLastSelfCheck() || { note: "mai eseguito" });
@@ -102098,7 +102274,10 @@ Da confermare.`,
                 if (sanC.changed) outcome.result.draftText = sanC.clean;
                 const id = saveDraft({ phone, contactName: cName, incoming: content, result: outcome.result });
                 const r = await approveDraftCore(id, { force: true });
-                if (r.ok) markCourtesySent(phone);
+                if (r.ok) {
+                  markCourtesySent(phone);
+                  recordBotSend({ phone, contactName: cName, kind: "courtesy", draftId: id, text: outcome.result.draftText });
+                }
                 broadcastEvent("bot_draft", { id, phone, contactName: cName, needsHuman: false, autoSent: r.ok, personal: true });
                 console.log(`[Chatbot] Cortesia (non-lavoro) ${r.ok ? "inviata" : "NON inviata"} a ${cName} (${phone})`);
               }
@@ -102131,6 +102310,7 @@ Da confermare.`,
             if (decision === "appointment-auto") {
               const r = await approveDraftCore(id, { force: false });
               if (r.ok) {
+                recordBotSend({ phone, contactName: cName, kind: "appointment", draftId: id, text: res2.draftText });
                 broadcastEvent("bot_draft", { id, phone, contactName: cName, needsHuman: false, autoSent: true });
                 console.log(`[Chatbot] Appuntamento autonomo a ${cName} (${phone})${r.hadEvent ? " + appuntamento DA CONFERMARE" : ""}`);
               } else if (r.conflict) {
@@ -102543,7 +102723,24 @@ router.post("/bot/jobs/:job/run", async (req, res) => {
     if (job === "reminders") return res.json(await runReminders(true));
     if (job === "waitlist") return res.json(await runWaitlistRecall(true));
     if (job === "sla") return res.json(await runSlaCheck(true));
-    res.status(400).json({ error: `Job sconosciuto: ${job} (validi: reminders, waitlist, sla)` });
+    if (job === "aging") return res.json(await runDraftAging(true));
+    res.status(400).json({ error: `Job sconosciuto: ${job} (validi: reminders, waitlist, sla, aging)` });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.get("/bot/drafts/aging", (_req, res) => {
+  try {
+    res.json(getAgingView());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.get("/bot/sent", (req, res) => {
+  try {
+    const since = req.query.since || void 0;
+    const limit = parseInt(req.query.limit || "200", 10);
+    res.json({ summary: getSentLogSummary(since), items: getSentLog(since, limit) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

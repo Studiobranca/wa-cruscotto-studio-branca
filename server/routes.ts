@@ -49,8 +49,9 @@ import {
   closeWaitlistEntry,
 } from './chatbot.js';
 import { runDailyDigest, getFlowHealth, repairWebhook, runSelfCheck, getLastSelfCheck } from './maintenance.js';
-import { runReminders, runWaitlistRecall, runSlaCheck, getRemindersStatus } from './reminders.js';
+import { runReminders, runWaitlistRecall, runSlaCheck, getRemindersStatus, runDraftAging, getAgingView } from './reminders.js';
 import { decideWorkAutoSend } from './autosend.js';
+import { recordBotSend, getSentLog, getSentLogSummary } from './sentlog.js';
 
 const router = Router();
 
@@ -74,7 +75,7 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.10.1', built: new Date().toISOString() });
+  res.json({ version: '2.10.2', built: new Date().toISOString() });
 });
 
 // ─── Autocheck (self-test + autocorrezione) ──────────────────────────────────
@@ -1019,7 +1020,7 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
                 if (sanC.changed) outcome.result.draftText = sanC.clean;
                 const id = saveDraft({ phone, contactName: cName, incoming: content, result: outcome.result });
                 const r = await approveDraftCore(id, { force: true });
-                if (r.ok) markCourtesySent(phone);
+                if (r.ok) { markCourtesySent(phone); recordBotSend({ phone, contactName: cName, kind: 'courtesy', draftId: id, text: outcome.result.draftText }); }
                 broadcastEvent('bot_draft', { id, phone, contactName: cName, needsHuman: false, autoSent: r.ok, personal: true });
                 console.log(`[Chatbot] Cortesia (non-lavoro) ${r.ok ? 'inviata' : 'NON inviata'} a ${cName} (${phone})`);
               }
@@ -1068,6 +1069,7 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
               // approveDraftCore → niente sovrapposizioni sugli slot).
               const r = await approveDraftCore(id, { force: false });
               if (r.ok) {
+                recordBotSend({ phone, contactName: cName, kind: 'appointment', draftId: id, text: res.draftText });
                 broadcastEvent('bot_draft', { id, phone, contactName: cName, needsHuman: false, autoSent: true });
                 console.log(`[Chatbot] Appuntamento autonomo a ${cName} (${phone})${r.hadEvent ? ' + appuntamento DA CONFERMARE' : ''}`);
               } else if (r.conflict) {
@@ -1569,7 +1571,26 @@ router.post('/bot/jobs/:job/run', async (req: Request, res: Response) => {
     if (job === 'reminders') return res.json(await runReminders(true));
     if (job === 'waitlist') return res.json(await runWaitlistRecall(true));
     if (job === 'sla') return res.json(await runSlaCheck(true));
-    res.status(400).json({ error: `Job sconosciuto: ${job} (validi: reminders, waitlist, sla)` });
+    if (job === 'aging') return res.json(await runDraftAging(true));
+    res.status(400).json({ error: `Job sconosciuto: ${job} (validi: reminders, waitlist, sla, aging)` });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── AGING BOZZE: vista prioritaria (sola lettura, nessun invio) ─────────────
+router.get('/bot/drafts/aging', (_req: Request, res: Response) => {
+  try { res.json(getAgingView()); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── AUDIT-LOG INVII AUTONOMI (sola lettura) ─────────────────────────────────
+// Elenca ogni messaggio inviato dal bot in AUTONOMIA (cortesia/appuntamento). Il
+// MERITO non viene mai auto-inviato → non compare qui: è la prova osservabile
+// dell'invariante. `?since=<ISO>&limit=N` · summary con conteggio per tipo.
+router.get('/bot/sent', (req: Request, res: Response) => {
+  try {
+    const since = (req.query.since as string) || undefined;
+    const limit = parseInt((req.query.limit as string) || '200', 10);
+    res.json({ summary: getSentLogSummary(since), items: getSentLog(since, limit) });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
