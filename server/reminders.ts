@@ -30,6 +30,8 @@ import { getControlNumber, getWaitlist, markWaitlistNotified, getAllAppointments
 import { isVipContact } from './contacts.js';
 import { selectExpiredProposals, selectPendingOutcome } from './agenda_logic.js';
 import { composeBriefing, type BriefingData } from './briefing_logic.js';
+import { getImminentDeadlines } from './deadlines.js';
+import { composeDeadlineDigest } from './deadlines_logic.js';
 import {
   channelOfKey, inReminderWindow, inRecallWindow, inSlaWindow,
   isTooFresh, sqliteToMs, reminderMessageIT, waitlistRecallMessageIT, slaAlertText,
@@ -328,10 +330,33 @@ export async function runAppointmentCleanup(force = false): Promise<{ expired: n
   return { expired: done };
 }
 
+// ═══ 7) SCADENZARIO ADEMPIMENTI — promemoria interni (rev. 11/07/2026) ════════
+// Digest 1×/giorno al numero di controllo con gli adempimenti (F24, dichiarazioni…)
+// imminenti o già scaduti ancora aperti. MAI ai clienti.
+export function deadlineRemindersEnabled(): boolean { return getSetting('bot_deadlines', '1') === '1'; }
+function deadlineWindowDays(): number { return parseInt(getSetting('deadline_days', '7'), 10) || 7; }
+export async function runDeadlineReminders(force = false): Promise<{ alerted: number }> {
+  if (!deadlineRemindersEnabled()) return { alerted: 0 };
+  const { iso, hour } = romeNow();
+  if (!force) {
+    if (hour < 8 || hour >= 20) return { alerted: 0 };
+    if (getSetting(`deadlines_done_${iso}`, '') === '1') return { alerted: 0 };
+  }
+  const list = getImminentDeadlines(iso, deadlineWindowDays());
+  const { text, empty } = composeDeadlineDigest(list);
+  if (empty) { if (!force) setSetting(`deadlines_done_${iso}`, '1'); return { alerted: 0 }; }
+  try { await sendTextMessage(getControlNumber(), text); }
+  catch (e: any) { console.error('[Reminders] scadenze fallito:', e.message); return { alerted: 0 }; }
+  if (!force) setSetting(`deadlines_done_${iso}`, '1');
+  console.log(`[Reminders] Scadenzario: ${list.length} adempiment${list.length === 1 ? 'o' : 'i'} imminent${list.length === 1 ? 'e' : 'i'}/scadut${list.length === 1 ? 'o' : 'i'}.`);
+  return { alerted: list.length };
+}
+
 /** Un giro di tutti i job: chiamato dal tick di maintenance (ogni 30 min). Ogni job è
  *  isolato in try/catch: un errore qui non deve MAI toccare digest/watchdog/bot. */
 export async function remindersTick(): Promise<void> {
   try { await runReminders(); } catch (e: any) { console.error('[Reminders] promemoria:', e.message); }
+  try { await runDeadlineReminders(); } catch (e: any) { console.error('[Reminders] scadenze:', e.message); }
   try { await runWaitlistRecall(); } catch (e: any) { console.error('[Reminders] lista d\'attesa:', e.message); }
   try { await runSlaCheck(); } catch (e: any) { console.error('[Reminders] SLA:', e.message); }
   try { await runDraftAging(); } catch (e: any) { console.error('[Reminders] aging bozze:', e.message); }

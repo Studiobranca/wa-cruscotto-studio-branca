@@ -49,7 +49,8 @@ import {
   closeWaitlistEntry,
 } from './chatbot.js';
 import { runDailyDigest, getFlowHealth, repairWebhook, runSelfCheck, getLastSelfCheck } from './maintenance.js';
-import { runReminders, runWaitlistRecall, runSlaCheck, getRemindersStatus, runDraftAging, getAgingView, runAppointmentCleanup, getBriefingData, runMorningBriefing } from './reminders.js';
+import { runReminders, runWaitlistRecall, runSlaCheck, getRemindersStatus, runDraftAging, getAgingView, runAppointmentCleanup, getBriefingData, runMorningBriefing, runDeadlineReminders } from './reminders.js';
+import { createDeadline, listDeadlines, completeDeadline, deleteDeadline, getImminentDeadlines } from './deadlines.js';
 import { composeBriefing } from './briefing_logic.js';
 import { summarizeConversation } from './summary.js';
 import { decideWorkAutoSend } from './autosend.js';
@@ -82,7 +83,7 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.11.1', built: new Date().toISOString() });
+  res.json({ version: '2.11.2', built: new Date().toISOString() });
 });
 
 // ─── Autocheck (self-test + autocorrezione) ──────────────────────────────────
@@ -1586,7 +1587,8 @@ router.post('/bot/jobs/:job/run', async (req: Request, res: Response) => {
     if (job === 'aging') return res.json(await runDraftAging(true));
     if (job === 'cleanup') return res.json(await runAppointmentCleanup(true));
     if (job === 'briefing') return res.json(await runMorningBriefing(true));
-    res.status(400).json({ error: `Job sconosciuto: ${job} (validi: reminders, waitlist, sla, aging, cleanup, briefing)` });
+    if (job === 'deadlines') return res.json(await runDeadlineReminders(true));
+    res.status(400).json({ error: `Job sconosciuto: ${job} (validi: reminders, waitlist, sla, aging, cleanup, briefing, deadlines)` });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1605,6 +1607,33 @@ router.get('/bot/briefing', (_req: Request, res: Response) => {
     const { text, empty } = composeBriefing(data);
     res.json({ preview: text, empty, data });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── SCADENZARIO ADEMPIMENTI (promemoria SOLO interni; nessun invio ai clienti) ──
+router.post('/bot/deadlines', (req: Request, res: Response) => {
+  try {
+    const { clientKey, contactName, tipo, description, dueDate } = req.body || {};
+    if (!dueDate || !/^\d{4}-\d{2}-\d{2}$/.test(String(dueDate))) return res.status(400).json({ error: 'dueDate (YYYY-MM-DD) richiesta' });
+    const id = createDeadline({ clientKey, contactName, tipo, description, dueDate: String(dueDate) });
+    res.json({ ok: true, id });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+router.get('/bot/deadlines', (req: Request, res: Response) => {
+  try {
+    if (req.query.imminent) {
+      const todayISO = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Rome' }).format(new Date());
+      return res.json(getImminentDeadlines(todayISO, parseInt(String(req.query.imminent), 10) || 7));
+    }
+    res.json(listDeadlines({ status: req.query.status ? String(req.query.status) : undefined, client: req.query.client ? String(req.query.client) : undefined }));
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+router.post('/bot/deadlines/:id/complete', (req: Request, res: Response) => {
+  try { res.json({ ok: completeDeadline(parseInt(String(req.params.id), 10)) }); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+router.delete('/bot/deadlines/:id', (req: Request, res: Response) => {
+  try { res.json({ ok: deleteDeadline(parseInt(String(req.params.id), 10)) }); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
 // ─── PRATICHE: checklist documenti (richiesta al cliente SEMPRE come BOZZA) ──

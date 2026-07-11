@@ -101060,6 +101060,76 @@ Apri il Cruscotto per gestire bozze, agenda e messaggi.`);
   return { text: L.join("\n"), empty };
 }
 
+// server/deadlines.ts
+init_db();
+
+// server/deadlines_logic.ts
+function selectImminentDeadlines(rows, todayISO, withinDays = 7) {
+  const limit = addDaysISO(todayISO, withinDays);
+  return rows.filter((r) => r.status === "aperto" && !!r.due_date && r.due_date <= limit).map((r) => ({ ...r, overdue: r.due_date < todayISO })).sort((a, b) => a.due_date.localeCompare(b.due_date));
+}
+function addDaysISO(iso, days) {
+  const [y, m, d] = iso.split("-").map((n) => parseInt(n, 10));
+  const t = Date.UTC(y, m - 1, d) + days * 864e5;
+  const dt = new Date(t);
+  return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, "0")}-${String(dt.getUTCDate()).padStart(2, "0")}`;
+}
+function composeDeadlineDigest(list) {
+  if (!list.length) return { text: "", empty: true };
+  const L = ["\u{1F4CC} *Scadenze adempimenti in arrivo* (o gi\xE0 scadute):"];
+  for (const d of list.slice(0, 20)) {
+    const tag = d.overdue ? " \u26A0\uFE0F SCADUTA" : "";
+    const who = d.who ? ` \u2014 ${d.who}` : "";
+    L.push(`- ${d.due_date} \xB7 *${d.tipo || "adempimento"}*${who}${d.description ? ` (${d.description})` : ""}${tag}`);
+  }
+  L.push("\nApri il Cruscotto per gestire lo scadenzario.");
+  return { text: L.join("\n"), empty: false };
+}
+
+// server/deadlines.ts
+db_default.exec(`
+  CREATE TABLE IF NOT EXISTS bot_deadlines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_key TEXT,                 -- telefono, email:<addr>, o nome cliente
+    contact_name TEXT,
+    tipo TEXT,                       -- es. F24, Dichiarazione redditi, IVA, ...
+    description TEXT,
+    due_date TEXT NOT NULL,          -- YYYY-MM-DD
+    status TEXT DEFAULT 'aperto',    -- aperto | completato
+    created_at TEXT DEFAULT (datetime('now')),
+    completed_at TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_bot_deadlines_due ON bot_deadlines(status, due_date);
+`);
+function createDeadline(e) {
+  const info = db_default.prepare(`INSERT INTO bot_deadlines (client_key, contact_name, tipo, description, due_date) VALUES (?, ?, ?, ?, ?)`).run(e.clientKey || null, e.contactName || null, e.tipo || null, e.description || null, e.dueDate);
+  return Number(info.lastInsertRowid);
+}
+function listDeadlines(opts = {}) {
+  let sql = `SELECT * FROM bot_deadlines WHERE 1=1`;
+  const a = [];
+  if (opts.status) {
+    sql += ` AND status = ?`;
+    a.push(opts.status);
+  }
+  if (opts.client) {
+    sql += ` AND client_key = ?`;
+    a.push(opts.client);
+  }
+  sql += ` ORDER BY due_date ASC`;
+  return db_default.prepare(sql).all(...a);
+}
+function completeDeadline(id) {
+  return db_default.prepare(`UPDATE bot_deadlines SET status = 'completato', completed_at = datetime('now') WHERE id = ? AND status != 'completato'`).run(id).changes > 0;
+}
+function deleteDeadline(id) {
+  return db_default.prepare(`DELETE FROM bot_deadlines WHERE id = ?`).run(id).changes > 0;
+}
+function getImminentDeadlines(todayISO, withinDays = 7) {
+  const rows = db_default.prepare(`SELECT id, tipo, description, contact_name, due_date, status FROM bot_deadlines WHERE status = 'aperto'`).all().map((r) => ({ id: r.id, tipo: r.tipo, description: r.description, who: r.contact_name, due_date: r.due_date, status: r.status }));
+  return selectImminentDeadlines(rows, todayISO, withinDays);
+}
+
 // server/reminders_logic.ts
 var SEGRETERIA = "0909797187";
 var FIRMA_WA = "Assistente Virtuale \u2014 Studio Tributario Branca";
@@ -101509,11 +101579,45 @@ async function runAppointmentCleanup(force = false) {
   }
   return { expired: done };
 }
+function deadlineRemindersEnabled() {
+  return getSetting2("bot_deadlines", "1") === "1";
+}
+function deadlineWindowDays() {
+  return parseInt(getSetting2("deadline_days", "7"), 10) || 7;
+}
+async function runDeadlineReminders(force = false) {
+  if (!deadlineRemindersEnabled()) return { alerted: 0 };
+  const { iso, hour } = romeNow();
+  if (!force) {
+    if (hour < 8 || hour >= 20) return { alerted: 0 };
+    if (getSetting2(`deadlines_done_${iso}`, "") === "1") return { alerted: 0 };
+  }
+  const list = getImminentDeadlines(iso, deadlineWindowDays());
+  const { text, empty } = composeDeadlineDigest(list);
+  if (empty) {
+    if (!force) setSetting2(`deadlines_done_${iso}`, "1");
+    return { alerted: 0 };
+  }
+  try {
+    await sendTextMessage(getControlNumber(), text);
+  } catch (e) {
+    console.error("[Reminders] scadenze fallito:", e.message);
+    return { alerted: 0 };
+  }
+  if (!force) setSetting2(`deadlines_done_${iso}`, "1");
+  console.log(`[Reminders] Scadenzario: ${list.length} adempiment${list.length === 1 ? "o" : "i"} imminent${list.length === 1 ? "e" : "i"}/scadut${list.length === 1 ? "o" : "i"}.`);
+  return { alerted: list.length };
+}
 async function remindersTick() {
   try {
     await runReminders();
   } catch (e) {
     console.error("[Reminders] promemoria:", e.message);
+  }
+  try {
+    await runDeadlineReminders();
+  } catch (e) {
+    console.error("[Reminders] scadenze:", e.message);
   }
   try {
     await runWaitlistRecall();
@@ -102019,7 +102123,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.11.1", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.11.2", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/selftest", (_req, res) => {
   res.json(getLastSelfCheck() || { note: "mai eseguito" });
@@ -103333,7 +103437,8 @@ router.post("/bot/jobs/:job/run", async (req, res) => {
     if (job === "aging") return res.json(await runDraftAging(true));
     if (job === "cleanup") return res.json(await runAppointmentCleanup(true));
     if (job === "briefing") return res.json(await runMorningBriefing(true));
-    res.status(400).json({ error: `Job sconosciuto: ${job} (validi: reminders, waitlist, sla, aging, cleanup, briefing)` });
+    if (job === "deadlines") return res.json(await runDeadlineReminders(true));
+    res.status(400).json({ error: `Job sconosciuto: ${job} (validi: reminders, waitlist, sla, aging, cleanup, briefing, deadlines)` });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -103350,6 +103455,41 @@ router.get("/bot/briefing", (_req, res) => {
     const data = getBriefingData();
     const { text, empty } = composeBriefing(data);
     res.json({ preview: text, empty, data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.post("/bot/deadlines", (req, res) => {
+  try {
+    const { clientKey, contactName, tipo, description, dueDate } = req.body || {};
+    if (!dueDate || !/^\d{4}-\d{2}-\d{2}$/.test(String(dueDate))) return res.status(400).json({ error: "dueDate (YYYY-MM-DD) richiesta" });
+    const id = createDeadline({ clientKey, contactName, tipo, description, dueDate: String(dueDate) });
+    res.json({ ok: true, id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.get("/bot/deadlines", (req, res) => {
+  try {
+    if (req.query.imminent) {
+      const todayISO = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Rome" }).format(/* @__PURE__ */ new Date());
+      return res.json(getImminentDeadlines(todayISO, parseInt(String(req.query.imminent), 10) || 7));
+    }
+    res.json(listDeadlines({ status: req.query.status ? String(req.query.status) : void 0, client: req.query.client ? String(req.query.client) : void 0 }));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.post("/bot/deadlines/:id/complete", (req, res) => {
+  try {
+    res.json({ ok: completeDeadline(parseInt(String(req.params.id), 10)) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.delete("/bot/deadlines/:id", (req, res) => {
+  try {
+    res.json({ ok: deleteDeadline(parseInt(String(req.params.id), 10)) });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
