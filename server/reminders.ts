@@ -28,7 +28,8 @@ import { getAvailability, formatAvailabilityIT } from './appointments.js';
 import { sendTextMessage } from './zapi.js';
 import { getControlNumber, getWaitlist, markWaitlistNotified, getAllAppointments, expireAppointmentRow } from './chatbot.js';
 import { isVipContact } from './contacts.js';
-import { selectExpiredProposals } from './agenda_logic.js';
+import { selectExpiredProposals, selectPendingOutcome } from './agenda_logic.js';
+import { composeBriefing, type BriefingData } from './briefing_logic.js';
 import {
   channelOfKey, inReminderWindow, inRecallWindow, inSlaWindow,
   isTooFresh, sqliteToMs, reminderMessageIT, waitlistRecallMessageIT, slaAlertText,
@@ -234,6 +235,70 @@ export function getAgingView(): any {
   return { opts, ...sel, overdueAppointments: overdueProposedAppointments(iso), totalPending: drafts.length };
 }
 
+// ═══ 6) BRIEFING DEL MATTINO (digest a Mariano) — rev. 11/07/2026 ════════════
+// UN riepilogo giornaliero al numero di controllo (mai ai clienti): bozze urgenti,
+// appuntamenti di oggi, appuntamenti passati da chiudere, vocali recenti da leggere.
+export function briefingEnabled(): boolean { return getSetting('bot_briefing', '1') === '1'; }
+
+const DOW_ITB = ['domenica', 'lunedì', 'martedì', 'mercoledì', 'giovedì', 'venerdì', 'sabato'];
+const MON_ITB = ['gennaio', 'febbraio', 'marzo', 'aprile', 'maggio', 'giugno', 'luglio', 'agosto', 'settembre', 'ottobre', 'novembre', 'dicembre'];
+function dateITfromISO(iso: string): string {
+  const [y, m, d] = iso.split('-').map((n) => parseInt(n, 10));
+  const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+  return `${DOW_ITB[dow]} ${d} ${MON_ITB[m - 1]}`;
+}
+
+/** Raccoglie i dati del briefing (sola lettura). Riusa aging + agenda + trascrizioni. */
+export function getBriefingData(): BriefingData {
+  const { iso } = romeNow();
+  const appts = getAllAppointments();
+  const sel = selectAgingDrafts(
+    db.prepare(`SELECT id, phone, contact_name, needs_human, created_at FROM bot_drafts WHERE status = 'pending'`).all() as any[],
+    Date.now(), agingOpts(),
+  );
+  const today = appts
+    .filter((a: any) => a.date === iso && ['da_confermare', 'confermato'].includes(a.status))
+    .sort((a: any, b: any) => String(a.start).localeCompare(String(b.start)))
+    .map((a: any) => ({ start: a.start, who: a.contact_name || a.phone, reason: a.reason, status: a.status }));
+  const pendingOutcome = selectPendingOutcome(
+    appts.map((a: any) => ({ id: a.id, date: a.date, status: a.status, outcome: a.outcome })), iso,
+  );
+  const pendWho = pendingOutcome.map((p) => {
+    const full = appts.find((a: any) => a.id === p.id);
+    return { who: full?.contact_name || full?.phone || '—', date: p.date };
+  });
+  // Vocali trascritti nelle ultime 24h ancora da leggere (received, non letti).
+  let voices = 0;
+  try {
+    voices = (db.prepare(`SELECT COUNT(*) c FROM live_messages
+      WHERE is_audio = 1 AND direction = 'received' AND COALESCE(is_read,0) = 0
+        AND transcription_status = 'ok' AND created_at >= ?`).get(new Date(Date.now() - 86400000).toISOString()) as any)?.c || 0;
+  } catch { /* colonna assente su DB vecchi */ }
+  return {
+    dateIT: dateITfromISO(iso),
+    urgentDrafts: sel.urgent.map((u) => ({ id: u.id, who: u.who, ageH: u.ageH })),
+    todayAppointments: today,
+    pendingOutcome: pendWho,
+    transcribedVoices: voices,
+  };
+}
+
+export async function runMorningBriefing(force = false): Promise<{ sent: boolean; empty: boolean }> {
+  if (!briefingEnabled()) return { sent: false, empty: true };
+  const { iso, hour } = romeNow();
+  if (!force) {
+    if (hour < 7 || hour >= 9) return { sent: false, empty: false };            // solo finestra 7–9
+    if (getSetting(`briefing_done_${iso}`, '') === '1') return { sent: false, empty: false }; // 1×/giorno
+  }
+  const { text, empty } = composeBriefing(getBriefingData());
+  if (!force && empty) { setSetting(`briefing_done_${iso}`, '1'); return { sent: false, empty: true }; }
+  try { await sendTextMessage(getControlNumber(), text); }
+  catch (e: any) { console.error('[Reminders] briefing fallito:', e.message); return { sent: false, empty }; }
+  if (!force) setSetting(`briefing_done_${iso}`, '1');
+  console.log('[Reminders] Briefing del mattino inviato al numero di controllo.');
+  return { sent: true, empty };
+}
+
 // ═══ 5) PULIZIA PROPOSTE APPUNTAMENTO SCADUTE (rev. 11/07/2026) ══════════════
 // Le proposte [DA CONFERMARE] con data ORMAI passata e mai confermate restavano
 // attive, occupando l'agenda (evento freeBusy "fantasma"). Questo job idempotente
@@ -271,6 +336,7 @@ export async function remindersTick(): Promise<void> {
   try { await runSlaCheck(); } catch (e: any) { console.error('[Reminders] SLA:', e.message); }
   try { await runDraftAging(); } catch (e: any) { console.error('[Reminders] aging bozze:', e.message); }
   try { await runAppointmentCleanup(); } catch (e: any) { console.error('[Reminders] pulizia agenda:', e.message); }
+  try { await runMorningBriefing(); } catch (e: any) { console.error('[Reminders] briefing:', e.message); }
 }
 
 /** Stato sintetico per Cruscotto/diagnostica. */

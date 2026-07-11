@@ -12,6 +12,7 @@ export interface Conversation {
   isArchived: number;
   priority: 'none' | 'normal' | 'high' | 'vip';
   priorityLabel: string | null;
+  isGroup?: number;
   createdAt: string;
 }
 

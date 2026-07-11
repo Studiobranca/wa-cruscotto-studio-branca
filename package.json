@@ -7,7 +7,10 @@
     "build:client": "vite build",
     "build:server": "esbuild server/index.ts --bundle --platform=node --format=cjs --outfile=dist/index.cjs --external:better-sqlite3 --external:fsevents",
     "start": "NODE_ENV=production node dist/index.cjs",
-    "build:local": "npm run build:client && npm run build:server"
+    "build:local": "npm run build:client && npm run build:server",
+    "typecheck": "tsc --noEmit",
+    "test:all": "for f in scripts/test_*.ts; do echo \"== $f ==\"; npx tsx \"$f\" || exit 1; done",
+    "predeploy": "npm run test:all && npm run typecheck && npm run build:local"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.0.0",

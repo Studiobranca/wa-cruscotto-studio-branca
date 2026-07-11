@@ -5,7 +5,7 @@ import RequestsPanel from '../components/RequestsPanel';
 import PriorityBadge from '../components/PriorityBadge';
 import Loader from '../components/Loader';
 import type { Conversation } from '../lib/types';
-import { Search, Send, ArrowLeft, MoreVertical, Star, AlertTriangle, User, Volume2, Bot, X, Trash2 } from 'lucide-react';
+import { Search, Send, ArrowLeft, MoreVertical, Star, AlertTriangle, User, Volume2, Bot, X, Trash2, FileText } from 'lucide-react';
 
 export default function Inbox() {
   const [selectedPhone, setSelectedPhone] = useState<string | null>(null);
@@ -16,6 +16,9 @@ export default function Inbox() {
   const [chatTab, setChatTab] = useState<'messages' | 'requests'>('messages');
   const [autoReplyText, setAutoReplyText] = useState('');
   const [isMobile, setIsMobile] = useState(window.innerWidth <= 600);
+  const [summary, setSummary] = useState<{ summary: string; cached: boolean; at?: string } | null>(null);
+  const [summaryLoading, setSummaryLoading] = useState(false);
+  const [showSummary, setShowSummary] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const { data: conversations = [], isLoading } = useConversations(false, search);
@@ -63,9 +66,25 @@ export default function Inbox() {
     const conv = conversations.find(c => c.phone === selectedPhone);
     setAutoReplyText(conv?.autoReplyMessage || '');
     setShowAutoReplyPanel(false);
+    setSummary(null); setShowSummary(false);
   }, [selectedPhone]);
 
   const selectedConv = conversations.find(c => c.phone === selectedPhone);
+
+  // Riepilogo AI on-demand (sola lettura interna; nessun invio ai clienti).
+  const loadSummary = async () => {
+    if (!selectedPhone) return;
+    setShowSummary(true);
+    if (summary) return;
+    setSummaryLoading(true);
+    try {
+      const r = await fetch(`/api/bot/conversation/${selectedPhone}/summary`);
+      const d = await r.json();
+      setSummary({ summary: d.summary || '(nessun riepilogo)', cached: !!d.cached, at: d.at });
+    } catch {
+      setSummary({ summary: 'Riepilogo non disponibile in questo momento.', cached: false });
+    } finally { setSummaryLoading(false); }
+  };
 
   const handleSend = async () => {
     const text = messageInput.trim();
@@ -227,6 +246,15 @@ export default function Inbox() {
                   <div className="chat-contact-phone">{selectedPhone}</div>
                 </div>
                 <div className="chat-header-actions">
+                  {/* Pulsante Riepilogo AI */}
+                  <button
+                    className="btn-icon"
+                    onClick={() => { showSummary ? setShowSummary(false) : loadSummary(); }}
+                    title="Riepilogo conversazione (AI)"
+                    style={showSummary ? { color: '#25D366' } : undefined}
+                  >
+                    <FileText size={18} />
+                  </button>
                   {/* Pulsante Auto-reply */}
                   <button
                     className="btn-icon"
@@ -265,6 +293,21 @@ export default function Inbox() {
                   )}
                 </div>
               </div>
+
+              {/* Pannello Riepilogo AI (sola lettura interna) */}
+              {showSummary && (
+                <div style={{ background: 'rgba(37,211,102,0.08)', borderBottom: '1px solid rgba(0,0,0,0.08)', padding: '10px 14px', fontSize: 13, lineHeight: 1.45 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 600, marginBottom: 4 }}>
+                    <FileText size={14} /> Riepilogo{summary?.cached ? ' (in cache)' : ''}
+                    <button className="btn-icon" style={{ marginLeft: 'auto' }} title="Chiudi" onClick={() => setShowSummary(false)}><X size={14} /></button>
+                  </div>
+                  {summaryLoading ? (
+                    <span style={{ opacity: 0.7 }}>Generazione riepilogo…</span>
+                  ) : (
+                    <span style={{ whiteSpace: 'pre-wrap' }}>{summary?.summary}</span>
+                  )}
+                </div>
+              )}
 
               {/* Tab switcher: Messaggi / Richieste */}
               <div className="chat-tabs">

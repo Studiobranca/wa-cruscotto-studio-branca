@@ -101023,6 +101023,43 @@ init_chatbot();
 init_contacts();
 init_agenda_logic();
 
+// server/briefing_logic.ts
+function composeBriefing(d) {
+  const L = [`\u2600\uFE0F *Buongiorno Dott. Branca* \u2014 riepilogo di ${d.dateIT}`];
+  const nUrg = d.urgentDrafts.length;
+  const nApp = d.todayAppointments.length;
+  const nOut = d.pendingOutcome.length;
+  const empty = nUrg === 0 && nApp === 0 && nOut === 0 && d.transcribedVoices === 0;
+  if (nApp) {
+    L.push(`
+\u{1F4C5} *Appuntamenti di oggi* (${nApp}):`);
+    for (const a of d.todayAppointments.slice(0, 12)) {
+      const tag = a.status === "da_confermare" ? " [da confermare]" : "";
+      L.push(`- ${a.start} \u2014 ${a.who}${a.reason ? ` (${a.reason})` : ""}${tag}`);
+    }
+  } else {
+    L.push(`
+\u{1F4C5} Nessun appuntamento in agenda per oggi.`);
+  }
+  if (nUrg) {
+    L.push(`
+\u{1F534} *Bozze URGENTI da approvare* (${nUrg}):`);
+    for (const u of d.urgentDrafts.slice(0, 10)) L.push(`- #${u.id} ${u.who} (in attesa ~${u.ageH}h)`);
+  }
+  if (nOut) {
+    L.push(`
+\u{1F4CB} *Appuntamenti passati da chiudere* (esito, ${nOut}):`);
+    for (const p of d.pendingOutcome.slice(0, 10)) L.push(`- ${p.who} \u2014 ${p.date}`);
+  }
+  if (d.transcribedVoices) {
+    L.push(`
+\u{1F3A4} *${d.transcribedVoices} vocal${d.transcribedVoices === 1 ? "e" : "i"}* trascritt${d.transcribedVoices === 1 ? "o" : "i"} da leggere nel Cruscotto.`);
+  }
+  L.push(`
+Apri il Cruscotto per gestire bozze, agenda e messaggi.`);
+  return { text: L.join("\n"), empty };
+}
+
 // server/reminders_logic.ts
 var SEGRETERIA = "0909797187";
 var FIRMA_WA = "Assistente Virtuale \u2014 Studio Tributario Branca";
@@ -101379,6 +101416,70 @@ function getAgingView() {
   const sel = selectAgingDrafts(drafts, Date.now(), opts);
   return { opts, ...sel, overdueAppointments: overdueProposedAppointments(iso), totalPending: drafts.length };
 }
+function briefingEnabled() {
+  return getSetting2("bot_briefing", "1") === "1";
+}
+var DOW_ITB = ["domenica", "luned\xEC", "marted\xEC", "mercoled\xEC", "gioved\xEC", "venerd\xEC", "sabato"];
+var MON_ITB = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"];
+function dateITfromISO(iso) {
+  const [y, m, d] = iso.split("-").map((n) => parseInt(n, 10));
+  const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+  return `${DOW_ITB[dow]} ${d} ${MON_ITB[m - 1]}`;
+}
+function getBriefingData() {
+  const { iso } = romeNow();
+  const appts = getAllAppointments();
+  const sel = selectAgingDrafts(
+    db_default.prepare(`SELECT id, phone, contact_name, needs_human, created_at FROM bot_drafts WHERE status = 'pending'`).all(),
+    Date.now(),
+    agingOpts()
+  );
+  const today = appts.filter((a) => a.date === iso && ["da_confermare", "confermato"].includes(a.status)).sort((a, b) => String(a.start).localeCompare(String(b.start))).map((a) => ({ start: a.start, who: a.contact_name || a.phone, reason: a.reason, status: a.status }));
+  const pendingOutcome = selectPendingOutcome(
+    appts.map((a) => ({ id: a.id, date: a.date, status: a.status, outcome: a.outcome })),
+    iso
+  );
+  const pendWho = pendingOutcome.map((p) => {
+    const full = appts.find((a) => a.id === p.id);
+    return { who: full?.contact_name || full?.phone || "\u2014", date: p.date };
+  });
+  let voices = 0;
+  try {
+    voices = db_default.prepare(`SELECT COUNT(*) c FROM live_messages
+      WHERE is_audio = 1 AND direction = 'received' AND COALESCE(is_read,0) = 0
+        AND transcription_status = 'ok' AND created_at >= ?`).get(new Date(Date.now() - 864e5).toISOString())?.c || 0;
+  } catch {
+  }
+  return {
+    dateIT: dateITfromISO(iso),
+    urgentDrafts: sel.urgent.map((u) => ({ id: u.id, who: u.who, ageH: u.ageH })),
+    todayAppointments: today,
+    pendingOutcome: pendWho,
+    transcribedVoices: voices
+  };
+}
+async function runMorningBriefing(force = false) {
+  if (!briefingEnabled()) return { sent: false, empty: true };
+  const { iso, hour } = romeNow();
+  if (!force) {
+    if (hour < 7 || hour >= 9) return { sent: false, empty: false };
+    if (getSetting2(`briefing_done_${iso}`, "") === "1") return { sent: false, empty: false };
+  }
+  const { text, empty } = composeBriefing(getBriefingData());
+  if (!force && empty) {
+    setSetting2(`briefing_done_${iso}`, "1");
+    return { sent: false, empty: true };
+  }
+  try {
+    await sendTextMessage(getControlNumber(), text);
+  } catch (e) {
+    console.error("[Reminders] briefing fallito:", e.message);
+    return { sent: false, empty };
+  }
+  if (!force) setSetting2(`briefing_done_${iso}`, "1");
+  console.log("[Reminders] Briefing del mattino inviato al numero di controllo.");
+  return { sent: true, empty };
+}
 async function runAppointmentCleanup(force = false) {
   const todayISO = romeNow().iso;
   const rows = getAllAppointments();
@@ -101433,6 +101534,11 @@ async function remindersTick() {
     await runAppointmentCleanup();
   } catch (e) {
     console.error("[Reminders] pulizia agenda:", e.message);
+  }
+  try {
+    await runMorningBriefing();
+  } catch (e) {
+    console.error("[Reminders] briefing:", e.message);
   }
 }
 function getRemindersStatus() {
@@ -101678,6 +101784,79 @@ function startMaintenance() {
   console.log("[Maintenance] Scheduler avviato (digest 20:30 + watchdog flusso + promemoria/lista d'attesa/SLA).");
 }
 
+// server/summary.ts
+init_db();
+init_chatbot();
+
+// server/summary_logic.ts
+function buildSummaryTranscript(rows) {
+  return rows.map((r) => `[${r.direction === "sent" ? "STUDIO" : "CLIENTE"}] ${String(r.content || "").replace(/\s+/g, " ").trim()}`).filter((l) => l.length > 12).join("\n");
+}
+function isSummaryCacheFresh(cached, latestTs, nowMs, ttlMin = 15) {
+  if (!cached || !cached.created_at) return false;
+  if ((cached.last_ts || "") !== (latestTs || "")) return false;
+  const age = nowMs - Date.parse(cached.created_at);
+  return !isNaN(age) && age < ttlMin * 6e4;
+}
+function parseAnthropicText(data) {
+  const blocks = data?.content || [];
+  return blocks.filter((b) => b?.type === "text").map((b) => b.text).join("").trim();
+}
+
+// server/summary.ts
+var ANTHROPIC_URL3 = "https://api.anthropic.com/v1/messages";
+var ANTHROPIC_VERSION3 = "2023-06-01";
+db_default.exec(`
+  CREATE TABLE IF NOT EXISTS conversation_summaries (
+    phone TEXT PRIMARY KEY,
+    summary TEXT,
+    last_ts TEXT,
+    created_at TEXT
+  );
+`);
+var SUMMARY_SYSTEM = `Sei l'assistente dello Studio Tributario Branca. Riassumi in ITALIANO, in 4-6 righe,
+i PUNTI CHIAVE e soprattutto le RICHIESTE ANCORA APERTE del cliente in questa conversazione WhatsApp/email.
+Sii concreto e sintetico. NON inventare nulla che non sia nel testo. Restituisci SOLO il riassunto, senza
+premesse, senza elenco di istruzioni, senza nominare strumenti.`;
+async function summarizeConversation(phone) {
+  const rows = db_default.prepare(`
+    SELECT direction, content, COALESCE(timestamp, created_at) AS timestamp
+    FROM live_messages
+    WHERE phone = ? AND content IS NOT NULL AND content != ''
+    ORDER BY COALESCE(timestamp, created_at) DESC, id DESC LIMIT 40
+  `).all(phone);
+  if (!rows.length) return { phone, summary: "(nessun messaggio in questa conversazione)", cached: false, at: (/* @__PURE__ */ new Date()).toISOString() };
+  rows.reverse();
+  const latestTs = rows[rows.length - 1].timestamp || "";
+  const cached = db_default.prepare(`SELECT summary, last_ts, created_at FROM conversation_summaries WHERE phone = ?`).get(phone);
+  if (cached && isSummaryCacheFresh(cached, latestTs, Date.now())) {
+    return { phone, summary: cached.summary, cached: true, at: cached.created_at };
+  }
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return { phone, summary: "(riassunto non disponibile: ANTHROPIC_API_KEY non configurata)", cached: false, at: (/* @__PURE__ */ new Date()).toISOString() };
+  const transcript = buildSummaryTranscript(rows);
+  try {
+    const resp = await fetch(ANTHROPIC_URL3, {
+      method: "POST",
+      headers: { "x-api-key": apiKey, "anthropic-version": ANTHROPIC_VERSION3, "content-type": "application/json" },
+      body: JSON.stringify({ model: getBotModel(), max_tokens: 400, system: SUMMARY_SYSTEM, messages: [{ role: "user", content: transcript }] })
+    });
+    if (!resp.ok) {
+      console.error("[Summary] Anthropic HTTP", resp.status);
+      return { phone, summary: "(riassunto non disponibile in questo momento)", cached: false, at: (/* @__PURE__ */ new Date()).toISOString() };
+    }
+    const data = await resp.json();
+    const summary = parseAnthropicText(data) || "(riassunto vuoto)";
+    const at = (/* @__PURE__ */ new Date()).toISOString();
+    db_default.prepare(`INSERT INTO conversation_summaries (phone, summary, last_ts, created_at) VALUES (?, ?, ?, ?)
+      ON CONFLICT(phone) DO UPDATE SET summary = excluded.summary, last_ts = excluded.last_ts, created_at = excluded.created_at`).run(phone, summary, latestTs, at);
+    return { phone, summary, cached: false, at, model: getBotModel() };
+  } catch (e) {
+    console.error("[Summary] errore:", e?.message);
+    return { phone, summary: "(riassunto non disponibile: errore di rete)", cached: false, at: (/* @__PURE__ */ new Date()).toISOString() };
+  }
+}
+
 // server/routes.ts
 init_autosend();
 
@@ -101757,7 +101936,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.10.4", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.11.0", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/selftest", (_req, res) => {
   res.json(getLastSelfCheck() || { note: "mai eseguito" });
@@ -103070,7 +103249,8 @@ router.post("/bot/jobs/:job/run", async (req, res) => {
     if (job === "sla") return res.json(await runSlaCheck(true));
     if (job === "aging") return res.json(await runDraftAging(true));
     if (job === "cleanup") return res.json(await runAppointmentCleanup(true));
-    res.status(400).json({ error: `Job sconosciuto: ${job} (validi: reminders, waitlist, sla, aging, cleanup)` });
+    if (job === "briefing") return res.json(await runMorningBriefing(true));
+    res.status(400).json({ error: `Job sconosciuto: ${job} (validi: reminders, waitlist, sla, aging, cleanup, briefing)` });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -103078,6 +103258,24 @@ router.post("/bot/jobs/:job/run", async (req, res) => {
 router.get("/bot/drafts/aging", (_req, res) => {
   try {
     res.json(getAgingView());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.get("/bot/briefing", (_req, res) => {
+  try {
+    const data = getBriefingData();
+    const { text, empty } = composeBriefing(data);
+    res.json({ preview: text, empty, data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.get("/bot/conversation/:phone/summary", async (req, res) => {
+  try {
+    const phone = String(req.params.phone).replace(/\D/g, "");
+    if (!phone) return res.status(400).json({ error: "phone non valido" });
+    res.json(await summarizeConversation(phone));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

@@ -1,6 +1,9 @@
 /* Test del PREDICATO SQL di deduplica eco fromMe (fix doppio log), su SQLite in-memory
  * reale (better-sqlite3). Nessun invio reale, nessun accesso al DB di produzione. */
-import { DatabaseSync } from 'node:sqlite';
+// node:sqlite è disponibile su Node recenti; se assente nel runtime CI, SKIP pulito.
+let DatabaseSync: any;
+try { ({ DatabaseSync } = await import('node:sqlite')); }
+catch { console.log('SKIP — node:sqlite non disponibile in questo runtime'); process.exit(0); }
 
 const db = new DatabaseSync(':memory:');
 db.exec(`CREATE TABLE live_messages (

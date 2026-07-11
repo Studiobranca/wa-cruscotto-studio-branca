@@ -49,7 +49,9 @@ import {
   closeWaitlistEntry,
 } from './chatbot.js';
 import { runDailyDigest, getFlowHealth, repairWebhook, runSelfCheck, getLastSelfCheck } from './maintenance.js';
-import { runReminders, runWaitlistRecall, runSlaCheck, getRemindersStatus, runDraftAging, getAgingView, runAppointmentCleanup } from './reminders.js';
+import { runReminders, runWaitlistRecall, runSlaCheck, getRemindersStatus, runDraftAging, getAgingView, runAppointmentCleanup, getBriefingData, runMorningBriefing } from './reminders.js';
+import { composeBriefing } from './briefing_logic.js';
+import { summarizeConversation } from './summary.js';
 import { decideWorkAutoSend } from './autosend.js';
 import { recordBotSend, getSentLog, getSentLogSummary } from './sentlog.js';
 import { getEmailDrafts, getEmailSentLog, getEmailSentSummary } from './emaildrafts.js';
@@ -79,7 +81,7 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.10.4', built: new Date().toISOString() });
+  res.json({ version: '2.11.0', built: new Date().toISOString() });
 });
 
 // ─── Autocheck (self-test + autocorrezione) ──────────────────────────────────
@@ -1582,7 +1584,8 @@ router.post('/bot/jobs/:job/run', async (req: Request, res: Response) => {
     if (job === 'sla') return res.json(await runSlaCheck(true));
     if (job === 'aging') return res.json(await runDraftAging(true));
     if (job === 'cleanup') return res.json(await runAppointmentCleanup(true));
-    res.status(400).json({ error: `Job sconosciuto: ${job} (validi: reminders, waitlist, sla, aging, cleanup)` });
+    if (job === 'briefing') return res.json(await runMorningBriefing(true));
+    res.status(400).json({ error: `Job sconosciuto: ${job} (validi: reminders, waitlist, sla, aging, cleanup, briefing)` });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1590,6 +1593,26 @@ router.post('/bot/jobs/:job/run', async (req: Request, res: Response) => {
 router.get('/bot/drafts/aging', (_req: Request, res: Response) => {
   try { res.json(getAgingView()); }
   catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── BRIEFING DEL MATTINO: anteprima (sola lettura, NESSUN invio) ────────────
+// Compone il briefing e lo restituisce SENZA inviarlo. L'invio reale avviene solo
+// dal job giornaliero (7–9) verso il numero di controllo di Mariano, mai ai clienti.
+router.get('/bot/briefing', (_req: Request, res: Response) => {
+  try {
+    const data = getBriefingData();
+    const { text, empty } = composeBriefing(data);
+    res.json({ preview: text, empty, data });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── RIASSUNTO AI DI UNA CONVERSAZIONE (sola lettura interna, on-demand) ─────
+router.get('/bot/conversation/:phone/summary', async (req: Request, res: Response) => {
+  try {
+    const phone = String(req.params.phone).replace(/\D/g, '');
+    if (!phone) return res.status(400).json({ error: 'phone non valido' });
+    res.json(await summarizeConversation(phone));
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
 // ─── AUDIT-LOG INVII AUTONOMI (sola lettura) ─────────────────────────────────
