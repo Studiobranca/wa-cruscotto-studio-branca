@@ -26,9 +26,11 @@ import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import nodemailer from 'nodemailer';
 import { db } from './db.js';
-import { generateReplyCore, materializeProposedEvent, getControlNumber, sendStudioAlertEmail, sanitizeReply } from './chatbot.js';
+import { generateReplyCore, materializeProposedEvent, getControlNumber, sendStudioAlertEmail, sanitizeReply, isAutoAppointmentsEnabled } from './chatbot.js';
 import { sendTextMessage } from './zapi.js';
 import * as contacts from './contacts.js';
+import { decideWorkAutoSend } from './autosend.js';
+import { saveEmailDraft, recordEmailSend, getEmailDraft, markEmailDraftSent, markEmailDraftRejected } from './emaildrafts.js';
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS incoming_emails (
@@ -273,28 +275,45 @@ async function maybeAutoReply(acc: MailAccount, row: {
   }
   if (!outcome || outcome.kind !== 'work' || !outcome.result) return null;
   const res = outcome.result;
-  if (res.needsHuman) {
-    // Urgenza: MAI auto-rispondere. Alert dedicato, distinto dal generico "in attesa".
-    await notifyUrgentEmail(row, res.humanReason);
-    return null;
-  }
+
+  // ─── ALLINEAMENTO ALL'INVARIANTE (rev. 11/07/2026) ────────────────────────
+  // Come su WhatsApp: MERITO e URGENZE via email NON partono più da sole → BOZZA da
+  // approvare (coda email_drafts). In autonomia resta SOLO il flusso appuntamenti.
+  const draftIt = (needsHuman: boolean, urgent: boolean, reason?: string): string => {
+    const id = saveEmailDraft({
+      account: acc.user, toAddr: fromAddr, toName: row.from_name, subject: row.subject,
+      draftText: res.draftText || '', inReplyTo: row.message_id, proposedEvent: res.proposedEvent || null,
+      needsHuman, incomingId: row.id,
+    });
+    if (urgent) { notifyUrgentEmail(row, reason || res.humanReason).catch(() => {}); }
+    else { sendTextMessage(getControlNumber(), `✉️ Bozza email pronta per ${row.from_name || fromAddr} (oggetto: "${row.subject}"). Rivedila nel Cruscotto.`).catch(() => {}); }
+    console.log(`[Email] Bozza email #${id} per ${fromAddr}${needsHuman ? ' [need_human]' : ''} — merito/urgenza NON auto-inviata.`);
+    return 'bozza';
+  };
+
+  // URGENZA → mai auto-risposta: bozza needs_human + alert dedicato.
+  if (res.needsHuman) return draftIt(true, true);
   if (!res.draftText) return null;
-  // GUARDRAIL anti-leak (problema 1): mai auto-inviare ragionamento/nomi-tool. Se il
-  // testo non è isolabile in sicurezza, NON si risponde in automatico: si avvisa
-  // Mariano e l'email resta da gestire a mano dal Cruscotto.
+
+  // GUARDRAIL anti-leak: testo non isolabile in sicurezza → bozza + alert (mai grezzo).
   const san = sanitizeReply(res.draftText);
   if (!san.safe) {
-    console.warn(`[Sanitizer] Email ${fromAddr}: risposta non isolabile in sicurezza (rimossi=${san.removed.length}, tool residuo=${san.residualTool}) → NON auto-inviata.`);
-    await notifyUrgentEmail(row, 'Risposta automatica bloccata dal guardrail anti-ragionamento: da gestire a mano.');
-    return null;
+    console.warn(`[Sanitizer] Email ${fromAddr}: testo non isolabile (rimossi=${san.removed.length}, tool=${san.residualTool}) → bozza.`);
+    return draftIt(true, true, 'Guardrail anti-ragionamento: risposta email da rivedere a mano.');
   }
-  if (san.changed) {
-    res.draftText = san.clean;
-    console.warn(`[Sanitizer] Email ${fromAddr}: rimosso preambolo di ragionamento (${san.removed.length} blocco/i) prima dell'invio.`);
-  }
-  const isAppt = !!res.appointmentFlow || !!res.proposedEvent;
-  const isDoc = !!res.docNoted;
+  if (san.changed) { res.draftText = san.clean; }
 
+  // DECISIONE: in autonomia SOLO il flusso appuntamenti; ogni altra risposta (merito,
+  // conferme documenti non-appuntamento) → BOZZA. Fail-safe verso la bozza.
+  const decision = decideWorkAutoSend({
+    appointmentFlow: !!res.appointmentFlow,
+    needsHuman: false,
+    autoApptEnabled: isAutoAppointmentsEnabled(),
+    sanitizerDiverted: false,
+  });
+  if (decision !== 'appointment-auto') return draftIt(false, false);
+
+  // APPUNTAMENTO in autonomia (agenda già incrociata) → invia + audit-log.
   try {
     if (res.proposedEvent) {
       await materializeProposedEvent(key, row.from_name || fromAddr, res.proposedEvent, 'email');
@@ -302,13 +321,40 @@ async function maybeAutoReply(acc: MailAccount, row: {
     await sendReply(acc, fromAddr, row.subject, res.draftText, row.message_id || undefined);
     db.prepare(`UPDATE incoming_emails SET replied = 1, reply_text = ?, reply_at = datetime('now') WHERE id = ?`)
       .run(res.draftText, row.id);
-    const label = isAppt ? 'appuntamento' : isDoc ? 'documenti' : 'risposta';
-    console.log(`[Email] Risposta automatica (${label}) inviata a ${fromAddr}.`);
-    return label;
+    recordEmailSend({ toAddr: fromAddr, subject: row.subject, kind: 'appointment', draftId: null, text: res.draftText });
+    console.log(`[Email] Appuntamento autonomo inviato a ${fromAddr}.`);
+    return 'appuntamento';
   } catch (e: any) {
-    console.error('[Email] invio risposta fallito:', e.message);
+    console.error('[Email] invio appuntamento fallito:', e.message);
     return null;
   }
+}
+
+// ─── Approvazione/rifiuto BOZZE email (dal Cruscotto) ────────────────────────
+// L'invio parte SOLO su approvazione umana (non è un auto-invio). Registra l'audit.
+export async function approveEmailDraft(id: number, opts: { text?: string } = {}): Promise<{ ok: boolean; status: number; message?: string }> {
+  const d = getEmailDraft(id);
+  if (!d) return { ok: false, status: 404, message: 'Bozza non trovata' };
+  if (d.status !== 'pending') return { ok: false, status: 400, message: 'Bozza già gestita' };
+  const acc = accounts().find((a) => a.user === d.account) || accounts()[0];
+  if (!acc) return { ok: false, status: 500, message: 'Nessun account email configurato' };
+  const finalText = (opts.text && String(opts.text).trim()) || d.draft_text || '';
+  try {
+    if (d.proposed_event) {
+      await materializeProposedEvent(`email:${d.to_addr}`, d.to_name || d.to_addr, d.proposed_event, 'email');
+    }
+    await sendReply(acc, d.to_addr, d.subject, finalText, d.in_reply_to || undefined);
+    if (d.incoming_id) { try { db.prepare(`UPDATE incoming_emails SET replied = 1, reply_text = ?, reply_at = datetime('now') WHERE id = ?`).run(finalText, d.incoming_id); } catch { /* best-effort */ } }
+    recordEmailSend({ toAddr: d.to_addr, subject: d.subject, kind: 'reply-approved', draftId: id, text: finalText });
+    markEmailDraftSent(id);
+    return { ok: true, status: 200 };
+  } catch (e: any) { return { ok: false, status: 500, message: e.message }; }
+}
+export function rejectEmailDraft(id: number): boolean {
+  const d = getEmailDraft(id);
+  if (!d || d.status !== 'pending') return false;
+  markEmailDraftRejected(id);
+  return true;
 }
 
 /** Avvisa il numero di controllo (Cruscotto) dell'arrivo di una email di un cliente.

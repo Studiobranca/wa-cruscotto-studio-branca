@@ -12,6 +12,7 @@
 
 import db from './db.js';
 import { getAvailability, formatAvailabilityIT, isSlotBusy, getNowStatus, formatDateIT } from './appointments.js';
+import { shouldBlockSlot } from './agenda_logic.js';
 import { sendTextMessage } from './zapi.js';
 import { createCalendarEvent, updateCalendarEvent, appendEventDescription } from './integrations.js';
 import { broadcastEvent } from './sse.js';
@@ -64,6 +65,9 @@ db.exec(`
 `);
 // Migrazione idempotente (v2.10): flag promemoria "appuntamento di domani" già inviato.
 try { db.exec(`ALTER TABLE bot_appointments ADD COLUMN reminder_sent INTEGER DEFAULT 0`); } catch { /* già presente */ }
+// Migrazione (rev. 11/07): esito appuntamento (tenuto | no_show | annullato) — NULL = da registrare.
+// Nota: lo status guadagna anche il valore 'scaduto' per le proposte [DA CONFERMARE] mai confermate.
+try { db.exec(`ALTER TABLE bot_appointments ADD COLUMN outcome TEXT`); } catch { /* già presente */ }
 
 // ─── Persistenza: lista d'attesa appuntamenti (v2.10) ─────────────────────────
 // Quando get_availability non ha slot (chiusura estiva, agenda piena) il bot propone
@@ -249,6 +253,35 @@ export async function cancelAppointmentRow(appt: any): Promise<void> {
     });
   }
   db.prepare(`UPDATE bot_appointments SET status = 'annullato' WHERE id = ?`).run(appt.id);
+}
+
+/** Fa SCADERE una proposta [DA CONFERMARE] mai confermata: aggiorna l'evento Calendar a
+ *  [SCADUTA] e porta lo status a 'scaduto' (distinto da 'annullato' dal cliente). Così lo
+ *  slot non resta "fantasma" occupando l'agenda. Rev. 11/07/2026. */
+export async function expireAppointmentRow(appt: any): Promise<void> {
+  if (appt.event_id) {
+    try {
+      await updateCalendarEvent({
+        eventId: appt.event_id,
+        title: `⌛ [SCADUTA] ${appt.reason || 'Appuntamento'} — ${appt.contact_name || appt.phone}`,
+        colorId: '8', // grafite
+      });
+    } catch (e: any) { console.error('[Chatbot] scadenza evento Calendar:', e.message); }
+  }
+  db.prepare(`UPDATE bot_appointments SET status = 'scaduto' WHERE id = ?`).run(appt.id);
+}
+
+/** Righe appuntamento (per job/endpoint agenda). */
+export function getAllAppointments(): any[] {
+  return db.prepare(`SELECT * FROM bot_appointments ORDER BY date DESC, start DESC`).all() as any[];
+}
+export function getAppointmentRow(id: number): any | null {
+  return db.prepare(`SELECT * FROM bot_appointments WHERE id = ?`).get(id) as any || null;
+}
+/** Registra l'esito di un appuntamento (tenuto | no_show | annullato). Rev. 11/07/2026. */
+export function setAppointmentOutcome(id: number, outcome: string): boolean {
+  const info = db.prepare(`UPDATE bot_appointments SET outcome = ? WHERE id = ?`).run(outcome, id);
+  return info.changes > 0;
 }
 
 // ─── Config (app_settings key/value) ─────────────────────────────────────────
@@ -1036,13 +1069,18 @@ export async function approveDraftCore(id: number, opts: { text?: string; force?
   if (d.status !== 'pending') return { ok: false, status: 400, message: 'Bozza già gestita' };
   const finalText = (opts.text && String(opts.text).trim()) || d.draft_text;
 
-  // Controllo agenda: se Mariano è impegnato nello slot, blocca (salvo force)
+  // Controllo agenda: se Mariano è impegnato nello slot, blocca (salvo force).
+  // ANTI-OVERBOOKING fail-safe (rev. 11/07): shouldBlockSlot blocca anche quando il
+  // controllo su Google Calendar va in ERRORE (Google configurato ma non risponde) →
+  // niente auto-conferma su slot non verificabile, la bozza resta da approvare a mano.
   if (d.proposed_event && !opts.force) {
     const ev = d.proposed_event;
-    const { busy, checked } = await isSlotBusy(ev.date, ev.start, ev.end);
-    if (busy && checked) {
+    const chk = await isSlotBusy(ev.date, ev.start, ev.end);
+    if (shouldBlockSlot(chk)) {
       return { ok: false, status: 409, conflict: true, contactName: d.contact_name,
-        message: `Risulti impegnato ${ev.date} alle ${ev.start}.` };
+        message: chk.error
+          ? `Agenda non verificabile ora (${ev.date} ${ev.start}): lasciata in bozza per sicurezza.`
+          : `Risulti impegnato ${ev.date} alle ${ev.start}.` };
     }
   }
 

@@ -24146,13 +24146,17 @@ async function isSlotBusy(date, start, end) {
         items: [{ id: process.env.GOOGLE_CALENDAR_ID || "primary" }]
       })
     });
-    if (!resp.ok) return { busy: false, checked: false };
+    if (!resp.ok) {
+      console.error("[Appuntamenti] isSlotBusy HTTP", resp.status);
+      return { busy: false, checked: false, error: true };
+    }
     const data = await resp.json();
     const cal = data.calendars?.[Object.keys(data.calendars || {})[0]];
     const busy = (cal?.busy || []).length > 0;
     return { busy, checked: true };
-  } catch {
-    return { busy: false, checked: false };
+  } catch (e) {
+    console.error("[Appuntamenti] isSlotBusy errore:", e?.message);
+    return { busy: false, checked: false, error: true };
   }
 }
 function formatAvailabilityIT(slots, maxDays = 4, maxPerDay = 3) {
@@ -24924,6 +24928,28 @@ var init_integrations = __esm({
   }
 });
 
+// server/agenda_logic.ts
+function shouldBlockSlot(c) {
+  if (c.error) return true;
+  return !!c.busy && !!c.checked;
+}
+function selectExpiredProposals(rows, todayISO) {
+  return rows.filter((r) => r.status === "da_confermare" && !!r.date && r.date < todayISO);
+}
+function selectPendingOutcome(rows, todayISO) {
+  return rows.filter((r) => r.status === "confermato" && !!r.date && r.date < todayISO && !r.outcome);
+}
+function isValidOutcome(v) {
+  return typeof v === "string" && VALID_OUTCOMES.includes(v);
+}
+var VALID_OUTCOMES;
+var init_agenda_logic = __esm({
+  "server/agenda_logic.ts"() {
+    "use strict";
+    VALID_OUTCOMES = ["tenuto", "no_show", "annullato"];
+  }
+});
+
 // server/contacts.ts
 var contacts_exports = {};
 __export(contacts_exports, {
@@ -25322,6 +25348,31 @@ async function cancelAppointmentRow(appt) {
   }
   db_default.prepare(`UPDATE bot_appointments SET status = 'annullato' WHERE id = ?`).run(appt.id);
 }
+async function expireAppointmentRow(appt) {
+  if (appt.event_id) {
+    try {
+      await updateCalendarEvent({
+        eventId: appt.event_id,
+        title: `\u231B [SCADUTA] ${appt.reason || "Appuntamento"} \u2014 ${appt.contact_name || appt.phone}`,
+        colorId: "8"
+        // grafite
+      });
+    } catch (e) {
+      console.error("[Chatbot] scadenza evento Calendar:", e.message);
+    }
+  }
+  db_default.prepare(`UPDATE bot_appointments SET status = 'scaduto' WHERE id = ?`).run(appt.id);
+}
+function getAllAppointments() {
+  return db_default.prepare(`SELECT * FROM bot_appointments ORDER BY date DESC, start DESC`).all();
+}
+function getAppointmentRow(id) {
+  return db_default.prepare(`SELECT * FROM bot_appointments WHERE id = ?`).get(id) || null;
+}
+function setAppointmentOutcome(id, outcome) {
+  const info = db_default.prepare(`UPDATE bot_appointments SET outcome = ? WHERE id = ?`).run(outcome, id);
+  return info.changes > 0;
+}
 function getSetting(key, def) {
   try {
     const row = db_default.prepare(`SELECT value FROM app_settings WHERE key = ?`).get(key);
@@ -25718,14 +25769,14 @@ async function approveDraftCore(id, opts) {
   const finalText = opts.text && String(opts.text).trim() || d.draft_text;
   if (d.proposed_event && !opts.force) {
     const ev = d.proposed_event;
-    const { busy, checked } = await isSlotBusy(ev.date, ev.start, ev.end);
-    if (busy && checked) {
+    const chk = await isSlotBusy(ev.date, ev.start, ev.end);
+    if (shouldBlockSlot(chk)) {
       return {
         ok: false,
         status: 409,
         conflict: true,
         contactName: d.contact_name,
-        message: `Risulti impegnato ${ev.date} alle ${ev.start}.`
+        message: chk.error ? `Agenda non verificabile ora (${ev.date} ${ev.start}): lasciata in bozza per sicurezza.` : `Risulti impegnato ${ev.date} alle ${ev.start}.`
       };
     }
   }
@@ -25875,6 +25926,7 @@ var init_chatbot = __esm({
     "use strict";
     init_db();
     init_appointments();
+    init_agenda_logic();
     init_zapi();
     init_integrations();
     init_sse();
@@ -25919,6 +25971,10 @@ var init_chatbot = __esm({
 `);
     try {
       db_default.exec(`ALTER TABLE bot_appointments ADD COLUMN reminder_sent INTEGER DEFAULT 0`);
+    } catch {
+    }
+    try {
+      db_default.exec(`ALTER TABLE bot_appointments ADD COLUMN outcome TEXT`);
     } catch {
     }
     db_default.exec(`
@@ -100052,6 +100108,147 @@ var require_nodemailer = __commonJS({
   }
 });
 
+// server/autosend.ts
+function decideWorkAutoSend(i) {
+  if (i.needsHuman) return "draft";
+  if (i.sanitizerDiverted) return "draft";
+  if (i.appointmentFlow && i.autoApptEnabled) return "appointment-auto";
+  return "draft";
+}
+var init_autosend = __esm({
+  "server/autosend.ts"() {
+    "use strict";
+  }
+});
+
+// server/sentlog_logic.ts
+function hashText(text) {
+  return import_node_crypto.default.createHash("sha256").update(String(text ?? "")).digest("hex").slice(0, 16);
+}
+function buildSentEntry(e, nowISO) {
+  const text = String(e.text ?? "");
+  return {
+    phone: String(e.phone ?? ""),
+    contact_name: e.contactName ?? null,
+    kind: e.kind,
+    draft_id: e.draftId ?? null,
+    text_hash: hashText(text),
+    text_preview: text.replace(/\s+/g, " ").trim().slice(0, 140),
+    created_at: nowISO
+  };
+}
+var import_node_crypto;
+var init_sentlog_logic = __esm({
+  "server/sentlog_logic.ts"() {
+    "use strict";
+    import_node_crypto = __toESM(require("node:crypto"), 1);
+  }
+});
+
+// server/emaildrafts.ts
+function saveEmailDraft(e) {
+  try {
+    db.prepare(`UPDATE email_drafts SET status = 'rejected' WHERE to_addr = ? AND status = 'pending'`).run(e.toAddr);
+  } catch {
+  }
+  const info = db.prepare(`
+    INSERT INTO email_drafts (account, to_addr, to_name, subject, draft_text, in_reply_to, proposed_event, needs_human, incoming_id, status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+  `).run(
+    e.account ?? null,
+    e.toAddr,
+    e.toName ?? null,
+    e.subject,
+    e.draftText,
+    e.inReplyTo ?? null,
+    e.proposedEvent ? JSON.stringify(e.proposedEvent) : null,
+    e.needsHuman ? 1 : 0,
+    e.incomingId ?? null
+  );
+  return Number(info.lastInsertRowid);
+}
+function getEmailDrafts(status = "pending") {
+  const rows = db.prepare(`SELECT * FROM email_drafts WHERE status = ? ORDER BY created_at DESC`).all(status);
+  return rows.map((r) => ({ ...r, proposed_event: r.proposed_event ? JSON.parse(r.proposed_event) : null }));
+}
+function getEmailDraft(id) {
+  const r = db.prepare(`SELECT * FROM email_drafts WHERE id = ?`).get(id);
+  if (!r) return null;
+  return { ...r, proposed_event: r.proposed_event ? JSON.parse(r.proposed_event) : null };
+}
+function markEmailDraftSent(id) {
+  db.prepare(`UPDATE email_drafts SET status = 'sent', sent_at = datetime('now') WHERE id = ?`).run(id);
+}
+function markEmailDraftRejected(id) {
+  db.prepare(`UPDATE email_drafts SET status = 'rejected' WHERE id = ?`).run(id);
+}
+function recordEmailSend(e) {
+  try {
+    db.prepare(`INSERT INTO email_sent_log (to_addr, subject, kind, draft_id, text_hash, text_preview, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(e.toAddr, e.subject, e.kind, e.draftId ?? null, hashText(e.text), String(e.text || "").replace(/\s+/g, " ").trim().slice(0, 140), (/* @__PURE__ */ new Date()).toISOString());
+  } catch (err) {
+    console.error("[EmailSentLog] insert fallito:", err?.message);
+  }
+}
+function getEmailSentLog(sinceISO, limit = 200) {
+  const since = sinceISO || new Date(Date.now() - 7 * 864e5).toISOString();
+  const lim = Math.min(Math.max(Number(limit) || 200, 1), 1e3);
+  try {
+    return db.prepare(`SELECT id, to_addr AS toAddr, subject, kind, draft_id AS draftId, text_hash AS textHash, text_preview AS textPreview, created_at AS createdAt
+      FROM email_sent_log WHERE created_at >= ? ORDER BY created_at DESC LIMIT ?`).all(since, lim);
+  } catch {
+    return [];
+  }
+}
+function getEmailSentSummary(sinceISO) {
+  const since = sinceISO || new Date(Date.now() - 7 * 864e5).toISOString();
+  const byKind = {};
+  let total = 0;
+  try {
+    for (const r of db.prepare(`SELECT kind, COUNT(*) c FROM email_sent_log WHERE created_at >= ? GROUP BY kind`).all(since)) {
+      byKind[r.kind || "unknown"] = r.c;
+      total += r.c;
+    }
+  } catch {
+  }
+  return { since, total, byKind };
+}
+var init_emaildrafts = __esm({
+  "server/emaildrafts.ts"() {
+    "use strict";
+    init_db();
+    init_sentlog_logic();
+    db.exec(`
+  CREATE TABLE IF NOT EXISTS email_drafts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account TEXT,
+    to_addr TEXT NOT NULL,
+    to_name TEXT,
+    subject TEXT,
+    draft_text TEXT,
+    in_reply_to TEXT,
+    proposed_event TEXT,            -- JSON oppure NULL
+    needs_human INTEGER DEFAULT 0,
+    incoming_id INTEGER,            -- id in incoming_emails
+    status TEXT DEFAULT 'pending',  -- pending | sent | rejected
+    created_at TEXT DEFAULT (datetime('now')),
+    sent_at TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_email_drafts_status ON email_drafts(status);
+  CREATE TABLE IF NOT EXISTS email_sent_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    to_addr TEXT,
+    subject TEXT,
+    kind TEXT,                      -- 'appointment' | 'reply-approved'
+    draft_id INTEGER,
+    text_hash TEXT,
+    text_preview TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_email_sent_log_created ON email_sent_log(created_at);
+`);
+  }
+});
+
 // server/docvision.ts
 var docvision_exports = {};
 __export(docvision_exports, {
@@ -100129,6 +100326,7 @@ Output: SOLO la descrizione, nessuna premessa n\xE9 commento.`;
 // server/email.ts
 var email_exports = {};
 __export(email_exports, {
+  approveEmailDraft: () => approveEmailDraft,
   getEmailStatus: () => getEmailStatus,
   getRecentEmails: () => getRecentEmails,
   markEmailAsCGT: () => markEmailAsCGT,
@@ -100136,6 +100334,7 @@ __export(email_exports, {
   markEmailAsFornitore: () => markEmailAsFornitore,
   markEmailAsNotClient: () => markEmailAsNotClient,
   markEmailSeen: () => markEmailSeen,
+  rejectEmailDraft: () => rejectEmailDraft,
   sendStudioEmail: () => sendStudioEmail,
   startEmailPoller: () => startEmailPoller
 });
@@ -100313,36 +100512,89 @@ ${row.body}`;
   }
   if (!outcome || outcome.kind !== "work" || !outcome.result) return null;
   const res = outcome.result;
-  if (res.needsHuman) {
-    await notifyUrgentEmail(row, res.humanReason);
-    return null;
-  }
+  const draftIt = (needsHuman, urgent, reason) => {
+    const id = saveEmailDraft({
+      account: acc.user,
+      toAddr: fromAddr,
+      toName: row.from_name,
+      subject: row.subject,
+      draftText: res.draftText || "",
+      inReplyTo: row.message_id,
+      proposedEvent: res.proposedEvent || null,
+      needsHuman,
+      incomingId: row.id
+    });
+    if (urgent) {
+      notifyUrgentEmail(row, reason || res.humanReason).catch(() => {
+      });
+    } else {
+      sendTextMessage(getControlNumber(), `\u2709\uFE0F Bozza email pronta per ${row.from_name || fromAddr} (oggetto: "${row.subject}"). Rivedila nel Cruscotto.`).catch(() => {
+      });
+    }
+    console.log(`[Email] Bozza email #${id} per ${fromAddr}${needsHuman ? " [need_human]" : ""} \u2014 merito/urgenza NON auto-inviata.`);
+    return "bozza";
+  };
+  if (res.needsHuman) return draftIt(true, true);
   if (!res.draftText) return null;
   const san = sanitizeReply(res.draftText);
   if (!san.safe) {
-    console.warn(`[Sanitizer] Email ${fromAddr}: risposta non isolabile in sicurezza (rimossi=${san.removed.length}, tool residuo=${san.residualTool}) \u2192 NON auto-inviata.`);
-    await notifyUrgentEmail(row, "Risposta automatica bloccata dal guardrail anti-ragionamento: da gestire a mano.");
-    return null;
+    console.warn(`[Sanitizer] Email ${fromAddr}: testo non isolabile (rimossi=${san.removed.length}, tool=${san.residualTool}) \u2192 bozza.`);
+    return draftIt(true, true, "Guardrail anti-ragionamento: risposta email da rivedere a mano.");
   }
   if (san.changed) {
     res.draftText = san.clean;
-    console.warn(`[Sanitizer] Email ${fromAddr}: rimosso preambolo di ragionamento (${san.removed.length} blocco/i) prima dell'invio.`);
   }
-  const isAppt = !!res.appointmentFlow || !!res.proposedEvent;
-  const isDoc = !!res.docNoted;
+  const decision = decideWorkAutoSend({
+    appointmentFlow: !!res.appointmentFlow,
+    needsHuman: false,
+    autoApptEnabled: isAutoAppointmentsEnabled(),
+    sanitizerDiverted: false
+  });
+  if (decision !== "appointment-auto") return draftIt(false, false);
   try {
     if (res.proposedEvent) {
       await materializeProposedEvent(key, row.from_name || fromAddr, res.proposedEvent, "email");
     }
     await sendReply(acc, fromAddr, row.subject, res.draftText, row.message_id || void 0);
     db.prepare(`UPDATE incoming_emails SET replied = 1, reply_text = ?, reply_at = datetime('now') WHERE id = ?`).run(res.draftText, row.id);
-    const label = isAppt ? "appuntamento" : isDoc ? "documenti" : "risposta";
-    console.log(`[Email] Risposta automatica (${label}) inviata a ${fromAddr}.`);
-    return label;
+    recordEmailSend({ toAddr: fromAddr, subject: row.subject, kind: "appointment", draftId: null, text: res.draftText });
+    console.log(`[Email] Appuntamento autonomo inviato a ${fromAddr}.`);
+    return "appuntamento";
   } catch (e) {
-    console.error("[Email] invio risposta fallito:", e.message);
+    console.error("[Email] invio appuntamento fallito:", e.message);
     return null;
   }
+}
+async function approveEmailDraft(id, opts = {}) {
+  const d = getEmailDraft(id);
+  if (!d) return { ok: false, status: 404, message: "Bozza non trovata" };
+  if (d.status !== "pending") return { ok: false, status: 400, message: "Bozza gi\xE0 gestita" };
+  const acc = accounts().find((a) => a.user === d.account) || accounts()[0];
+  if (!acc) return { ok: false, status: 500, message: "Nessun account email configurato" };
+  const finalText = opts.text && String(opts.text).trim() || d.draft_text || "";
+  try {
+    if (d.proposed_event) {
+      await materializeProposedEvent(`email:${d.to_addr}`, d.to_name || d.to_addr, d.proposed_event, "email");
+    }
+    await sendReply(acc, d.to_addr, d.subject, finalText, d.in_reply_to || void 0);
+    if (d.incoming_id) {
+      try {
+        db.prepare(`UPDATE incoming_emails SET replied = 1, reply_text = ?, reply_at = datetime('now') WHERE id = ?`).run(finalText, d.incoming_id);
+      } catch {
+      }
+    }
+    recordEmailSend({ toAddr: d.to_addr, subject: d.subject, kind: "reply-approved", draftId: id, text: finalText });
+    markEmailDraftSent(id);
+    return { ok: true, status: 200 };
+  } catch (e) {
+    return { ok: false, status: 500, message: e.message };
+  }
+}
+function rejectEmailDraft(id) {
+  const d = getEmailDraft(id);
+  if (!d || d.status !== "pending") return false;
+  markEmailDraftRejected(id);
+  return true;
 }
 async function notifyControlNewEmail(row, autoReplied) {
   if (isAutomatedSender(row.from_addr)) return;
@@ -100538,6 +100790,8 @@ var init_email = __esm({
     init_chatbot();
     init_zapi();
     init_contacts();
+    init_autosend();
+    init_emaildrafts();
     db.exec(`
   CREATE TABLE IF NOT EXISTS incoming_emails (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100767,6 +101021,7 @@ init_appointments();
 init_zapi();
 init_chatbot();
 init_contacts();
+init_agenda_logic();
 
 // server/reminders_logic.ts
 var SEGRETERIA = "0909797187";
@@ -101124,6 +101379,35 @@ function getAgingView() {
   const sel = selectAgingDrafts(drafts, Date.now(), opts);
   return { opts, ...sel, overdueAppointments: overdueProposedAppointments(iso), totalPending: drafts.length };
 }
+async function runAppointmentCleanup(force = false) {
+  const todayISO = romeNow().iso;
+  const rows = getAllAppointments();
+  const expired = selectExpiredProposals(
+    rows.map((r) => ({ id: r.id, date: r.date, status: r.status })),
+    todayISO
+  );
+  if (!expired.length) return { expired: 0 };
+  let done = 0;
+  for (const e of expired) {
+    const full = rows.find((r) => r.id === e.id);
+    try {
+      await expireAppointmentRow(full);
+      done++;
+    } catch (err) {
+      console.error("[Reminders] scadenza appuntamento", e.id, err.message);
+    }
+  }
+  if (done) {
+    console.log(`[Reminders] Pulizia agenda: ${done} propost${done === 1 ? "a" : "e"} [DA CONFERMARE] scadut${done === 1 ? "a" : "e"} \u2192 'scaduto'.`);
+    if (force || done > 0) {
+      try {
+        await sendTextMessage(getControlNumber(), `\u231B Agenda: ${done} propost${done === 1 ? "a" : "e"} di appuntamento scadut${done === 1 ? "a" : "e"} (mai confermat${done === 1 ? "a" : "e"}) e liberat${done === 1 ? "o lo slot" : "i gli slot"}.`);
+      } catch {
+      }
+    }
+  }
+  return { expired: done };
+}
 async function remindersTick() {
   try {
     await runReminders();
@@ -101144,6 +101428,11 @@ async function remindersTick() {
     await runDraftAging();
   } catch (e) {
     console.error("[Reminders] aging bozze:", e.message);
+  }
+  try {
+    await runAppointmentCleanup();
+  } catch (e) {
+    console.error("[Reminders] pulizia agenda:", e.message);
   }
 }
 function getRemindersStatus() {
@@ -101389,36 +101678,12 @@ function startMaintenance() {
   console.log("[Maintenance] Scheduler avviato (digest 20:30 + watchdog flusso + promemoria/lista d'attesa/SLA).");
 }
 
-// server/autosend.ts
-function decideWorkAutoSend(i) {
-  if (i.needsHuman) return "draft";
-  if (i.sanitizerDiverted) return "draft";
-  if (i.appointmentFlow && i.autoApptEnabled) return "appointment-auto";
-  return "draft";
-}
+// server/routes.ts
+init_autosend();
 
 // server/sentlog.ts
 init_db();
-
-// server/sentlog_logic.ts
-var import_node_crypto = __toESM(require("node:crypto"), 1);
-function hashText(text) {
-  return import_node_crypto.default.createHash("sha256").update(String(text ?? "")).digest("hex").slice(0, 16);
-}
-function buildSentEntry(e, nowISO) {
-  const text = String(e.text ?? "");
-  return {
-    phone: String(e.phone ?? ""),
-    contact_name: e.contactName ?? null,
-    kind: e.kind,
-    draft_id: e.draftId ?? null,
-    text_hash: hashText(text),
-    text_preview: text.replace(/\s+/g, " ").trim().slice(0, 140),
-    created_at: nowISO
-  };
-}
-
-// server/sentlog.ts
+init_sentlog_logic();
 db_default.exec(`
   CREATE TABLE IF NOT EXISTS bot_sent_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -101472,6 +101737,10 @@ function getSentLogSummary(sinceISO) {
 }
 
 // server/routes.ts
+init_emaildrafts();
+init_email();
+init_chatbot();
+init_agenda_logic();
 var router = (0, import_express.Router)();
 try {
   const bad = db_default.prepare(`SELECT id, timestamp FROM live_messages WHERE timestamp LIKE '+%'`).all();
@@ -101488,7 +101757,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.10.3", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.10.4", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/selftest", (_req, res) => {
   res.json(getLastSelfCheck() || { note: "mai eseguito" });
@@ -102800,7 +103069,8 @@ router.post("/bot/jobs/:job/run", async (req, res) => {
     if (job === "waitlist") return res.json(await runWaitlistRecall(true));
     if (job === "sla") return res.json(await runSlaCheck(true));
     if (job === "aging") return res.json(await runDraftAging(true));
-    res.status(400).json({ error: `Job sconosciuto: ${job} (validi: reminders, waitlist, sla, aging)` });
+    if (job === "cleanup") return res.json(await runAppointmentCleanup(true));
+    res.status(400).json({ error: `Job sconosciuto: ${job} (validi: reminders, waitlist, sla, aging, cleanup)` });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -102817,6 +103087,68 @@ router.get("/bot/sent", (req, res) => {
     const since = req.query.since || void 0;
     const limit = parseInt(req.query.limit || "200", 10);
     res.json({ summary: getSentLogSummary(since), items: getSentLog(since, limit) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.get("/email/drafts", (req, res) => {
+  try {
+    res.json(getEmailDrafts(String(req.query.status || "pending")));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.post("/email/drafts/:id/approve", async (req, res) => {
+  try {
+    const r = await approveEmailDraft(parseInt(String(req.params.id), 10), { text: req.body?.text });
+    res.status(r.ok ? 200 : r.status).json(r);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.post("/email/drafts/:id/reject", (req, res) => {
+  try {
+    const ok = rejectEmailDraft(parseInt(String(req.params.id), 10));
+    res.status(ok ? 200 : 404).json({ ok });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.get("/email/sent", (req, res) => {
+  try {
+    const since = req.query.since || void 0;
+    const limit = parseInt(req.query.limit || "200", 10);
+    res.json({ summary: getEmailSentSummary(since), items: getEmailSentLog(since, limit) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.get("/bot/appointments/pending-outcome", (_req, res) => {
+  try {
+    const todayISO = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Rome" }).format(/* @__PURE__ */ new Date());
+    const rows = getAllAppointments().map((r) => ({ id: r.id, date: r.date, status: r.status, outcome: r.outcome, contact_name: r.contact_name, phone: r.phone, start: r.start, reason: r.reason }));
+    res.json(selectPendingOutcome(rows, todayISO));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.post("/bot/appointments/:id/outcome", (req, res) => {
+  try {
+    const id = parseInt(String(req.params.id), 10);
+    const outcome = String(req.body?.outcome || "");
+    if (!isValidOutcome(outcome)) return res.status(400).json({ error: "outcome non valido (tenuto | no_show | annullato)" });
+    const appt = getAppointmentRow(id);
+    if (!appt) return res.status(404).json({ error: "Appuntamento non trovato" });
+    const ok = setAppointmentOutcome(id, outcome);
+    let draftId = null;
+    if (ok && outcome === "no_show" && appt.phone) {
+      const testo = `Gentile ${appt.contact_name || ""}, non l'abbiamo vista all'appuntamento del ${appt.date}. Se desidera, possiamo riprogrammarlo: ci faccia sapere la sua disponibilit\xE0.
+
+Per qualsiasi necessit\xE0 pu\xF2 chiamare lo 0909797187 negli orari di segreteria.
+Assistente Virtuale \u2014 Studio Tributario Branca`;
+      draftId = saveDraft({ phone: appt.phone, contactName: appt.contact_name || appt.phone, incoming: `[no-show ${appt.date}]`, result: { draftText: testo, proposedEvent: null, needsHuman: false } });
+    }
+    res.json({ ok, id, outcome, followupDraftId: draftId });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

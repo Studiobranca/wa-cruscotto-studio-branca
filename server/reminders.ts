@@ -26,8 +26,9 @@
 import db from './db.js';
 import { getAvailability, formatAvailabilityIT } from './appointments.js';
 import { sendTextMessage } from './zapi.js';
-import { getControlNumber, getWaitlist, markWaitlistNotified } from './chatbot.js';
+import { getControlNumber, getWaitlist, markWaitlistNotified, getAllAppointments, expireAppointmentRow } from './chatbot.js';
 import { isVipContact } from './contacts.js';
+import { selectExpiredProposals } from './agenda_logic.js';
 import {
   channelOfKey, inReminderWindow, inRecallWindow, inSlaWindow,
   isTooFresh, sqliteToMs, reminderMessageIT, waitlistRecallMessageIT, slaAlertText,
@@ -233,6 +234,35 @@ export function getAgingView(): any {
   return { opts, ...sel, overdueAppointments: overdueProposedAppointments(iso), totalPending: drafts.length };
 }
 
+// ═══ 5) PULIZIA PROPOSTE APPUNTAMENTO SCADUTE (rev. 11/07/2026) ══════════════
+// Le proposte [DA CONFERMARE] con data ORMAI passata e mai confermate restavano
+// attive, occupando l'agenda (evento freeBusy "fantasma"). Questo job idempotente
+// le porta a status 'scaduto' e aggiorna l'evento Calendar a [SCADUTA]. Gira nel
+// tick; NESSUN messaggio ai clienti (solo pulizia interna).
+export async function runAppointmentCleanup(force = false): Promise<{ expired: number }> {
+  const todayISO = romeNow().iso;
+  const rows = getAllAppointments();
+  const expired = selectExpiredProposals(
+    rows.map((r: any) => ({ id: r.id, date: r.date, status: r.status })),
+    todayISO,
+  );
+  if (!expired.length) return { expired: 0 };
+  let done = 0;
+  for (const e of expired) {
+    const full = rows.find((r: any) => r.id === e.id);
+    try { await expireAppointmentRow(full); done++; }
+    catch (err: any) { console.error('[Reminders] scadenza appuntamento', e.id, err.message); }
+  }
+  if (done) {
+    console.log(`[Reminders] Pulizia agenda: ${done} propost${done === 1 ? 'a' : 'e'} [DA CONFERMARE] scadut${done === 1 ? 'a' : 'e'} → 'scaduto'.`);
+    if (force || done > 0) {
+      try { await sendTextMessage(getControlNumber(), `⌛ Agenda: ${done} propost${done === 1 ? 'a' : 'e'} di appuntamento scadut${done === 1 ? 'a' : 'e'} (mai confermat${done === 1 ? 'a' : 'e'}) e liberat${done === 1 ? 'o lo slot' : 'i gli slot'}.`); }
+      catch { /* best-effort */ }
+    }
+  }
+  return { expired: done };
+}
+
 /** Un giro di tutti i job: chiamato dal tick di maintenance (ogni 30 min). Ogni job è
  *  isolato in try/catch: un errore qui non deve MAI toccare digest/watchdog/bot. */
 export async function remindersTick(): Promise<void> {
@@ -240,6 +270,7 @@ export async function remindersTick(): Promise<void> {
   try { await runWaitlistRecall(); } catch (e: any) { console.error('[Reminders] lista d\'attesa:', e.message); }
   try { await runSlaCheck(); } catch (e: any) { console.error('[Reminders] SLA:', e.message); }
   try { await runDraftAging(); } catch (e: any) { console.error('[Reminders] aging bozze:', e.message); }
+  try { await runAppointmentCleanup(); } catch (e: any) { console.error('[Reminders] pulizia agenda:', e.message); }
 }
 
 /** Stato sintetico per Cruscotto/diagnostica. */

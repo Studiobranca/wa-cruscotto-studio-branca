@@ -49,9 +49,13 @@ import {
   closeWaitlistEntry,
 } from './chatbot.js';
 import { runDailyDigest, getFlowHealth, repairWebhook, runSelfCheck, getLastSelfCheck } from './maintenance.js';
-import { runReminders, runWaitlistRecall, runSlaCheck, getRemindersStatus, runDraftAging, getAgingView } from './reminders.js';
+import { runReminders, runWaitlistRecall, runSlaCheck, getRemindersStatus, runDraftAging, getAgingView, runAppointmentCleanup } from './reminders.js';
 import { decideWorkAutoSend } from './autosend.js';
 import { recordBotSend, getSentLog, getSentLogSummary } from './sentlog.js';
+import { getEmailDrafts, getEmailSentLog, getEmailSentSummary } from './emaildrafts.js';
+import { approveEmailDraft, rejectEmailDraft } from './email.js';
+import { getAllAppointments, setAppointmentOutcome, getAppointmentRow } from './chatbot.js';
+import { selectPendingOutcome, isValidOutcome } from './agenda_logic.js';
 
 const router = Router();
 
@@ -75,7 +79,7 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.10.3', built: new Date().toISOString() });
+  res.json({ version: '2.10.4', built: new Date().toISOString() });
 });
 
 // ─── Autocheck (self-test + autocorrezione) ──────────────────────────────────
@@ -1577,7 +1581,8 @@ router.post('/bot/jobs/:job/run', async (req: Request, res: Response) => {
     if (job === 'waitlist') return res.json(await runWaitlistRecall(true));
     if (job === 'sla') return res.json(await runSlaCheck(true));
     if (job === 'aging') return res.json(await runDraftAging(true));
-    res.status(400).json({ error: `Job sconosciuto: ${job} (validi: reminders, waitlist, sla, aging)` });
+    if (job === 'cleanup') return res.json(await runAppointmentCleanup(true));
+    res.status(400).json({ error: `Job sconosciuto: ${job} (validi: reminders, waitlist, sla, aging, cleanup)` });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1596,6 +1601,60 @@ router.get('/bot/sent', (req: Request, res: Response) => {
     const since = (req.query.since as string) || undefined;
     const limit = parseInt((req.query.limit as string) || '200', 10);
     res.json({ summary: getSentLogSummary(since), items: getSentLog(since, limit) });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── EMAIL: coda BOZZE (invariante) + audit-log invii ────────────────────────
+// Le risposte di merito/urgenza via email ora restano BOZZA (email_drafts) come su WhatsApp.
+router.get('/email/drafts', (req: Request, res: Response) => {
+  try { res.json(getEmailDrafts(String(req.query.status || 'pending'))); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+router.post('/email/drafts/:id/approve', async (req: Request, res: Response) => {
+  try {
+    const r = await approveEmailDraft(parseInt(String(req.params.id), 10), { text: req.body?.text });
+    res.status(r.ok ? 200 : r.status).json(r);
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+router.post('/email/drafts/:id/reject', (req: Request, res: Response) => {
+  try {
+    const ok = rejectEmailDraft(parseInt(String(req.params.id), 10));
+    res.status(ok ? 200 : 404).json({ ok });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+// Audit-log invii email (sola lettura): kind 'appointment' (autonomo) | 'reply-approved' (approvato a mano).
+// Il merito NON parte mai da solo → non comparirà mai come autonomo.
+router.get('/email/sent', (req: Request, res: Response) => {
+  try {
+    const since = (req.query.since as string) || undefined;
+    const limit = parseInt((req.query.limit as string) || '200', 10);
+    res.json({ summary: getEmailSentSummary(since), items: getEmailSentLog(since, limit) });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── AGENDA: esito appuntamento (no-show) — sola gestione, nessun invio ──────
+router.get('/bot/appointments/pending-outcome', (_req: Request, res: Response) => {
+  try {
+    const todayISO = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Rome' }).format(new Date());
+    const rows = getAllAppointments().map((r: any) => ({ id: r.id, date: r.date, status: r.status, outcome: r.outcome, contact_name: r.contact_name, phone: r.phone, start: r.start, reason: r.reason }));
+    res.json(selectPendingOutcome(rows, todayISO));
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+router.post('/bot/appointments/:id/outcome', (req: Request, res: Response) => {
+  try {
+    const id = parseInt(String(req.params.id), 10);
+    const outcome = String(req.body?.outcome || '');
+    if (!isValidOutcome(outcome)) return res.status(400).json({ error: 'outcome non valido (tenuto | no_show | annullato)' });
+    const appt = getAppointmentRow(id);
+    if (!appt) return res.status(404).json({ error: 'Appuntamento non trovato' });
+    const ok = setAppointmentOutcome(id, outcome);
+    // Follow-up NO-SHOW: crea una BOZZA WhatsApp (mai auto-inviata) da rivedere.
+    let draftId: number | null = null;
+    if (ok && outcome === 'no_show' && appt.phone) {
+      const testo = `Gentile ${appt.contact_name || ''}, non l'abbiamo vista all'appuntamento del ${appt.date}. Se desidera, possiamo riprogrammarlo: ci faccia sapere la sua disponibilità.\n\nPer qualsiasi necessità può chiamare lo 0909797187 negli orari di segreteria.\nAssistente Virtuale — Studio Tributario Branca`;
+      draftId = saveDraft({ phone: appt.phone, contactName: appt.contact_name || appt.phone, incoming: `[no-show ${appt.date}]`, result: { draftText: testo, proposedEvent: null, needsHuman: false } });
+    }
+    res.json({ ok, id, outcome, followupDraftId: draftId });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 

@@ -152,8 +152,9 @@ export async function getAvailability(days = 14): Promise<{ slots: Slot[]; calen
  * se nel frattempo è diventato impegnato. Ritorna { busy, checked }: se il
  * calendario non è verificabile (checked=false) NON si blocca l'approvazione.
  */
-export async function isSlotBusy(date: string, start: string, end: string): Promise<{ busy: boolean; checked: boolean }> {
+export async function isSlotBusy(date: string, start: string, end: string): Promise<{ busy: boolean; checked: boolean; error?: boolean }> {
   const token = await getGoogleAccessToken();
+  // Google NON configurato: non è un errore, semplicemente non verificabile (checked=false).
   if (!token) return { busy: false, checked: false };
   const off = romeOffset(date);
   try {
@@ -167,13 +168,16 @@ export async function isSlotBusy(date: string, start: string, end: string): Prom
         items: [{ id: process.env.GOOGLE_CALENDAR_ID || 'primary' }],
       }),
     });
-    if (!resp.ok) return { busy: false, checked: false };
+    // ERRORE di verifica (Google configurato ma non risponde): fail-safe anti-overbooking
+    // → segnala error, così il chiamante NON auto-conferma e lascia la bozza.
+    if (!resp.ok) { console.error('[Appuntamenti] isSlotBusy HTTP', resp.status); return { busy: false, checked: false, error: true }; }
     const data = await resp.json() as any;
     const cal = data.calendars?.[Object.keys(data.calendars || {})[0]];
     const busy = (cal?.busy || []).length > 0;
     return { busy, checked: true };
-  } catch {
-    return { busy: false, checked: false };
+  } catch (e: any) {
+    console.error('[Appuntamenti] isSlotBusy errore:', e?.message);
+    return { busy: false, checked: false, error: true };
   }
 }
 
