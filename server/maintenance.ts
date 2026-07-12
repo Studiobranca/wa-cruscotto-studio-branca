@@ -14,9 +14,11 @@
 
 import db from './db.js';
 import { upsertAllDayEvent } from './integrations.js';
-import { setReceivedWebhook, getReceivedWebhook } from './zapi.js';
+import { setReceivedWebhook, getReceivedWebhook, getDevicePhone, zapiGet, sendTextMessage } from './zapi.js';
 import { broadcastEvent } from './sse.js';
-import { getControlNumber } from './chatbot.js';
+import { getControlNumber, getAlertEmail, sendStudioAlertEmail, isAutoSendEnabled, waCommandsEnabled, isBotEnabled } from './chatbot.js';
+import { remindersTick } from './reminders.js';
+import { evaluateZapiHealth, decideMonitorAlert } from './monitor_logic.js';
 
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || 'https://wa-cruscotto-v2-production.up.railway.app';
 const WEBHOOK_URL = `${PUBLIC_BASE_URL}/api/webhook/message`;
@@ -130,13 +132,154 @@ export async function repairWebhook(): Promise<{ ok: boolean; previous: string |
   return { ok, previous, set: WEBHOOK_URL };
 }
 
+function inRepairCooldown(): boolean {
+  const last = getSetting('last_webhook_repair');
+  return !!(last && (Date.now() - Date.parse(last)) / 60000 < REPAIR_COOLDOWN_MIN);
+}
+
 async function watchdogTick(): Promise<void> {
   const h = getFlowHealth();
+
+  // (A) Controllo PRESENZA del webhook — gira 24/7, INDIPENDENTE dall'orario.
+  // Se il webhook ricevuti registrato su Z-API manca o è diverso da quello
+  // atteso, lo ri-registra subito (rispettando il cooldown). Così una caduta
+  // serale/weekend/fuori orario non resta morta fino al rientro in studio.
+  try {
+    const current = await getReceivedWebhook();
+    const missing = !current || current !== WEBHOOK_URL;
+    console.log(`[Watchdog] Webhook check: registrato=${current ?? 'null'} atteso=${WEBHOOK_URL} → ${missing ? 'MANCANTE/DIVERSO' : 'OK'}`);
+    if (missing) {
+      if (inRepairCooldown()) {
+        console.warn('[Watchdog] Webhook mancante/diverso ma in cooldown → riparazione rimandata.');
+      } else {
+        console.warn('[Watchdog] Webhook ricevuti mancante/diverso → riparazione (anche fuori orario).');
+        await repairWebhook();
+        return; // repairWebhook aggiorna il cooldown: niente doppia riparazione nello stesso tick
+      }
+    }
+  } catch (e: any) {
+    console.error('[Watchdog] Webhook check fallito:', e.message);
+  }
+
+  // (B) Watchdog "stale" messaggi — INVARIATO: solo in orario lavorativo,
+  // come segnale aggiuntivo di flusso fermo (usato anche per le notifiche).
   if (!h.stale) return;
-  const last = getSetting('last_webhook_repair');
-  if (last && (Date.now() - Date.parse(last)) / 60000 < REPAIR_COOLDOWN_MIN) return; // cooldown
+  if (inRepairCooldown()) return;
   console.warn(`[Watchdog] Flusso messaggi fermo da ${h.lastAgeMin} min in orario lavorativo → riparazione webhook`);
   await repairWebhook();
+}
+
+// ═══ 3) AUTOCHECK GIORNALIERO + AUTOCORREZIONE ═══════════════════════════════
+// Controlli STRUTTURALI (nessuna chiamata AI → costo zero, eseguito di notte).
+// Verifica gli invarianti di sicurezza e ripara ciò che è sicuro riparare; manda
+// un'email di riepilogo SOLO se ha trovato/corretto qualcosa (niente rumore quotidiano).
+interface CheckItem { name: string; status: 'ok' | 'fixed' | 'warn' | 'error'; detail: string; }
+
+export async function runSelfCheck(): Promise<{ at: string; items: CheckItem[]; issues: number }> {
+  const items: CheckItem[] = [];
+
+  // 1) Webhook di ricezione registrato e corretto → ripara se manca/diverso.
+  try {
+    const current = await getReceivedWebhook();
+    if (current === WEBHOOK_URL) items.push({ name: 'webhook', status: 'ok', detail: 'registrato' });
+    else if (inRepairCooldown()) items.push({ name: 'webhook', status: 'warn', detail: `diverso (${current ?? 'null'}) ma in cooldown` });
+    else { const r = await repairWebhook(); items.push({ name: 'webhook', status: r.ok ? 'fixed' : 'error', detail: r.ok ? 'ri-registrato' : 'riparazione fallita' }); }
+  } catch (e: any) { items.push({ name: 'webhook', status: 'error', detail: e.message }); }
+
+  // 2) auto-invio ai clienti LOCKATO: se è acceso senza l'env autorizzativa, forzalo OFF.
+  if (getSetting('bot_auto_send') === '1' && process.env.BOT_ALLOW_AUTOSEND !== '1') {
+    setSetting('bot_auto_send', '0');
+    items.push({ name: 'autoSend', status: 'fixed', detail: 'era ON senza BOT_ALLOW_AUTOSEND → forzato OFF' });
+  } else items.push({ name: 'autoSend', status: 'ok', detail: isAutoSendEnabled() ? 'ON (env autorizzata)' : 'OFF' });
+
+  // 3) numero di controllo ≠ numero del dispositivo (altrimenti notifiche su sé stessi).
+  try {
+    const control = getControlNumber();
+    const device = (await getDevicePhone()) || '';
+    if (!control) items.push({ name: 'controlNumber', status: 'warn', detail: 'non impostato' });
+    else if (device && (control === device)) items.push({ name: 'controlNumber', status: 'warn', detail: `coincide col device ${device} (rischio auto-notifica)` });
+    else items.push({ name: 'controlNumber', status: 'ok', detail: `${control} (device ${device || '?'})` });
+  } catch (e: any) { items.push({ name: 'controlNumber', status: 'error', detail: e.message }); }
+
+  // 4) comandi WhatsApp: stato (off = approvazione solo da Cruscotto, scelto per sicurezza).
+  items.push({ name: 'waCommands', status: 'ok', detail: waCommandsEnabled() ? 'ON' : 'OFF (approvazione da Cruscotto)' });
+
+  // 5) bot abilitato.
+  items.push({ name: 'bot', status: isBotEnabled() ? 'ok' : 'warn', detail: isBotEnabled() ? 'abilitato' : 'DISABILITATO' });
+
+  // 6) email: se configurata, l'ultimo poll deve essere riuscito.
+  try {
+    const mail = await import('./email.js');
+    const st: any = mail.getEmailStatus();
+    if (!st.configured?.length) items.push({ name: 'email', status: 'ok', detail: 'non configurata' });
+    else if (st.lastPoll && st.lastPoll.ok === false) items.push({ name: 'email', status: 'error', detail: `ultimo poll KO: ${st.lastPoll.error || '?'}` });
+    else items.push({ name: 'email', status: 'ok', detail: `${st.configured.length} caselle, ultimo poll ${st.lastPoll?.ok ? 'OK' : 'n/d'}` });
+  } catch (e: any) { items.push({ name: 'email', status: 'warn', detail: `modulo non valutabile: ${e.message}` }); }
+
+  const at = new Date().toISOString();
+  const issues = items.filter((i) => i.status !== 'ok').length;
+  setSetting('selfcheck_last', JSON.stringify({ at, items, issues }));
+  console.log(`[SelfCheck] ${at} — ${issues} anomalie/correzioni: ${items.map((i) => `${i.name}:${i.status}`).join(' ')}`);
+
+  // Email di riepilogo SOLO se c'è qualcosa di rilevante (fixed/warn/error).
+  const notable = items.filter((i) => i.status !== 'ok');
+  if (notable.length) {
+    const rows = items.map((i) => {
+      const ic = i.status === 'ok' ? '✅' : i.status === 'fixed' ? '🔧' : i.status === 'warn' ? '⚠️' : '❌';
+      return `<tr><td>${ic} <b>${i.name}</b></td><td>${i.detail}</td></tr>`;
+    }).join('');
+    const html = `<h2>Autocheck Cruscotto — ${at.slice(0, 16).replace('T', ' ')}</h2>
+      <p>${notable.length} voce/i da segnalare (le correzioni automatiche sono marcate 🔧).</p>
+      <table cellpadding="6" style="border-collapse:collapse">${rows}</table>
+      <p style="color:#888;font-size:12px">Controllo automatico notturno (nessun costo AI).</p>`;
+    try { await sendStudioAlertEmail(`🩺 Autocheck Cruscotto: ${notable.length} segnalazioni`, html); } catch {}
+  }
+  return { at, items, issues };
+}
+
+export function getLastSelfCheck(): any {
+  try { return JSON.parse(getSetting('selfcheck_last') || 'null'); } catch { return null; }
+}
+
+// ─── MONITORAGGIO SESSIONE Z-API + allarmi (rev. 11/07/2026) ─────────────────
+// Complementare al watchdog (che ripara il WEBHOOK): qui controlliamo la SESSIONE
+// Z-API (device/telefono). Se cade, l'alert va via EMAIL (Brevo) — canale affidabile
+// proprio perché WhatsApp è ciò che è rotto — con cooldown; alla ripresa, notifica di
+// ripristino. Nessun doppione col selftest notturno (che verifica invarianti interni).
+export async function runMonitoring(force = false): Promise<{ healthy: boolean; reason: string; action: string }> {
+  let status: any = null;
+  try { status = await zapiGet('status'); } catch { status = null; }
+  const { healthy, reason } = evaluateZapiHealth(status);
+  const lastState = (getSetting('monitor_zapi_state') as 'up' | 'down' | null) || undefined;
+  const lastAtRaw = getSetting('monitor_zapi_alert_at');
+  const lastAlertMs = lastAtRaw ? Date.parse(lastAtRaw) : null;
+  const { action, newState } = decideMonitorAlert(healthy, lastState || undefined, (lastAlertMs != null && !isNaN(lastAlertMs)) ? lastAlertMs : null, Date.now());
+  setSetting('monitor_zapi_state', newState);
+  if (action === 'alert-down') {
+    setSetting('monitor_zapi_alert_at', new Date().toISOString());
+    const html = `<h2 style="color:#b00020">⚠️ Sessione WhatsApp (Z-API) NON attiva</h2>
+      <p>${reason}</p>
+      <p>Il bot potrebbe non ricevere/inviare messaggi WhatsApp. <b>RUNBOOK</b>: riconnetti la
+      sessione Z-API (riscansiona il QR nella dashboard Z-API), poi verifica
+      <code>/api/bot/zapi-info</code> e <code>/api/bot/flow-health</code>.</p>`;
+    await sendStudioAlertEmail('🔴 WhatsApp/Z-API disconnesso — Studio Branca', html).catch(() => {});
+    console.warn('[Monitor] Z-API DOWN:', reason);
+  } else if (action === 'alert-recovered') {
+    try { await sendTextMessage(getControlNumber(), '✅ Sessione WhatsApp (Z-API) di nuovo attiva.'); } catch { /* best-effort */ }
+    await sendStudioAlertEmail('✅ WhatsApp/Z-API ripristinato — Studio Branca', '<p>La sessione Z-API è tornata attiva.</p>').catch(() => {});
+    console.log('[Monitor] Z-API RECOVERED');
+  }
+  return { healthy, reason, action };
+}
+
+/** Stato consolidato per diagnostica (sola lettura). */
+export function getMonitorStatus(): any {
+  return {
+    zapiState: getSetting('monitor_zapi_state') || 'unknown',
+    lastZapiAlertAt: getSetting('monitor_zapi_alert_at'),
+    flow: getFlowHealth(),
+    lastSelfCheck: getLastSelfCheck(),
+  };
 }
 
 // ─── Scheduler interno ───────────────────────────────────────────────────────
@@ -158,13 +301,24 @@ export function startMaintenance(): void {
         const r = await runDailyDigest(iso);
         console.log(`[Digest] ${iso}: ${r.ok ? `evento aggiornato (${r.total} msg)` : `errore: ${r.error}`}`);
       }
+      // Autocheck giornaliero + autocorrezione: notte (03:00 Rome), 1×/giorno.
+      // Di notte i job sono fermi → sicuro riparare; controlli strutturali = costo AI nullo.
+      if (hour >= 3 && hour < 6 && getSetting(`selfcheck_done_${iso}`) !== '1') {
+        setSetting(`selfcheck_done_${iso}`, '1');
+        await runSelfCheck();
+      }
       // Watchdog flusso messaggi
       await watchdogTick();
+      // Promemoria appuntamenti + richiamo lista d'attesa + SLA risposte (v2.10).
+      // Internamente già isolato per singolo job (try/catch in remindersTick).
+      await remindersTick();
+      // Monitoraggio sessione Z-API (alert via email se il device cade).
+      try { await runMonitoring(); } catch (e: any) { console.error('[Monitor] tick:', e.message); }
     } catch (e: any) {
       console.error('[Maintenance] tick error:', e.message);
     }
   };
   setInterval(tick, 30 * 60 * 1000); // ogni 30 min
   setTimeout(tick, 60 * 1000);       // primo giro dopo 1 min
-  console.log('[Maintenance] Scheduler avviato (digest 20:30 + watchdog flusso).');
+  console.log('[Maintenance] Scheduler avviato (digest 20:30 + watchdog flusso + promemoria/lista d\'attesa/SLA).');
 }

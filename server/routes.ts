@@ -20,6 +20,7 @@ import {
 import {
   generateDraft,
   saveDraft,
+  sanitizeReply,
   getPendingDrafts,
   getDraft,
   markDraftSent,
@@ -35,6 +36,8 @@ import {
   handleControlCommand,
   approveDraftCore,
   isAutoSendEnabled,
+  isAutoAppointmentsEnabled,
+  waCommandsEnabled,
   getPendingAppointments,
   getAppointmentById,
   confirmAppointmentRow,
@@ -42,8 +45,22 @@ import {
   courtesySentToday,
   markCourtesySent,
   notifyUrgentByEmail,
+  getWaitlist,
+  closeWaitlistEntry,
 } from './chatbot.js';
-import { runDailyDigest, getFlowHealth, repairWebhook } from './maintenance.js';
+import { runDailyDigest, getFlowHealth, repairWebhook, runSelfCheck, getLastSelfCheck, getMonitorStatus, runMonitoring } from './maintenance.js';
+import { runReminders, runWaitlistRecall, runSlaCheck, getRemindersStatus, runDraftAging, getAgingView, runAppointmentCleanup, getBriefingData, runMorningBriefing, runDeadlineReminders } from './reminders.js';
+import { createDeadline, listDeadlines, completeDeadline, deleteDeadline, getImminentDeadlines } from './deadlines.js';
+import { composeBriefing } from './briefing_logic.js';
+import { summarizeConversation } from './summary.js';
+import { decideWorkAutoSend } from './autosend.js';
+import { recordBotSend, getSentLog, getSentLogSummary } from './sentlog.js';
+import { getEmailDrafts, getEmailSentLog, getEmailSentSummary, saveEmailDraft } from './emaildrafts.js';
+import { approveEmailDraft, rejectEmailDraft } from './email.js';
+import { getAllAppointments, setAppointmentOutcome, getAppointmentRow } from './chatbot.js';
+import { selectPendingOutcome, isValidOutcome } from './agenda_logic.js';
+import { createChecklist, getChecklist, getChecklistGrouped, markDocReceived, buildDocRequestText } from './practices.js';
+import { smsStatus } from './sms.js';
 
 const router = Router();
 
@@ -67,7 +84,116 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.9.1', built: new Date().toISOString() });
+  res.json({ version: '2.11.4', built: new Date().toISOString() });
+});
+
+// ─── Autocheck (self-test + autocorrezione) ──────────────────────────────────
+router.get('/selftest', (_req: Request, res: Response) => {
+  res.json(getLastSelfCheck() || { note: 'mai eseguito' });
+});
+router.post('/selftest', async (_req: Request, res: Response) => {
+  try { res.json(await runSelfCheck()); }
+  catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Posta in arrivo (IMAP, sola lettura) ────────────────────────────────────
+// Import LAZY del modulo email: imapflow resta fuori dal percorso di caricamento
+// critico; se manca o fallisce, queste rotte rispondono errore ma il resto vive.
+router.get('/emails', async (req: Request, res: Response) => {
+  try {
+    const m = await import('./email.js');
+    const limit = parseInt(String(req.query.limit || '100'), 10) || 100;
+    const category = req.query.category ? String(req.query.category) : undefined;
+    res.json({ emails: m.getRecentEmails(limit, category) });
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+router.get('/emails/status', async (_req: Request, res: Response) => {
+  try {
+    const m = await import('./email.js');
+    res.json(m.getEmailStatus());
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+router.post('/emails/:id/seen', async (req: Request, res: Response) => {
+  try {
+    const m = await import('./email.js');
+    m.markEmailSeen(parseInt(req.params.id, 10));
+    res.json({ ok: true });
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+// ─── Rubrica contatti (clienti / fornitori / ignorati) ───────────────────────
+// Fonte di verità per la classificazione email; collega in automatico un numero
+// WhatsApp per raffronto (nome) quando un contatto viene marcato cliente/fornitore.
+router.get('/contacts', async (req: Request, res: Response) => {
+  try {
+    const c = await import('./contacts.js');
+    const type = req.query.type ? String(req.query.type) as any : undefined;
+    res.json({ contacts: c.listContacts(type) });
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+// Aggiunta manuale (es. un intero dominio "@fornitoreX.it" come fornitore, senza
+// dover aspettare che arrivi un'email da smistare).
+router.post('/contacts', async (req: Request, res: Response) => {
+  try {
+    const c = await import('./contacts.js');
+    const { value, name, type } = req.body || {};
+    if (!value) return res.status(400).json({ error: 'value richiesto' });
+    const t = type === 'fornitore' || type === 'ignorato' || type === 'cgt' ? type : 'cliente';
+    c.setContactType(String(value), name ? String(name) : undefined, t);
+    res.json({ ok: true, contacts: c.listContacts() });
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+router.get('/contacts/:value/profile', async (req: Request, res: Response) => {
+  try {
+    const c = await import('./contacts.js');
+    const profile = c.getContactProfile(decodeURIComponent(req.params.value));
+    if (!profile) return res.status(404).json({ error: 'contatto non trovato' });
+    res.json(profile);
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+router.patch('/contacts/:value', async (req: Request, res: Response) => {
+  try {
+    const c = await import('./contacts.js');
+    const { phone } = req.body || {};
+    c.setContactPhone(decodeURIComponent(req.params.value), phone ? String(phone) : null);
+    res.json({ ok: true });
+  } catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+router.delete('/contacts/:value', async (req: Request, res: Response) => {
+  try { const c = await import('./contacts.js'); c.removeContact(decodeURIComponent(req.params.value)); res.json({ ok: true, contacts: c.listContacts() }); }
+  catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+// Alias compatibili con la UI email esistente (whitelist clienti / blacklist ignorati).
+router.get('/emails/clients', async (_req: Request, res: Response) => {
+  try { const c = await import('./contacts.js'); res.json({ clients: c.listContacts('cliente') }); }
+  catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+router.get('/emails/fornitori', async (_req: Request, res: Response) => {
+  try { const c = await import('./contacts.js'); res.json({ fornitori: c.listContacts('fornitore') }); }
+  catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+router.get('/emails/ignored', async (_req: Request, res: Response) => {
+  try { const c = await import('./contacts.js'); res.json({ ignored: c.listContacts('ignorato') }); }
+  catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+// Segna una email (e il suo mittente) come cliente / fornitore / non-cliente:
+// aggiorna la rubrica (con raffronto WhatsApp) e riclassifica le email di quel mittente.
+router.post('/emails/:id/mark-client', async (req: Request, res: Response) => {
+  try { const m = await import('./email.js'); res.json({ ok: m.markEmailAsClient(parseInt(req.params.id, 10)) }); }
+  catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+router.post('/emails/:id/mark-fornitore', async (req: Request, res: Response) => {
+  try { const m = await import('./email.js'); res.json({ ok: m.markEmailAsFornitore(parseInt(req.params.id, 10)) }); }
+  catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+router.post('/emails/:id/mark-not-client', async (req: Request, res: Response) => {
+  try { const m = await import('./email.js'); res.json({ ok: m.markEmailAsNotClient(parseInt(req.params.id, 10)) }); }
+  catch (e: any) { res.status(500).json({ error: e.message }); }
+});
+// Commissione Tributaria / Corte di Giustizia Tributaria: da ricollegare a un procedimento
+// anche quando l'email non arriva via PEC (mai lavoro, mai auto-risposta).
+router.post('/emails/:id/mark-cgt', async (req: Request, res: Response) => {
+  try { const m = await import('./email.js'); res.json({ ok: m.markEmailAsCGT(parseInt(req.params.id, 10)) }); }
+  catch (e: any) { res.status(500).json({ error: e.message }); }
 });
 
 // ─── Debug ───────────────────────────────────────────────────────────────────
@@ -292,6 +418,7 @@ router.get('/conversations/:phone/messages', (req: Request, res: Response) => {
         is_audio as isAudio, audio_url as audioUrl,
         is_image as isImage, image_url as imageUrl, caption,
         original_content as originalContent, detected_language as detectedLanguage,
+        transcription, transcription_status as transcriptionStatus,
         created_at as createdAt
       FROM live_messages
       WHERE phone = ?
@@ -307,6 +434,29 @@ router.get('/conversations/:phone/messages', (req: Request, res: Response) => {
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// ─── Ri-trascrizione vocale (retry/backfill, IDEMPOTENTE) ────────────────────
+// Ritrascrive un singolo messaggio audio. Idempotente: se già trascritto ('ok')
+// non ripete la chiamata STT. Utile per recuperare i vocali con stato failed/empty
+// o quelli antecedenti all'introduzione del campo dedicato. Nessun invio ai clienti.
+router.post('/bot/transcribe/:id', async (req: Request, res: Response) => {
+  try {
+    const id = parseInt(String(req.params.id), 10);
+    const m = db.prepare(`SELECT id, audio_url, is_audio, transcription_status FROM live_messages WHERE id = ?`).get(id) as any;
+    if (!m) return res.status(404).json({ error: 'Messaggio non trovato' });
+    if (!m.is_audio || !m.audio_url) return res.status(400).json({ error: 'Il messaggio non è un vocale o manca l\'URL audio' });
+    if (m.transcription_status === 'ok') return res.json({ id, skipped: true, reason: 'già trascritto', status: 'ok' });
+    const { transcribeAudioUrl } = await import('./transcription.js');
+    const tr = await transcribeAudioUrl(m.audio_url, process.env.DEEPGRAM_API_KEY);
+    if (tr.transcript) {
+      db.prepare(`UPDATE live_messages SET transcription = ?, transcription_status = 'ok', content = ? WHERE id = ?`)
+        .run(tr.transcript, `🎤 ${tr.transcript}`, id);
+    } else {
+      db.prepare(`UPDATE live_messages SET transcription_status = ? WHERE id = ?`).run(tr.status, id);
+    }
+    res.json({ id, status: tr.status, transcript: tr.transcript });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
 // Log globale messaggi (ricevuti + inviati) per l'agenda del cruscotto.
@@ -553,6 +703,10 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
     const messageId = body.messageId || body.id || `wh_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
     const isGroup = body.isGroup === true || (phone && phone.includes('@g.us'));
     const fromMe = body.fromMe === true;
+    // Il NUMERO DI CONTROLLO (es. con AI auto-risposta) è solo un canale di notifica:
+    // i suoi messaggi in arrivo NON vanno trattati come cliente (niente integrazioni,
+    // niente bozze, niente auto-reply) → evita eventi/Notion fantasma e loop.
+    const isControl = !!phone && phone.replace(/\D/g, '') === getControlNumber();
     const msgType = (body.type || '').toLowerCase();
     // Riconoscimento audio: tipo OPPURE presenza del campo body.audio
     const audioUrl = body.audio?.audioUrl || body.audio?.url || body.audio?.mediaUrl || null;
@@ -581,41 +735,38 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
     else if (isAudio) content = '[Messaggio vocale 🎤]';
     else content = text || '';
 
-    // Trascrizione Deepgram (richiede DEEPGRAM_API_KEY env var)
-    const deepgramKey = process.env.DEEPGRAM_API_KEY;
-    if (isAudio && audioUrl && deepgramKey) {
+    // Lettura automatica del documento (rev. 01/07/2026): prima il bot vedeva solo un
+    // segnaposto "[Immagine]" e rispondeva in modo generico. Ora analizza la foto (tipo di
+    // documento, mittente/ente, riferimenti visibili) così la risposta può essere pertinente
+    // a quanto ricevuto. Isolato: se l'analisi fallisce, resta il segnaposto testuale.
+    if (isImage && imageUrl && !fromMe) {
       try {
-        // Scarica audio
-        const audioResp = await fetch(audioUrl);
-        const audioBuffer = await audioResp.arrayBuffer();
-        // Invia a Deepgram nova-2 forzando l'italiano: detect_language sbagliava
-        // sui vocali brevi/rumorosi e produceva trascrizioni in inglese
-        const dgResp = await fetch(
-          'https://api.deepgram.com/v1/listen?model=nova-2&language=it&punctuate=true&smart_format=true',
-          {
-            method: 'POST',
-            headers: {
-              'Authorization': `Token ${deepgramKey}`,
-              'Content-Type': 'audio/ogg; codecs=opus',
-            },
-            body: audioBuffer,
-          }
-        );
-        if (dgResp.ok) {
-          const dgData = await dgResp.json() as any;
-          const transcript = dgData?.results?.channels?.[0]?.alternatives?.[0]?.transcript?.trim();
-          if (transcript) {
-            content = `🎤 ${transcript}`;
-            console.log(`[Deepgram] Trascritto: ${transcript.substring(0, 80)}`);
-          } else {
-            console.log('[Deepgram] Audio ricevuto ma trascrizione vuota (silenzio o rumore)');
-          }
-        } else {
-          const errText = await dgResp.text();
-          console.error('[Deepgram] Errore API:', dgResp.status, errText.substring(0, 100));
+        const { analyzeImageUrl } = await import('./docvision.js');
+        const desc = await analyzeImageUrl(imageUrl);
+        if (desc) {
+          content = `📄 Documento ricevuto${caption ? ` (didascalia cliente: "${caption}")` : ''} — analisi automatica: ${desc}`;
         }
-      } catch (e) {
-        console.error('[Deepgram] Error:', e);
+      } catch (e: any) {
+        console.error('[DocVision] webhook immagine:', e.message);
+      }
+    }
+
+    // ─── Trascrizione vocali (Deepgram nova-2, italiano) — rev. 11/07/2026 ─────
+    // SOLO lettura/visualizzazione: NON innesca alcun auto-invio (l'invariante resta
+    // in server/autosend.ts). Salvata in campo DEDICATO `transcription` + stato; il
+    // `content` mantiene il prefisso 🎤 per la lettura del bot e la compatibilità UI.
+    let transcription: string | null = null;
+    let transcriptionStatus: string | null = null;
+    if (isAudio && audioUrl) {
+      const { transcribeAudioUrl } = await import('./transcription.js');
+      const tr = await transcribeAudioUrl(audioUrl, process.env.DEEPGRAM_API_KEY);
+      transcriptionStatus = tr.status;
+      if (tr.transcript) {
+        transcription = tr.transcript;
+        content = `🎤 ${tr.transcript}`;
+        console.log(`[Deepgram] Trascritto (${phone}): ${tr.transcript.substring(0, 80)}`);
+      } else {
+        console.log(`[Deepgram] Nessuna trascrizione (${transcriptionStatus}) per ${phone}`);
       }
     }
 
@@ -650,14 +801,40 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
     const timestamp = new Date(momment).toISOString();
     const now = new Date().toISOString();
 
+    // ─── DEDUP eco fromMe (fix doppio log, rev. 03/07) ────────────────────────
+    // Con notifySentByMe:true Z-API rinvia al webhook anche i messaggi inviati da
+    // noi (fromMe). Ogni risposta del BOT veniva quindi loggata DUE volte: la riga
+    // locale `bot_...` (creata al momento dell'invio) + l'eco Z-API con messageId
+    // esatto. NON è doppia consegna (l'invio è uno solo), ma doppia RIGA. Se l'eco
+    // corrisponde a un invio bot già loggato di recente, non la re-inseriamo.
+    // Le risposte MANUALI di Mariano dal telefono NON hanno una riga `bot_` gemella
+    // → non vengono deduplicate (restano tracciate, come da regola #10).
+    if (fromMe && content && content.trim()) {
+      const since = new Date(Date.now() - 180000).toISOString();
+      const echoOf = db.prepare(
+        `SELECT id FROM live_messages
+           WHERE phone = ? AND direction = 'sent' AND message_id LIKE 'bot_%'
+             AND TRIM(content) = TRIM(?) AND created_at >= ? LIMIT 1`
+      ).get(phone, content, since) as any;
+      if (echoOf) {
+        // Non re-inserire la riga, ma tieni allineato il conteggio invii della
+        // conversazione (che prima veniva incrementato proprio dall'eco).
+        db.prepare(
+          `UPDATE conversations SET last_message = ?, last_message_at = ?, total_sent = total_sent + 1 WHERE phone = ?`
+        ).run(content, new Date(momment).toISOString(), phone);
+        console.log(`[Webhook] Eco fromMe deduplicata per ${phone} (invio bot già loggato #${echoOf.id}).`);
+        return res.json({ ok: true, deduped: true });
+      }
+    }
+
     // Save message
     const groupName = isGroup ? (body.groupName || body.name || phone) : null;
     const effectiveSenderName = isGroup ? (senderName || body.participantPhone || phone) : (senderName || phone);
     db.prepare(`
       INSERT OR IGNORE INTO live_messages 
-        (message_id, phone, contact_name, content, direction, timestamp, is_read, is_audio, audio_url, is_image, image_url, caption, original_content, detected_language, is_group, sender_name, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(messageId, phone, groupName || effectiveSenderName, content, direction, timestamp, fromMe ? 1 : 0, isAudio ? 1 : 0, audioUrl, isImage ? 1 : 0, imageUrl, caption || null, originalContent, detectedLanguage, isGroup ? 1 : 0, effectiveSenderName, now);
+        (message_id, phone, contact_name, content, direction, timestamp, is_read, is_audio, audio_url, is_image, image_url, caption, original_content, detected_language, transcription, transcription_status, is_group, sender_name, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(messageId, phone, groupName || effectiveSenderName, content, direction, timestamp, fromMe ? 1 : 0, isAudio ? 1 : 0, audioUrl, isImage ? 1 : 0, imageUrl, caption || null, originalContent, detectedLanguage, transcription, transcriptionStatus, isGroup ? 1 : 0, effectiveSenderName, now);
 
     // Upsert conversation
     const convName = isGroup ? (body.groupName || body.name || phone) : (senderName || phone);
@@ -681,7 +858,7 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
     // Auto-reply: prima le regole keyword (progetto iniziale), poi il messaggio
     // fisso per conversazione come fallback. Entrambe scattano SOLO se il
     // contatto ha l'auto-risposta attiva (auto_reply_enabled).
-    if (!fromMe) {
+    if (!fromMe && !isControl) {
       const conv = db.prepare(`SELECT auto_reply_enabled, auto_reply_message FROM conversations WHERE phone = ?`).get(phone) as any;
       if (conv?.auto_reply_enabled) {
         let replyText: string | null = null;
@@ -742,7 +919,7 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
     });
 
     // ─── INTEGRAZIONI AUTOMATICHE (async, non bloccante) ────────────────────
-    if (!fromMe && !isGroup && content && content.trim().length > 2) {
+    if (!fromMe && !isGroup && !isControl && content && content.trim().length > 2) {
       setImmediate(async () => {
         try {
           const intEnabled = db.prepare(`SELECT value FROM app_settings WHERE key = 'integrations_enabled'`).get() as any;
@@ -830,11 +1007,11 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
       }
     }
 
-    if (!fromMe && !isGroup && content && content.trim().length > 2 && isBotEnabled()) {
+    if (!fromMe && !isGroup && !isControl && content && content.trim().length > 2 && isBotEnabled()) {
       setImmediate(async () => {
         try {
           // Mai generare bozze per il numero di controllo (Mariano stesso).
-          if (phone === getControlNumber()) return;
+          if (isControl || phone === getControlNumber()) return;
           const c = db.prepare(`SELECT contact_name, priority FROM conversations WHERE phone = ?`).get(phone) as any;
           const pr = (c?.priority || 'none');
           if (pr === 'vip' || pr === 'high') return; // viplist → gestisce Mariano
@@ -846,33 +1023,69 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
             // riporta. Inviamo però un breve messaggio di cortesia (impegnato, ricontatto),
             // auto e al massimo 1 volta al giorno per contatto, se il modello l'ha prodotto.
             recordClassification(messageId, phone, day, 'personal');
-            if (outcome.result?.draftText && !courtesySentToday(phone)) {
-              const id = saveDraft({ phone, contactName: cName, incoming: content, result: outcome.result });
-              const r = await approveDraftCore(id, { force: true });
-              if (r.ok) markCourtesySent(phone);
-              broadcastEvent('bot_draft', { id, phone, contactName: cName, needsHuman: false, autoSent: r.ok, personal: true });
-              console.log(`[Chatbot] Cortesia (non-lavoro) ${r.ok ? 'inviata' : 'NON inviata'} a ${cName} (${phone})`);
+            // Messaggio di cortesia auto SOLO se autoSend è attivo. Con autoSend OFF
+            // (default) il bot NON scrive nulla di propria iniziativa ai clienti.
+            if (isAutoSendEnabled() && outcome.result?.draftText && !courtesySentToday(phone)) {
+              // Guardrail anche sulla cortesia: se il testo non è sicuro, non inviarlo.
+              const sanC = sanitizeReply(outcome.result.draftText);
+              if (!sanC.safe) {
+                console.warn(`[Sanitizer] Cortesia per ${cName} (${phone}) non isolabile in sicurezza → NON inviata.`);
+              } else {
+                if (sanC.changed) outcome.result.draftText = sanC.clean;
+                const id = saveDraft({ phone, contactName: cName, incoming: content, result: outcome.result });
+                const r = await approveDraftCore(id, { force: true });
+                if (r.ok) { markCourtesySent(phone); recordBotSend({ phone, contactName: cName, kind: 'courtesy', draftId: id, text: outcome.result.draftText }); }
+                broadcastEvent('bot_draft', { id, phone, contactName: cName, needsHuman: false, autoSent: r.ok, personal: true });
+                console.log(`[Chatbot] Cortesia (non-lavoro) ${r.ok ? 'inviata' : 'NON inviata'} a ${cName} (${phone})`);
+              }
             } else {
-              console.log(`[Chatbot] Messaggio personale — ${cName} (${phone}) (cortesia già inviata oggi o assente)`);
+              console.log(`[Chatbot] Messaggio personale — ${cName} (${phone}) (nessun invio: autoSend off o cortesia già inviata)`);
             }
           } else if (outcome?.kind === 'work' && outcome.result) {
             recordClassification(messageId, phone, day, 'work');
             const res = outcome.result;
+            // ─── GUARDRAIL anti-leak ragionamento/nome-tool (problema 1, rev. 03/07) ───
+            // Prima di QUALSIASI auto-invio, ripulisci il testo: se il modello ha lasciato
+            // un preambolo di ragionamento o un nome di strumento interno, va rimosso. Se
+            // il testo-cliente NON è isolabile in sicurezza, NON si auto-invia: la risposta
+            // resta BOZZA needs_human (revisione dal Cruscotto) — comportamento di sicurezza
+            // preferito visto che l'auto-invio è ON.
+            const wouldAutoSend = (!!res.appointmentFlow && !res.needsHuman && isAutoAppointmentsEnabled())
+              || (isAutoSendEnabled() && !res.needsHuman);
+            let sanitizerDiverted = false;
+            const san = sanitizeReply(res.draftText);
+            if (!san.safe) {
+              if (wouldAutoSend) { res.needsHuman = true; sanitizerDiverted = true; }
+              console.warn(`[Sanitizer] ${cName} (${phone}): testo NON isolabile in sicurezza (rimossi=${san.removed.length}, tool residuo=${san.residualTool}) → ${wouldAutoSend ? 'deviato a BOZZA needs_human, testo grezzo NON inviato' : 'resta bozza da revisionare'}.`);
+            } else if (san.changed) {
+              res.draftText = san.clean;
+              console.warn(`[Sanitizer] ${cName} (${phone}): rimosso preambolo di ragionamento (${san.removed.length} blocco/i) prima dell'invio.`);
+            }
             const id = saveDraft({ phone, contactName: cName, incoming: content, result: res });
-            // Gli APPUNTAMENTI li gestisce il bot in autonomia: se la risposta nasce dal
-            // flusso agenda (disponibilità/proposta/conferma) e NON è un caso urgente, parte
-            // subito senza approvazione (get_availability ha già incrociato l'agenda). Le
-            // altre risposte di merito restano bozza per la revisione, salvo autoSend globale.
-            const isUrgent = res.needsHuman;
-            const autonomousAppt = !!res.appointmentFlow && !isUrgent;
-            const globalAuto = isAutoSendEnabled() && !isUrgent;
-            if (autonomousAppt || globalAuto) {
-              // Appuntamento autonomo: NON forzare, così l'agenda viene ricontrollata e non si
-              // sovrappone a un evento già presente. autoSend globale: comportamento legacy.
-              const r = await approveDraftCore(id, { force: globalAuto && !autonomousAppt });
+            // APPUNTAMENTI in autonomia: il flusso agenda (proposta/conferma/spostamento)
+            // parte da solo DOPO aver incrociato Google Calendar — automatismo voluto e
+            // circoscritto, governato da isAutoAppointmentsEnabled (default ON). Le altre
+            // risposte di merito restano BOZZA salvo autoSend globale (lucchettato). Le
+            // urgenze (need_human) non partono mai da sole.
+            // ─── DECISIONE AUTO-INVIO (rev. 03/07, post-incidente 06/07) ──────────────
+            // In AUTONOMIA parte SOLO il flusso APPUNTAMENTI (agenda già incrociata).
+            // OGNI risposta di MERITO e OGNI URGENZA restano BOZZA. Nel dubbio → BOZZA.
+            // Rimosso il vecchio auto-invio generale del merito (`globalAuto`/bot_auto_send):
+            // causava invii non voluti. Logica in server/autosend.ts (pura, testata).
+            const decision = decideWorkAutoSend({
+              appointmentFlow: !!res.appointmentFlow,
+              needsHuman: !!res.needsHuman,
+              autoApptEnabled: isAutoAppointmentsEnabled(),
+              sanitizerDiverted,
+            });
+            if (decision === 'appointment-auto') {
+              // Appuntamento autonomo: NON forzare (l'agenda viene ricontrollata in
+              // approveDraftCore → niente sovrapposizioni sugli slot).
+              const r = await approveDraftCore(id, { force: false });
               if (r.ok) {
+                recordBotSend({ phone, contactName: cName, kind: 'appointment', draftId: id, text: res.draftText });
                 broadcastEvent('bot_draft', { id, phone, contactName: cName, needsHuman: false, autoSent: true });
-                console.log(`[Chatbot] ${autonomousAppt ? 'Appuntamento autonomo' : 'Auto-risposta'} a ${cName} (${phone})${r.hadEvent ? ' + appuntamento DA CONFERMARE' : ''}`);
+                console.log(`[Chatbot] Appuntamento autonomo a ${cName} (${phone})${r.hadEvent ? ' + appuntamento DA CONFERMARE' : ''}`);
               } else if (r.conflict) {
                 // Slot occupatosi tra la proposta e l'invio: lascia la bozza in attesa nel Cruscotto.
                 broadcastEvent('bot_draft', { id, phone, contactName: cName, needsHuman: false, conflict: true });
@@ -1253,18 +1466,31 @@ router.get('/bot/drafts', (_req: Request, res: Response) => {
 });
 
 router.get('/bot/config', (_req: Request, res: Response) => {
-  res.json({ enabled: isBotEnabled(), model: getBotModel(), notifyMode: getNotifyMode(), controlNumber: getControlNumber(), autoSend: isAutoSendEnabled() });
+  res.json({ enabled: isBotEnabled(), model: getBotModel(), notifyMode: getNotifyMode(), controlNumber: getControlNumber(), autoSend: isAutoSendEnabled(), waCommands: waCommandsEnabled() });
 });
 
 router.post('/bot/config', (req: Request, res: Response) => {
   try {
     const { enabled, model, notifyMode, controlNumber, autoSend } = req.body || {};
     if (enabled !== undefined) setBotSetting('bot_enabled', enabled ? '1' : '0');
-    if (autoSend !== undefined) setBotSetting('bot_auto_send', autoSend ? '1' : '0');
+    // BLINDATURA: l'auto-invio si può attivare SOLO se l'env BOT_ALLOW_AUTOSEND=1
+    // è presente su Railway. Una richiesta che prova ad accenderlo senza il lucchetto
+    // viene ignorata (resta '0') e segnalata, così l'interfaccia non illude.
+    let autoSendRejected = false;
+    if (autoSend !== undefined) {
+      if (autoSend && process.env.BOT_ALLOW_AUTOSEND !== '1') {
+        autoSendRejected = true;
+        setBotSetting('bot_auto_send', '0');
+      } else {
+        setBotSetting('bot_auto_send', autoSend ? '1' : '0');
+      }
+    }
     if (model) setBotSetting('bot_model', String(model));
     if (notifyMode && ['off', 'outside_hours', 'always'].includes(notifyMode)) setBotSetting('notify_mode', notifyMode);
     if (controlNumber) setBotSetting('control_number', String(controlNumber).replace(/\D/g, ''));
-    res.json({ enabled: isBotEnabled(), model: getBotModel(), notifyMode: getNotifyMode(), controlNumber: getControlNumber(), autoSend: isAutoSendEnabled() });
+    const { waCommands } = req.body || {};
+    if (waCommands !== undefined) setBotSetting('wa_commands', waCommands ? '1' : '0');
+    res.json({ enabled: isBotEnabled(), model: getBotModel(), notifyMode: getNotifyMode(), controlNumber: getControlNumber(), autoSend: isAutoSendEnabled(), waCommands: waCommandsEnabled(), ...(autoSendRejected ? { autoSendRejected: true, reason: 'autoSend bloccato: imposta BOT_ALLOW_AUTOSEND=1 su Railway per abilitarlo' } : {}) });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -1330,6 +1556,219 @@ router.post('/bot/appointments/:id/cancel', async (req: Request, res: Response) 
     console.error('[Bot appointment cancel] Error:', err);
     res.status(500).json({ error: err.message });
   }
+});
+
+// ─── Lista d'attesa + job promemoria/SLA (v2.10) ─────────────────────────────
+router.get('/bot/waitlist', (req: Request, res: Response) => {
+  try {
+    const status = req.query.status ? String(req.query.status) : undefined;
+    res.json(getWaitlist(status));
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+router.post('/bot/waitlist/:id/close', (req: Request, res: Response) => {
+  try {
+    closeWaitlistEntry(parseInt(req.params.id, 10));
+    res.json({ success: true });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+router.get('/bot/reminders/status', (_req: Request, res: Response) => {
+  try { res.json(getRemindersStatus()); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// Trigger manuale dei job (diagnostica / recupero): forza fuori dalle finestre orarie.
+router.post('/bot/jobs/:job/run', async (req: Request, res: Response) => {
+  try {
+    const job = String(req.params.job);
+    if (job === 'reminders') return res.json(await runReminders(true));
+    if (job === 'waitlist') return res.json(await runWaitlistRecall(true));
+    if (job === 'sla') return res.json(await runSlaCheck(true));
+    if (job === 'aging') return res.json(await runDraftAging(true));
+    if (job === 'cleanup') return res.json(await runAppointmentCleanup(true));
+    if (job === 'briefing') return res.json(await runMorningBriefing(true));
+    if (job === 'deadlines') return res.json(await runDeadlineReminders(true));
+    res.status(400).json({ error: `Job sconosciuto: ${job} (validi: reminders, waitlist, sla, aging, cleanup, briefing, deadlines)` });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── AGING BOZZE: vista prioritaria (sola lettura, nessun invio) ─────────────
+router.get('/bot/drafts/aging', (_req: Request, res: Response) => {
+  try { res.json(getAgingView()); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── BRIEFING DEL MATTINO: anteprima (sola lettura, NESSUN invio) ────────────
+// Compone il briefing e lo restituisce SENZA inviarlo. L'invio reale avviene solo
+// dal job giornaliero (7–9) verso il numero di controllo di Mariano, mai ai clienti.
+router.get('/bot/briefing', (_req: Request, res: Response) => {
+  try {
+    const data = getBriefingData();
+    const { text, empty } = composeBriefing(data);
+    res.json({ preview: text, empty, data });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── SMS (scaffold): stato configurazione. OFF finché SMS_PROVIDER non è impostato ──
+router.get('/bot/sms/status', (_req: Request, res: Response) => {
+  try { res.json(smsStatus()); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── MONITORAGGIO: stato consolidato + check manuale (nessun invio ai clienti) ──
+router.get('/bot/monitor', (_req: Request, res: Response) => {
+  try { res.json(getMonitorStatus()); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+router.post('/bot/monitor/check', async (_req: Request, res: Response) => {
+  try { res.json(await runMonitoring(true)); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── SCADENZARIO ADEMPIMENTI (promemoria SOLO interni; nessun invio ai clienti) ──
+router.post('/bot/deadlines', (req: Request, res: Response) => {
+  try {
+    const { clientKey, contactName, tipo, description, dueDate } = req.body || {};
+    if (!dueDate || !/^\d{4}-\d{2}-\d{2}$/.test(String(dueDate))) return res.status(400).json({ error: 'dueDate (YYYY-MM-DD) richiesta' });
+    const id = createDeadline({ clientKey, contactName, tipo, description, dueDate: String(dueDate) });
+    res.json({ ok: true, id });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+router.get('/bot/deadlines', (req: Request, res: Response) => {
+  try {
+    if (req.query.imminent) {
+      const todayISO = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Rome' }).format(new Date());
+      return res.json(getImminentDeadlines(todayISO, parseInt(String(req.query.imminent), 10) || 7));
+    }
+    res.json(listDeadlines({ status: req.query.status ? String(req.query.status) : undefined, client: req.query.client ? String(req.query.client) : undefined }));
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+router.post('/bot/deadlines/:id/complete', (req: Request, res: Response) => {
+  try { res.json({ ok: completeDeadline(parseInt(String(req.params.id), 10)) }); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+router.delete('/bot/deadlines/:id', (req: Request, res: Response) => {
+  try { res.json({ ok: deleteDeadline(parseInt(String(req.params.id), 10)) }); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── PRATICHE: checklist documenti (richiesta al cliente SEMPRE come BOZZA) ──
+router.post('/bot/practices/checklist', (req: Request, res: Response) => {
+  try {
+    const { clientKey, pratica, docs, contactName, fascicolo } = req.body || {};
+    if (!clientKey || !pratica || !Array.isArray(docs) || !docs.length) {
+      return res.status(400).json({ error: 'clientKey, pratica e docs[] richiesti' });
+    }
+    const ids = createChecklist(String(clientKey), String(pratica), docs, { contactName, fascicolo });
+    res.json({ ok: true, ids, count: ids.length });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+router.get('/bot/practices/checklist', (req: Request, res: Response) => {
+  try {
+    const client = req.query.client ? String(req.query.client) : undefined;
+    const pratica = req.query.pratica ? String(req.query.pratica) : undefined;
+    if (client && !pratica) return res.json(getChecklistGrouped(client));
+    res.json(getChecklist(client, pratica));
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+router.post('/bot/practices/checklist/:id/received', (req: Request, res: Response) => {
+  try { res.json({ ok: markDocReceived(parseInt(String(req.params.id), 10)) }); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+// Genera la richiesta documenti mancanti come BOZZA (mai auto-inviata). WhatsApp (phone)
+// → bozza WhatsApp; email:<addr> → bozza email. L'invio parte solo dall'approvazione.
+router.post('/bot/practices/request-draft', (req: Request, res: Response) => {
+  try {
+    const { clientKey, pratica } = req.body || {};
+    if (!clientKey || !pratica) return res.status(400).json({ error: 'clientKey e pratica richiesti' });
+    const { text, missing, contactName } = buildDocRequestText(String(clientKey), String(pratica));
+    if (!missing.length) return res.json({ ok: true, draftId: null, note: 'Nessun documento mancante: niente da richiedere.' });
+    let draftId: number | null = null; let channel = 'whatsapp';
+    const key = String(clientKey);
+    if (key.startsWith('email:')) {
+      channel = 'email';
+      draftId = saveEmailDraft({ toAddr: key.slice(6), toName: contactName, subject: `Documenti pratica ${pratica}`, draftText: text, needsHuman: false });
+    } else {
+      draftId = saveDraft({ phone: key, contactName: contactName || key, incoming: `[richiesta documenti ${pratica}]`, result: { draftText: text, proposedEvent: null, needsHuman: false } });
+    }
+    res.json({ ok: true, draftId, channel, missing, preview: text });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── RIASSUNTO AI DI UNA CONVERSAZIONE (sola lettura interna, on-demand) ─────
+router.get('/bot/conversation/:phone/summary', async (req: Request, res: Response) => {
+  try {
+    const phone = String(req.params.phone).replace(/\D/g, '');
+    if (!phone) return res.status(400).json({ error: 'phone non valido' });
+    res.json(await summarizeConversation(phone));
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── AUDIT-LOG INVII AUTONOMI (sola lettura) ─────────────────────────────────
+// Elenca ogni messaggio inviato dal bot in AUTONOMIA (cortesia/appuntamento). Il
+// MERITO non viene mai auto-inviato → non compare qui: è la prova osservabile
+// dell'invariante. `?since=<ISO>&limit=N` · summary con conteggio per tipo.
+router.get('/bot/sent', (req: Request, res: Response) => {
+  try {
+    const since = (req.query.since as string) || undefined;
+    const limit = parseInt((req.query.limit as string) || '200', 10);
+    res.json({ summary: getSentLogSummary(since), items: getSentLog(since, limit) });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── EMAIL: coda BOZZE (invariante) + audit-log invii ────────────────────────
+// Le risposte di merito/urgenza via email ora restano BOZZA (email_drafts) come su WhatsApp.
+router.get('/email/drafts', (req: Request, res: Response) => {
+  try { res.json(getEmailDrafts(String(req.query.status || 'pending'))); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+router.post('/email/drafts/:id/approve', async (req: Request, res: Response) => {
+  try {
+    const r = await approveEmailDraft(parseInt(String(req.params.id), 10), { text: req.body?.text });
+    res.status(r.ok ? 200 : r.status).json(r);
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+router.post('/email/drafts/:id/reject', (req: Request, res: Response) => {
+  try {
+    const ok = rejectEmailDraft(parseInt(String(req.params.id), 10));
+    res.status(ok ? 200 : 404).json({ ok });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+// Audit-log invii email (sola lettura): kind 'appointment' (autonomo) | 'reply-approved' (approvato a mano).
+// Il merito NON parte mai da solo → non comparirà mai come autonomo.
+router.get('/email/sent', (req: Request, res: Response) => {
+  try {
+    const since = (req.query.since as string) || undefined;
+    const limit = parseInt((req.query.limit as string) || '200', 10);
+    res.json({ summary: getEmailSentSummary(since), items: getEmailSentLog(since, limit) });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── AGENDA: esito appuntamento (no-show) — sola gestione, nessun invio ──────
+router.get('/bot/appointments/pending-outcome', (_req: Request, res: Response) => {
+  try {
+    const todayISO = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Rome' }).format(new Date());
+    const rows = getAllAppointments().map((r: any) => ({ id: r.id, date: r.date, status: r.status, outcome: r.outcome, contact_name: r.contact_name, phone: r.phone, start: r.start, reason: r.reason }));
+    res.json(selectPendingOutcome(rows, todayISO));
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+router.post('/bot/appointments/:id/outcome', (req: Request, res: Response) => {
+  try {
+    const id = parseInt(String(req.params.id), 10);
+    const outcome = String(req.body?.outcome || '');
+    if (!isValidOutcome(outcome)) return res.status(400).json({ error: 'outcome non valido (tenuto | no_show | annullato)' });
+    const appt = getAppointmentRow(id);
+    if (!appt) return res.status(404).json({ error: 'Appuntamento non trovato' });
+    const ok = setAppointmentOutcome(id, outcome);
+    // Follow-up NO-SHOW: crea una BOZZA WhatsApp (mai auto-inviata) da rivedere.
+    let draftId: number | null = null;
+    if (ok && outcome === 'no_show' && appt.phone) {
+      const testo = `Gentile ${appt.contact_name || ''}, non l'abbiamo vista all'appuntamento del ${appt.date}. Se desidera, possiamo riprogrammarlo: ci faccia sapere la sua disponibilità.\n\nPer qualsiasi necessità può chiamare lo 0909797187 negli orari di segreteria.\nAssistente Virtuale — Studio Tributario Branca`;
+      draftId = saveDraft({ phone: appt.phone, contactName: appt.contact_name || appt.phone, incoming: `[no-show ${appt.date}]`, result: { draftText: testo, proposedEvent: null, needsHuman: false } });
+    }
+    res.json({ ok, id, outcome, followupDraftId: draftId });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
 // ─── MANUTENZIONE: digest giornaliero + watchdog flusso ──────────────────────

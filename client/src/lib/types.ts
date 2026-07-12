@@ -12,6 +12,7 @@ export interface Conversation {
   isArchived: number;
   priority: 'none' | 'normal' | 'high' | 'vip';
   priorityLabel: string | null;
+  isGroup?: number;
   createdAt: string;
 }
 
@@ -31,6 +32,8 @@ export interface Message {
   caption: string | null;
   originalContent: string | null;
   detectedLanguage: string | null;
+  transcription?: string | null;
+  transcriptionStatus?: string | null;
   createdAt: string;
 }
 

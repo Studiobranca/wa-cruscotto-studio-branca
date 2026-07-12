@@ -2,15 +2,35 @@
  * Disponibilità appuntamenti — Studio Tributario Branca
  *
  * Calcola gli slot liberi incrociando l'orario studio con Google Calendar
- * (freeBusy). Regole fisse concordate (ricevimento Dott. Branca, salvo appuntamenti):
+ * (freeBusy). Calendario ricevimento Dott. Branca (salvo appuntamenti):
+ *  ── ORARIO STANDARD (fino al 9 luglio 2026 e da settembre 2026) ──
  *  - lun, mar, gio: 9:00–18:00 a orario continuato
  *  - mer, ven: 9:00–13:00 (solo mattina)
- *  - ESCLUSI: sabato, domenica
- *  - ESCLUSE: feste comandate italiane (incl. lunedì dell'Angelo)
- *  - ESCLUSA: chiusura estiva 20 luglio – 31 agosto (ogni anno)
+ *  ── ORARIO ESTIVO 2026 (date esatte comunicate dallo Studio) ──
+ *  - 10–25 luglio 2026: ORARIO UNICO 9:00–14:00 tutti i feriali
+ *  - 26 luglio – 31 agosto 2026: CHIUSO, NESSUN appuntamento
+ *  - 1–30 settembre 2026: torna all'orario STANDARD
+ *  - da ottobre 2026: DA RIDETERMINARE → per ora usa lo STANDARD (fallback)
+ *  ── SEMPRE esclusi ──
+ *  - sabato, domenica; feste comandate italiane (incl. lunedì dell'Angelo)
  */
 
 const TZ = 'Europe/Rome';
+
+// Periodi 2026 a date esatte (override sullo standard). ATTENZIONE: lo Studio
+// rideterminerà ottobre 2026 → finché non arriva, ottobre+ usa lo standard.
+const ESTIVO_UNICO_DA = '2026-07-10';   // incluso
+const ESTIVO_UNICO_A = '2026-07-25';    // incluso → 9–14 ogni feriale
+const CHIUSURA_DA = '2026-07-26';       // incluso
+const CHIUSURA_A = '2026-08-31';        // incluso → niente appuntamenti
+
+// Finestra di apertura del giorno (ore intere) o null se CHIUSO. dow: 0=dom..6=sab.
+function openWindow(ds: string, dow: number): { start: number; last: number } | null {
+  if (ds >= ESTIVO_UNICO_DA && ds <= ESTIVO_UNICO_A) return { start: 9, last: 14 }; // orario unico estivo
+  if (ds >= CHIUSURA_DA && ds <= CHIUSURA_A) return null;                            // chiusura estiva
+  const fullDay = dow === 1 || dow === 2 || dow === 4;                              // standard
+  return { start: 9, last: fullDay ? 18 : 13 };
+}
 
 async function getGoogleAccessToken(): Promise<string | null> {
   const clientId = process.env.GOOGLE_CLIENT_ID;
@@ -57,22 +77,18 @@ function isHoliday(ds: string): boolean {
   return false;
 }
 
-function isSummerClosure(ds: string): boolean {
-  const md = ds.slice(5); // MM-DD
-  return md >= '07-20' && md <= '08-31';
-}
-
 interface Slot { date: string; start: string; end: string; dow: number; }
 
-// Slot teorici di un giorno secondo le regole studio (slot da 1 ora)
+// Slot teorici di un giorno secondo il calendario studio (slot da 1 ora).
 function daySlots(ds: string, dow: number): Slot[] {
   if (dow === 0 || dow === 6) return [];          // domenica, sabato
-  if (isHoliday(ds) || isSummerClosure(ds)) return [];
-  // Lun(1), Mar(2), Gio(4): orario continuato 9:00–18:00. Mer(3) e Ven(5): solo 9:00–13:00.
-  const fullDay = dow === 1 || dow === 2 || dow === 4;
-  const lastHour = fullDay ? 18 : 13;
+  if (isHoliday(ds)) return [];
+  const win = openWindow(ds, dow);                // null = chiuso (es. 26/7–31/8)
+  if (!win) return [];
   const out: Slot[] = [];
-  for (let h = 9; h < lastHour; h++) out.push({ date: ds, start: `${String(h).padStart(2, '0')}:00`, end: `${String(h + 1).padStart(2, '0')}:00`, dow });
+  for (let h = win.start; h < win.last; h++) {
+    out.push({ date: ds, start: `${String(h).padStart(2, '0')}:00`, end: `${String(h + 1).padStart(2, '0')}:00`, dow });
+  }
   return out;
 }
 
@@ -136,8 +152,9 @@ export async function getAvailability(days = 14): Promise<{ slots: Slot[]; calen
  * se nel frattempo è diventato impegnato. Ritorna { busy, checked }: se il
  * calendario non è verificabile (checked=false) NON si blocca l'approvazione.
  */
-export async function isSlotBusy(date: string, start: string, end: string): Promise<{ busy: boolean; checked: boolean }> {
+export async function isSlotBusy(date: string, start: string, end: string): Promise<{ busy: boolean; checked: boolean; error?: boolean }> {
   const token = await getGoogleAccessToken();
+  // Google NON configurato: non è un errore, semplicemente non verificabile (checked=false).
   if (!token) return { busy: false, checked: false };
   const off = romeOffset(date);
   try {
@@ -151,13 +168,16 @@ export async function isSlotBusy(date: string, start: string, end: string): Prom
         items: [{ id: process.env.GOOGLE_CALENDAR_ID || 'primary' }],
       }),
     });
-    if (!resp.ok) return { busy: false, checked: false };
+    // ERRORE di verifica (Google configurato ma non risponde): fail-safe anti-overbooking
+    // → segnala error, così il chiamante NON auto-conferma e lascia la bozza.
+    if (!resp.ok) { console.error('[Appuntamenti] isSlotBusy HTTP', resp.status); return { busy: false, checked: false, error: true }; }
     const data = await resp.json() as any;
     const cal = data.calendars?.[Object.keys(data.calendars || {})[0]];
     const busy = (cal?.busy || []).length > 0;
     return { busy, checked: true };
-  } catch {
-    return { busy: false, checked: false };
+  } catch (e: any) {
+    console.error('[Appuntamenti] isSlotBusy errore:', e?.message);
+    return { busy: false, checked: false, error: true };
   }
 }
 
@@ -177,4 +197,87 @@ export function formatAvailabilityIT(slots: Slot[], maxDays = 4, maxPerDay = 3):
     lines.push(`• ${DOW_IT[d[0].dow]} ${day} ${month}: ore ${hours}`);
   }
   return lines.join('\n');
+}
+
+/** Data in italiano (senza giorno della settimana), es. "3 luglio". */
+export function formatDateIT(ds: string): string {
+  const day = parseInt(ds.slice(8, 10), 10), month = MONTH_IT[parseInt(ds.slice(5, 7), 10) - 1];
+  return `${day} ${month}`;
+}
+
+export interface NowStatus {
+  isOpenNow: boolean;
+  freeNow: boolean;
+  appointmentsRemainingToday: number;
+  nextSlot: { date: string; start: string } | null;
+  calendarChecked: boolean;
+}
+
+/**
+ * Stato "adesso" per le richieste di passare SUBITO in studio (non un appuntamento
+ * futuro): lo studio è aperto in questo momento? Il Dott. Branca è libero ADESSO?
+ * Quanti impegni restano oggi prima che si liberi? Se lo studio è chiuso ora, qual è
+ * la prima data/ora utile? Sempre incrociato con l'orario REALE dello studio
+ * (openWindow/isHoliday, le stesse regole di getAvailability) e con Google Calendar.
+ */
+export async function getNowStatus(): Promise<NowStatus> {
+  const now = new Date();
+  const todayISO = new Intl.DateTimeFormat('en-CA', { timeZone: TZ }).format(now);
+  const wd = new Intl.DateTimeFormat('en-US', { timeZone: TZ, weekday: 'short' }).format(now);
+  const dow = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(wd);
+  const hour = parseInt(new Intl.DateTimeFormat('en-GB', { timeZone: TZ, hour: '2-digit', hour12: false }).format(now), 10);
+
+  const todaySlots = daySlots(todayISO, dow);
+  const isOpenNow = todaySlots.some((s) => hour >= parseInt(s.start.slice(0, 2), 10) && hour < parseInt(s.end.slice(0, 2), 10));
+
+  let freeNow = true;
+  let appointmentsRemainingToday = 0;
+  let calendarChecked = false;
+
+  const token = await getGoogleAccessToken();
+  // Il freeBusy di "oggi" serve solo se lo studio è aperto ORA (freeNow/appointmentsRemainingToday
+  // non vengono letti dal chiamante quando isOpenNow è false — vedi runTool check_walkin_now).
+  if (token && isOpenNow && todaySlots.length) {
+    try {
+      const off = romeOffset(todayISO);
+      const last = todaySlots[todaySlots.length - 1];
+      const timeMax = `${todayISO}T${last.end}:00${off}`;
+      const resp = await fetch('https://www.googleapis.com/calendar/v3/freeBusy', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          timeMin: now.toISOString(),
+          timeMax,
+          timeZone: TZ,
+          items: [{ id: process.env.GOOGLE_CALENDAR_ID || 'primary' }],
+        }),
+      });
+      if (resp.ok) {
+        const data = await resp.json() as any;
+        const cal = data.calendars?.[Object.keys(data.calendars || {})[0]];
+        const busy = (cal?.busy || []) as { start: string; end: string }[];
+        calendarChecked = true;
+        appointmentsRemainingToday = busy.length;
+        const nowMs = now.getTime();
+        freeNow = !busy.some((b) => Date.parse(b.start) <= nowMs && Date.parse(b.end) > nowMs);
+      }
+    } catch (e) {
+      console.error('[Appuntamenti] getNowStatus freeBusy:', e);
+    }
+  }
+
+  let nextSlot: { date: string; start: string } | null = null;
+  if (!isOpenNow) {
+    const firstToday = todaySlots[0];
+    if (firstToday && hour < parseInt(firstToday.start.slice(0, 2), 10)) {
+      // Oggi apriamo più tardi: il prossimo slot utile è oggi stesso.
+      nextSlot = { date: todayISO, start: firstToday.start };
+    } else {
+      // Oggi è finito (o chiuso tutto il giorno): cerca il primo slot dei prossimi giorni.
+      const { slots } = await getAvailability(60);
+      if (slots.length) nextSlot = { date: slots[0].date, start: slots[0].start };
+    }
+  }
+
+  return { isOpenNow, freeNow, appointmentsRemainingToday, nextSlot, calendarChecked };
 }

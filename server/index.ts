@@ -47,6 +47,18 @@ app.listen(PORT, () => {
 
   // Manutenzione: digest giornaliero + watchdog flusso messaggi
   startMaintenance();
+
+  // Posta in arrivo (IMAP, sola lettura) — ISOLATA: import dinamico in try/catch così
+  // un eventuale problema del modulo email non può MAI tirare giù il bot WhatsApp.
+  // Il poller parte solo se sono presenti le credenziali (EMAIL_*_PASS).
+  setTimeout(async () => {
+    try {
+      const mail = await import('./email.js');
+      mail.startEmailPoller();
+    } catch (e: any) {
+      console.error('[Email] modulo non avviato (isolato, bot non impattato):', e.message);
+    }
+  }, 5000);
 });
 
 export default app;
