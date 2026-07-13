@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import db from './db.js';
 import { getAvailability, formatAvailabilityIT, isSlotBusy } from './appointments.js';
+import { siteLead, siteAvailability, siteBookingRequest, getSiteLeads } from './site.js';
 import { sendTextMessage, syncContacts, zapiGet, getReceivedWebhook } from './zapi.js';
 import { addSSEClient, broadcastEvent, getClientCount } from './sse.js';
 import { startPolling, stopPolling, isPollingRunning } from './polling.js';
@@ -89,7 +90,18 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.15.0', built: new Date().toISOString() });
+  res.json({ version: '2.16.0', built: new Date().toISOString() });
+});
+
+// ─── Endpoint pubblici per il SITO (studiotributariobranca.eu) ───────────────
+// Conformi all'invariante: lead → alert allo studio (mai risposta al cliente);
+// booking → appuntamento PENDING "da_confermare" (mai auto-confermato).
+router.post('/site/lead', (req: Request, res: Response) => siteLead(req, res));
+router.get('/site/availability', (req: Request, res: Response) => siteAvailability(req, res));
+router.post('/site/booking-request', (req: Request, res: Response) => siteBookingRequest(req, res));
+router.get('/site/leads', (req: Request, res: Response) => {
+  try { res.json({ ok: true, leads: getSiteLeads(req.query.status ? String(req.query.status) : undefined) }); }
+  catch (err: any) { res.status(500).json({ ok: false, error: err.message }); }
 });
 
 // ─── Autocheck (self-test + autocorrezione) ──────────────────────────────────
