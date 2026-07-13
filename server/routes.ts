@@ -1,7 +1,7 @@
 import { Router, Request, Response } from 'express';
 import db from './db.js';
 import { getAvailability, formatAvailabilityIT, isSlotBusy } from './appointments.js';
-import { siteLead, siteAvailability, siteBookingRequest, getSiteLeads } from './site.js';
+import { siteLead, siteAvailability, siteBookingRequest, getSiteLeads, deleteSiteLead, cleanupTestLeads } from './site.js';
 import { sendTextMessage, syncContacts, zapiGet, getReceivedWebhook } from './zapi.js';
 import { addSSEClient, broadcastEvent, getClientCount } from './sse.js';
 import { startPolling, stopPolling, isPollingRunning } from './polling.js';
@@ -90,7 +90,7 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.16.0', built: new Date().toISOString() });
+  res.json({ version: '2.16.1', built: new Date().toISOString() });
 });
 
 // ─── Endpoint pubblici per il SITO (studiotributariobranca.eu) ───────────────
@@ -102,6 +102,16 @@ router.post('/site/booking-request', (req: Request, res: Response) => siteBookin
 router.get('/site/leads', (req: Request, res: Response) => {
   try { res.json({ ok: true, leads: getSiteLeads(req.query.status ? String(req.query.status) : undefined) }); }
   catch (err: any) { res.status(500).json({ ok: false, error: err.message }); }
+});
+// Elimina un singolo lead del sito per id (usato dal Cruscotto per pulizia/gestione).
+router.delete('/site/leads/:id', (req: Request, res: Response) => {
+  try {
+    const id = parseInt(String(req.params.id), 10);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ ok: false, error: 'id non valido' });
+    const removed = deleteSiteLead(id);
+    if (!removed) return res.status(404).json({ ok: false, error: 'lead non trovato' });
+    res.json({ ok: true, deleted: removed, id });
+  } catch (err: any) { res.status(500).json({ ok: false, error: err.message }); }
 });
 
 // ─── Autocheck (self-test + autocorrezione) ──────────────────────────────────
@@ -1467,7 +1477,10 @@ router.post('/admin/cleanup-test-data', (req: Request, res: Response) => {
     const r3 = db.prepare(`DELETE FROM conversations WHERE phone LIKE '%120363%'`).run();
     const r4 = db.prepare(`DELETE FROM live_messages WHERE phone LIKE '%120363%'`).run();
     deleted += r3.changes + r4.changes;
-    res.json({ success: true, deleted });
+    // Rimuovi anche i lead del sito marcati [TEST SISTEMA]
+    const leadsDeleted = cleanupTestLeads();
+    deleted += leadsDeleted;
+    res.json({ success: true, deleted, leadsDeleted });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

@@ -105982,6 +105982,16 @@ function getSiteLeads(status) {
   if (status) return db_default.prepare(`SELECT * FROM site_leads WHERE status = ? ORDER BY created_at DESC`).all(status);
   return db_default.prepare(`SELECT * FROM site_leads ORDER BY created_at DESC LIMIT 500`).all();
 }
+function deleteSiteLead(id) {
+  const info = db_default.prepare(`DELETE FROM site_leads WHERE id = ?`).run(id);
+  return info.changes;
+}
+function cleanupTestLeads() {
+  const info = db_default.prepare(
+    `DELETE FROM site_leads WHERE name LIKE '%[TEST SISTEMA]%' OR message LIKE '%[TEST SISTEMA]%'`
+  ).run();
+  return info.changes;
+}
 var HITS = /* @__PURE__ */ new Map();
 function rateLimited(ip, max = 6, windowMs = 6e4) {
   const now = Date.now();
@@ -107377,7 +107387,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.16.0", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.16.1", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.post("/site/lead", (req, res) => siteLead(req, res));
 router.get("/site/availability", (req, res) => siteAvailability(req, res));
@@ -107385,6 +107395,17 @@ router.post("/site/booking-request", (req, res) => siteBookingRequest(req, res))
 router.get("/site/leads", (req, res) => {
   try {
     res.json({ ok: true, leads: getSiteLeads(req.query.status ? String(req.query.status) : void 0) });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+router.delete("/site/leads/:id", (req, res) => {
+  try {
+    const id = parseInt(String(req.params.id), 10);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ ok: false, error: "id non valido" });
+    const removed = deleteSiteLead(id);
+    if (!removed) return res.status(404).json({ ok: false, error: "lead non trovato" });
+    res.json({ ok: true, deleted: removed, id });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -108575,7 +108596,9 @@ router.post("/admin/cleanup-test-data", (req, res) => {
     const r3 = db_default.prepare(`DELETE FROM conversations WHERE phone LIKE '%120363%'`).run();
     const r4 = db_default.prepare(`DELETE FROM live_messages WHERE phone LIKE '%120363%'`).run();
     deleted += r3.changes + r4.changes;
-    res.json({ success: true, deleted });
+    const leadsDeleted = cleanupTestLeads();
+    deleted += leadsDeleted;
+    res.json({ success: true, deleted, leadsDeleted });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

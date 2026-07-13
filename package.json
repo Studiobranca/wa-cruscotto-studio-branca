@@ -1,6 +1,6 @@
 {
   "name": "wa-cruscotto",
-  "version": "1.0.0",
+  "version": "2.16.1",
   "type": "module",
   "scripts": {
     "dev": "tsx server/index.ts",

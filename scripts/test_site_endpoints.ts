@@ -1,6 +1,6 @@
 /* Test endpoint SITO: validazione input, lead → persistenza, booking → PENDING.
  * Nessun invio reale (nessuna email/WhatsApp): si esercitano schemi e DB. */
-import { leadSchema, bookingSchema, recordLead, getSiteLeads } from '../server/site.js';
+import { leadSchema, bookingSchema, recordLead, getSiteLeads, deleteSiteLead, cleanupTestLeads } from '../server/site.js';
 import { recordAppointment, getPendingAppointment } from '../server/chatbot.js';
 
 let fails = 0;
@@ -28,6 +28,19 @@ const leadId = recordLead({ kind: 'contatto', name: 'Test Lead', email: 't@e.it'
 ok('lead salvato con id', leadId > 0);
 const found = getSiteLeads().some((l) => l.id === leadId && l.message === marker && l.status === 'nuovo');
 ok('lead recuperabile con status "nuovo"', found);
+
+// ── DELETE lead per id ────────────────────────────────────────
+const delCount = deleteSiteLead(leadId);
+ok('deleteSiteLead rimuove 1 riga', delCount === 1, 'rimosse=' + delCount);
+ok('lead non piu presente dopo delete', !getSiteLeads().some((l) => l.id === leadId));
+ok('deleteSiteLead su id inesistente ritorna 0', deleteSiteLead(leadId) === 0);
+
+// ── cleanupTestLeads rimuove i lead [TEST SISTEMA] ────────────
+const testLeadId = recordLead({ kind: 'contatto', name: '[TEST SISTEMA] Verifica', email: 't@e.it', message: 'auto' });
+ok('lead di test [TEST SISTEMA] creato', testLeadId > 0);
+const cleaned = cleanupTestLeads();
+ok('cleanupTestLeads rimuove >=1 lead di test', cleaned >= 1, 'rimossi=' + cleaned);
+ok('nessun lead [TEST SISTEMA] residuo', !getSiteLeads().some((l) => String(l.name || '').includes('[TEST SISTEMA]')));
 
 // ── BOOKING → SEMPRE pending "da_confermare" (INVARIANTE) ──────
 const testPhone = '39000' + (Date.now() % 1000000);

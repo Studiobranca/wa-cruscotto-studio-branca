@@ -56,6 +56,20 @@ export function getSiteLeads(status?: string): any[] {
   return db.prepare(`SELECT * FROM site_leads ORDER BY created_at DESC LIMIT 500`).all() as any[];
 }
 
+/** Elimina un singolo lead per id. Ritorna il numero di righe rimosse (0 o 1). */
+export function deleteSiteLead(id: number): number {
+  const info = db.prepare(`DELETE FROM site_leads WHERE id = ?`).run(id);
+  return info.changes;
+}
+
+/** Rimuove i lead di test marcati [TEST SISTEMA] (nel nome o nel messaggio). Ritorna le righe rimosse. */
+export function cleanupTestLeads(): number {
+  const info = db.prepare(
+    `DELETE FROM site_leads WHERE name LIKE '%[TEST SISTEMA]%' OR message LIKE '%[TEST SISTEMA]%'`
+  ).run();
+  return info.changes;
+}
+
 // ─── Rate limit basilare in-memory (per IP) ───────────────────────────────────
 const HITS = new Map<string, number[]>();
 function rateLimited(ip: string, max = 6, windowMs = 60_000): boolean {
