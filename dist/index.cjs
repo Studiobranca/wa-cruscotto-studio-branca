@@ -100995,9 +100995,10 @@ function extractDates(text) {
 }
 function extractHearingDate(text) {
   const t = String(text || "");
-  const m = t.match(/(udienza|trattazione)[\s\S]{0,120}/i);
-  if (m) {
-    const near = extractDates(m[0]);
+  const re = /(udienza|trattazione)/gi;
+  let m;
+  while ((m = re.exec(t)) !== null) {
+    const near = extractDates(t.slice(m.index, m.index + 160));
     if (near.length) return near[0];
   }
   return null;
@@ -102681,7 +102682,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.12.3", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.12.4", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/selftest", (_req, res) => {
   res.json(getLastSelfCheck() || { note: "mai eseguito" });

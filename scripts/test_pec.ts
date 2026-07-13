@@ -30,6 +30,10 @@ ok('estrae R.G. 300/2026', extractRG(dep) === '300/2026', String(extractRG(dep))
 ok('riscossione', classifyPec('protocollo@pec.agenziariscossione.gov.it', 'Comunicazione', 'cartella').category === 'RISCOSSIONE');
 ok('agenzia entrate', classifyPec('x@pec.agenziaentrate.it', 'Avviso', 'agenzia delle entrate accertamento').category === 'AGENZIA_ENTRATE');
 
+// Oggetto con "trattazione" (senza data) + corpo con "udienza del ..." → deve prendere la data del corpo
+const misto = 'Avviso di trattazione\nCorte di Giustizia Tributaria di Messina. Il ricorso R.G.R. n. 245/2025 è fissato per l\'udienza del 15/09/2026 ore 9:30.';
+ok('hearing dal corpo nonostante "trattazione" nell\'oggetto', extractHearingDate(misto) === '2026-09-15', String(extractHearingDate(misto)));
+
 // Data testuale + incerto
 ok('data testuale 15 settembre 2026', extractDates('udienza del 15 settembre 2026').includes('2026-09-15'));
 ok('ignoto → non confident', classifyPec('tizio@gmail.com', 'ciao', 'testo qualsiasi').confident === false);

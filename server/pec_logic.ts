@@ -52,11 +52,17 @@ export function extractDates(text: string): string[] {
   return [...new Set(out)];
 }
 
-/** Data d'udienza: la prima data che compare DOPO le parole "udienza"/"trattazione". */
+/** Data d'udienza: la prima data che compare vicino a una parola "udienza"/"trattazione".
+ *  Scandisce TUTTE le occorrenze (l'oggetto può contenere "trattazione" senza data, mentre
+ *  la data reale è vicino a "udienza" nel corpo). */
 export function extractHearingDate(text: string): string | null {
   const t = String(text || '');
-  const m = t.match(/(udienza|trattazione)[\s\S]{0,120}/i);
-  if (m) { const near = extractDates(m[0]); if (near.length) return near[0]; }
+  const re = /(udienza|trattazione)/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(t)) !== null) {
+    const near = extractDates(t.slice(m.index, m.index + 160));
+    if (near.length) return near[0];
+  }
   return null;
 }
 
