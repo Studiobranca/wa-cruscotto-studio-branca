@@ -337,6 +337,34 @@ export function getNotifiche(limit = 100): any[] {
   return rows.map((r) => ({ ...r, recipients: r.recipients_json ? JSON.parse(r.recipients_json) : [], has_attachment: !!r.attachment_name }));
 }
 
+/** Elabora UN messaggio grezzo IMAP (parse → ingest → prepara notifica se sentenza vinta).
+ *  Idempotente (dedup Message-ID). Ritorna true se ha creato un nuovo pec_event. Non lancia. */
+async function ingestRawMessage(source: Buffer, uid: number | undefined, ownUser: string): Promise<boolean> {
+  const parsed = await simpleParser(source);
+  const messageId = parsed.messageId || `pec_${uid}`;
+  if (db.prepare(`SELECT 1 FROM pec_events WHERE message_id = ?`).get(messageId)) return false;
+  const fromVal = (parsed.from as any)?.value?.[0] || {};
+  const attsFull = (parsed.attachments || []) as any[];
+  const atts = attsFull.map((a: any) => a.filename || 'allegato');
+  const id = ingestPecMessage({
+    messageId, uid, fromAddr: fromVal.address || '', subject: parsed.subject || '(senza oggetto)',
+    body: parsed.text || '', attachments: atts, receivedAt: (parsed.date || new Date()).toISOString(),
+  });
+  if (!id) return false;
+  // FEATURE B — sentenza FAVOREVOLE/PARZIALE con PDF → PREPARA notifica ex L.53/1994
+  // (coda ad alta priorità, NESSUN invio automatico salvo flag). Isolato.
+  try {
+    const full = `${parsed.subject || ''}\n${parsed.text || ''}`;
+    const oc = classifyOutcome(full);
+    if (oc.isSentenza && (oc.esito === 'favorevole' || oc.esito === 'parziale')) {
+      const pdf = attsFull.find((a: any) => /\.pdf$/i.test(a.filename || '') || /pdf/i.test(a.contentType || ''));
+      const attachment = pdf && pdf.content ? { filename: pdf.filename || 'sentenza.pdf', contentB64: Buffer.from(pdf.content).toString('base64') } : null;
+      await prepareNotifica({ pecEventId: id, rgRef: extractRG(full), fullText: full, subject: parsed.subject || '', ownUser, senderAddr: fromVal.address || '', attachment });
+    }
+  } catch (e: any) { console.error('[PEC] prepareNotifica:', e?.message); }
+  return true;
+}
+
 /** Poll IMAP della casella PEC (sola lettura). Idempotente per Message-ID. Non lancia mai. */
 export async function pollPec(force = false): Promise<{ enabled: boolean; processed: number; created: number; error?: string }> {
   if (!pecEnabled()) return { enabled: false, processed: 0, created: 0, error: 'PEC non configurata (mancano PEC_USER/PEC_PASS)' };
@@ -353,32 +381,8 @@ export async function pollPec(force = false): Promise<{ enabled: boolean; proces
         const from = Math.max(1, total - 60);
         for await (const msg of client.fetch(`${from}:*`, { uid: true, source: true })) {
           processed++;
-          try {
-            const parsed = await simpleParser(msg.source as Buffer);
-            const messageId = parsed.messageId || `pec_${msg.uid}`;
-            if (db.prepare(`SELECT 1 FROM pec_events WHERE message_id = ?`).get(messageId)) continue;
-            const fromVal = (parsed.from as any)?.value?.[0] || {};
-            const attsFull = (parsed.attachments || []) as any[];
-            const atts = attsFull.map((a: any) => a.filename || 'allegato');
-            const id = ingestPecMessage({
-              messageId, uid: msg.uid, fromAddr: fromVal.address || '', subject: parsed.subject || '(senza oggetto)',
-              body: parsed.text || '', attachments: atts, receivedAt: (parsed.date || new Date()).toISOString(),
-            });
-            if (id) {
-              created++;
-              // FEATURE B — sentenza FAVOREVOLE/PARZIALE con PDF → PREPARA notifica ex L.53/1994
-              // (coda ad alta priorità, NESSUN invio automatico salvo flag). Isolato.
-              try {
-                const full = `${parsed.subject || ''}\n${parsed.text || ''}`;
-                const oc = classifyOutcome(full);
-                if (oc.isSentenza && (oc.esito === 'favorevole' || oc.esito === 'parziale')) {
-                  const pdf = attsFull.find((a: any) => /\.pdf$/i.test(a.filename || '') || /pdf/i.test(a.contentType || ''));
-                  const attachment = pdf && pdf.content ? { filename: pdf.filename || 'sentenza.pdf', contentB64: Buffer.from(pdf.content).toString('base64') } : null;
-                  await prepareNotifica({ pecEventId: id, rgRef: extractRG(full), fullText: full, subject: parsed.subject || '', ownUser: c.user, senderAddr: fromVal.address || '', attachment });
-                }
-              } catch (e: any) { console.error('[PEC] prepareNotifica:', e?.message); }
-            }
-          } catch (e: any) { console.error('[PEC] parse messaggio fallito:', e?.message); }
+          try { if (await ingestRawMessage(msg.source as Buffer, msg.uid, c.user)) created++; }
+          catch (e: any) { console.error('[PEC] parse messaggio fallito:', e?.message); }
         }
       }
     } finally { lock.release(); }
@@ -393,6 +397,74 @@ export async function pollPec(force = false): Promise<{ enabled: boolean; proces
     setSetting('pec_last_error', `${new Date().toISOString()} ${e?.message}`);
     return { enabled: true, processed, created, error: e?.message };
   }
+}
+
+// ═══ BACKSCAN — scansione a ritroso ultimi N mesi (min 2) ════════════════════
+// Recupera i messaggi PEC degli ultimi N mesi via IMAP SEARCH (SINCE), li fa passare per la
+// stessa pipeline (ingest → termini/appello/sentenza → notifica L.53 in coda). Idempotente.
+// Se la PEC non è configurata NON fallisce: ritorna {ok:false, reason}.
+export async function backscanPec(months = 2): Promise<{ ok: boolean; reason?: string; months?: number; since?: string; scanned?: number; created?: number; notifichePronte?: number; sentenzeVinte?: number; error?: string }> {
+  const m = Math.max(2, Math.floor(Number(months) || 2));
+  if (!pecEnabled()) { setSetting('pec_backscan_last', JSON.stringify({ ts: new Date().toISOString(), ok: false, reason: 'PEC non configurata' })); return { ok: false, reason: 'PEC non configurata' }; }
+  const since = new Date(); since.setMonth(since.getMonth() - m); since.setHours(0, 0, 0, 0);
+  const sinceISO = since.toISOString().slice(0, 10);
+  const c = pecConfig();
+  const client = new ImapFlow({ host: c.host, port: c.port, secure: true, auth: { user: c.user, pass: c.pass }, logger: false });
+  let scanned = 0, created = 0;
+  try {
+    await client.connect();
+    const lock = await client.getMailboxLock('INBOX');
+    try {
+      const uids = await client.search({ since }, { uid: true }) as number[];
+      if (uids && uids.length) {
+        for await (const msg of client.fetch(uids, { uid: true, source: true }, { uid: true })) {
+          scanned++;
+          try { if (await ingestRawMessage(msg.source as Buffer, msg.uid, c.user)) created++; }
+          catch (e: any) { console.error('[PEC] backscan msg fallito:', e?.message); }
+        }
+      }
+    } finally { lock.release(); }
+    await client.logout().catch(() => {});
+    // Calendarizza/termini per i nuovi eventi (idempotente).
+    try { await runPecProcessing(); } catch (e: any) { console.error('[PEC] backscan processing:', e?.message); }
+    const notifichePronte = (db.prepare(`SELECT COUNT(*) n FROM pec_notifiche WHERE status = 'pronta'`).get() as any)?.n || 0;
+    const sentenzeVinte = (db.prepare(`SELECT COUNT(*) n FROM pec_events WHERE outcome IN ('favorevole','parziale')`).get() as any)?.n || 0;
+    const summary = { ts: new Date().toISOString(), ok: true, months: m, since: sinceISO, scanned, created, notifichePronte, sentenzeVinte };
+    setSetting('pec_backscan_last', JSON.stringify(summary));
+    return { ok: true, months: m, since: sinceISO, scanned, created, notifichePronte, sentenzeVinte };
+  } catch (e: any) {
+    try { await client.logout().catch(() => {}); } catch { /* noop */ }
+    console.error('[PEC] backscan fallito:', e?.message);
+    setSetting('pec_backscan_last', JSON.stringify({ ts: new Date().toISOString(), ok: false, reason: 'errore', error: e?.message }));
+    return { ok: false, reason: 'errore', months: m, since: sinceISO, scanned, created, error: e?.message };
+  }
+}
+
+export function getBackscanStatus(): any {
+  const raw = getSetting('pec_backscan_last');
+  return { enabled: pecEnabled(), lastBackscan: raw ? JSON.parse(raw) : null };
+}
+
+/** Conteggi notifiche per stato (per il cruscotto). */
+export function getNotificheCounts(): Record<string, number> {
+  const counts: Record<string, number> = {};
+  try { for (const r of db.prepare(`SELECT status, COUNT(*) n FROM pec_notifiche GROUP BY status`).all() as any[]) counts[r.status] = r.n; } catch { /* noop */ }
+  return counts;
+}
+
+/** INVIO MASSIVO PROTETTO: invia SOLO le notifiche 'pronta' con destinatari verificati.
+ *  Esclude 'destinatari_da_verificare', 'inviata', 'errore'. È un'azione UMANA esplicita
+ *  (chiamata dall'endpoint di approvazione) o via flag PEC_AUTOSEND_NOTIFICA. */
+export async function approveAllNotifiche(): Promise<{ ok: boolean; sent: number; skipped: number; details: Array<{ id: number; status: string; error?: string }> }> {
+  const rows = db.prepare(`SELECT id FROM pec_notifiche WHERE status = 'pronta' ORDER BY id ASC`).all() as any[];
+  let sent = 0, skipped = 0;
+  const details: Array<{ id: number; status: string; error?: string }> = [];
+  for (const r of rows) {
+    const res = await sendNotifica(r.id);
+    if (res.ok && res.status === 'inviata') { sent++; details.push({ id: r.id, status: 'inviata' }); }
+    else { skipped++; details.push({ id: r.id, status: res.status, error: res.error }); }
+  }
+  return { ok: true, sent, skipped, details };
 }
 
 export function getPecEvents(limit = 100): any[] {

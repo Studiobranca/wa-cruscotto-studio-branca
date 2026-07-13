@@ -61,7 +61,8 @@ import { getAllAppointments, setAppointmentOutcome, getAppointmentRow } from './
 import { selectPendingOutcome, isValidOutcome } from './agenda_logic.js';
 import { createChecklist, getChecklist, getChecklistGrouped, markDocReceived, buildDocRequestText } from './practices.js';
 import { smsStatus } from './sms.js';
-import { getPecEvents, getPecStatus, pollPec, getNotifiche, sendNotifica, pecAutosendNotifica } from './pec.js';
+import { getPecEvents, getPecStatus, pollPec, getNotifiche, sendNotifica, pecAutosendNotifica,
+  backscanPec, getBackscanStatus, getNotificheCounts, approveAllNotifiche } from './pec.js';
 import { classifyPec, extractDates, extractHearingDate, extractRG, extractHearingLink, classifyOutcome, extractLiquidatedAmount,
   hasSentenceNotification, extractSentenceRef, extractOrgano, extractSentenceDate, selectCounterpartyPec, formatDateIT, composeNotificaText } from './pec_logic.js';
 import { computeDeadlinesFromEvent, computeRecoveryDeadline, computeAppealDeadline } from './pec_terms.js';
@@ -88,7 +89,7 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.14.0', built: new Date().toISOString() });
+  res.json({ version: '2.15.0', built: new Date().toISOString() });
 });
 
 // ─── Autocheck (self-test + autocorrezione) ──────────────────────────────────
@@ -1676,9 +1677,9 @@ router.post('/pec/simulate', (req: Request, res: Response) => {
 });
 
 // ─── NOTIFICHE ex L. 53/1994 (coda ad alta priorità; invio SOLO su approvazione) ──
-// Lettura della coda: NON espone il base64 dell'allegato.
+// Lettura della coda: NON espone il base64 dell'allegato. Include i conteggi per stato.
 router.get('/pec/notifiche', (req: Request, res: Response) => {
-  try { res.json({ autosend: pecAutosendNotifica(), items: getNotifiche(parseInt(String(req.query.limit || '100'), 10)) }); }
+  try { res.json({ autosend: pecAutosendNotifica(), counts: getNotificheCounts(), items: getNotifiche(parseInt(String(req.query.limit || '100'), 10)) }); }
   catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 // VIA LIBERA UMANO: unico punto da cui parte l'invio reale della notifica alla controparte.
@@ -1687,6 +1688,27 @@ router.post('/pec/notifiche/:id/approva-invia', async (req: Request, res: Respon
     const r = await sendNotifica(parseInt(String(req.params.id), 10));
     res.status(r.ok ? 200 : 409).json(r);
   } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+// INVIO MASSIVO PROTETTO — azione umana esplicita: invia SOLO le notifiche 'pronta' con
+// destinatari verificati (esclude 'destinatari_da_verificare'). Ritorna inviate/saltate.
+router.post('/pec/notifiche/approva-invia-tutte', async (_req: Request, res: Response) => {
+  try { res.json(await approveAllNotifiche()); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── BACKSCAN — scansione a ritroso ultimi N mesi (default 2, min 2) ──────────
+// Prepara in coda notifiche/richieste per le sentenze vinte trovate. Idempotente.
+// Se PEC non configurata → {ok:false, reason} (nessun errore sporco).
+router.post('/pec/backscan', async (req: Request, res: Response) => {
+  try {
+    const months = parseInt(String(req.query.months || req.body?.months || '2'), 10) || 2;
+    const r = await backscanPec(months);
+    res.status(r.ok ? 200 : 200).json(r);
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+router.get('/pec/backscan/status', (_req: Request, res: Response) => {
+  try { res.json(getBackscanStatus()); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
 // ─── SMS (scaffold): stato configurazione. OFF finché SMS_PROVIDER non è impostato ──
