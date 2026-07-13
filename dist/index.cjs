@@ -69793,7 +69793,7 @@ var require_imap_flow = __commonJS({
       SELECTED: 3,
       LOGOUT: 4
     };
-    var ImapFlow2 = class extends EventEmitter {
+    var ImapFlow3 = class extends EventEmitter {
       /**
        * Current module version as a static class property
        * @property {String} version Module version
@@ -72840,7 +72840,7 @@ var require_imap_flow = __commonJS({
         };
       }
     };
-    module2.exports.ImapFlow = ImapFlow2;
+    module2.exports.ImapFlow = ImapFlow3;
   }
 });
 
@@ -88282,10 +88282,10 @@ var require_mailparser = __commonJS({
   "node_modules/mailparser/index.js"(exports2, module2) {
     "use strict";
     var MailParser = require_mail_parser();
-    var simpleParser2 = require_simple_parser();
+    var simpleParser3 = require_simple_parser();
     module2.exports = {
       MailParser,
-      simpleParser: simpleParser2
+      simpleParser: simpleParser3
     };
   }
 });
@@ -102244,6 +102244,222 @@ function buildDocRequestText(clientKey, pratica) {
   return { text: composeDocRequest(pratica, miss.map((m) => m.doc_name), contactName), missing: miss.map((m) => m.doc_name), contactName };
 }
 
+// server/pec.ts
+var import_imapflow2 = __toESM(require_imap_flow(), 1);
+var import_mailparser2 = __toESM(require_mailparser(), 1);
+init_db();
+
+// server/pec_logic.ts
+var MESI = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"];
+function classifyPec(sender, subject, body) {
+  const s = String(sender || "").toLowerCase();
+  const t = `${subject || ""} ${body || ""}`.toLowerCase();
+  const all = `${s} ${t}`;
+  let category = "ALTRO";
+  if (/sigit|processo tributario telematico|\bptt\b|giustiziatributaria|corte di giustizia tributaria|commissione tributaria|\bcgt\b|mef\.gov/.test(all)) category = "CGT_PTT";
+  else if (/agenzia.?entrate.?riscossione|agenzia delle entrate-riscossione|riscossione|\bader\b|agenziariscossione/.test(all)) category = "RISCOSSIONE";
+  else if (/agenzia delle entrate|agenziaentrate|\bade\b/.test(all)) category = "AGENZIA_ENTRATE";
+  else if (/avvocatura|studio legale|\bavv\.|controparte|@pec\./.test(s)) category = "CONTROPARTE";
+  let eventType = "incerto";
+  if (/fissazione|avviso di trattazione|avviso di udienza|udienza .*(fissat|del )|data (di )?udienza|trattazione .*fissat/.test(t)) eventType = "fissazione_udienza";
+  else if (/ricevuta di accettazione/.test(t)) eventType = "accettazione";
+  else if (/ricevuta di (avvenuta )?consegna/.test(t)) eventType = "consegna";
+  else if (/deposito|iscrizione a ruolo|attestazione di deposito|nir\b|numero informatico di registrazione/.test(t)) eventType = "ricevuta_deposito";
+  else if (/notific|ricorso|appello|controdeduzioni|memoria|atto di/.test(t)) eventType = "notifica_atto";
+  else if (/comunicazione|avviso/.test(t)) eventType = "comunicazione";
+  const confident = category !== "ALTRO" && eventType !== "incerto";
+  return { category, eventType, confident };
+}
+function extractDates(text) {
+  const out = [];
+  const t = String(text || "");
+  const push = (y, m, d) => {
+    if (m >= 1 && m <= 12 && d >= 1 && d <= 31 && y >= 2e3 && y <= 2100) {
+      out.push(`${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`);
+    }
+  };
+  for (const mm of t.matchAll(/\b(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})\b/g)) push(+mm[3], +mm[2], +mm[1]);
+  const rx = new RegExp(`\\b(\\d{1,2})\\s+(${MESI.join("|")})\\s+(\\d{4})\\b`, "gi");
+  for (const mm of t.matchAll(rx)) push(+mm[3], MESI.indexOf(mm[2].toLowerCase()) + 1, +mm[1]);
+  return [...new Set(out)];
+}
+function extractHearingDate(text) {
+  const t = String(text || "");
+  const m = t.match(/(udienza|trattazione)[\s\S]{0,120}/i);
+  if (m) {
+    const near = extractDates(m[0]);
+    if (near.length) return near[0];
+  }
+  return null;
+}
+function extractRG(text) {
+  const t = String(text || "");
+  const m = t.match(/R\.?\s*G\.?\s*R?\.?\s*(?:n\.?\s*)?(\d+\s*\/\s*\d{4})/i) || t.match(/ruolo\s+generale[^\d]{0,20}(\d+\s*\/\s*\d{4})/i) || t.match(/\bn\.?\s*(\d+\s*\/\s*\d{4})\s*R\.?G/i);
+  return m ? m[1].replace(/\s+/g, "") : null;
+}
+
+// server/pec.ts
+db_default.exec(`
+  CREATE TABLE IF NOT EXISTS pec_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id TEXT UNIQUE,
+    pec_uid INTEGER,
+    from_addr TEXT,
+    subject TEXT,
+    category TEXT,
+    event_type TEXT,
+    confident INTEGER DEFAULT 0,
+    hearing_date TEXT,
+    rg_ref TEXT,
+    dates_json TEXT,
+    attachments_json TEXT,
+    body_excerpt TEXT,
+    client_key TEXT,
+    status TEXT DEFAULT 'nuovo',       -- nuovo | da_rivedere | processato
+    calendar_event_ids TEXT,           -- JSON: idempotenza calendarizzazione (BLOCCO 3)
+    received_at TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_pec_events_status ON pec_events(status, created_at);
+`);
+function envSetting(key, def = "") {
+  return (process.env[key] || def).trim();
+}
+function pecConfig() {
+  return {
+    host: envSetting("PEC_IMAP_HOST", "mbox.cert.legalmail.it"),
+    port: parseInt(envSetting("PEC_IMAP_PORT", "993"), 10) || 993,
+    user: envSetting("PEC_USER", "studiotributariobrancamariano@legalmail.it"),
+    pass: process.env.PEC_PASS || ""
+  };
+}
+function pecEnabled() {
+  const c = pecConfig();
+  return !!(c.user && c.pass);
+}
+function setSetting4(k, v) {
+  try {
+    db_default.prepare(`INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(k, v);
+  } catch {
+  }
+}
+function getSetting4(k) {
+  try {
+    return db_default.prepare(`SELECT value FROM app_settings WHERE key = ?`).get(k)?.value ?? null;
+  } catch {
+    return null;
+  }
+}
+function ingestPecMessage(m) {
+  const exists = db_default.prepare(`SELECT id FROM pec_events WHERE message_id = ?`).get(m.messageId);
+  if (exists) return null;
+  const cls = classifyPec(m.fromAddr, m.subject, m.body);
+  const hearing = extractHearingDate(`${m.subject}
+${m.body}`);
+  const rg = extractRG(`${m.subject}
+${m.body}`);
+  const dates = extractDates(`${m.subject}
+${m.body}`);
+  const status = cls.confident ? "nuovo" : "da_rivedere";
+  const info = db_default.prepare(`
+    INSERT INTO pec_events (message_id, pec_uid, from_addr, subject, category, event_type, confident,
+      hearing_date, rg_ref, dates_json, attachments_json, body_excerpt, status, received_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    m.messageId,
+    m.uid ?? null,
+    m.fromAddr,
+    m.subject,
+    cls.category,
+    cls.eventType,
+    cls.confident ? 1 : 0,
+    hearing,
+    rg,
+    JSON.stringify(dates),
+    JSON.stringify(m.attachments || []),
+    String(m.body || "").slice(0, 500),
+    status,
+    m.receivedAt
+  );
+  return Number(info.lastInsertRowid);
+}
+async function pollPec(force = false) {
+  if (!pecEnabled()) return { enabled: false, processed: 0, created: 0, error: "PEC non configurata (mancano PEC_USER/PEC_PASS)" };
+  const c = pecConfig();
+  const client = new import_imapflow2.ImapFlow({ host: c.host, port: c.port, secure: true, auth: { user: c.user, pass: c.pass }, logger: false });
+  let processed = 0, created = 0;
+  try {
+    await client.connect();
+    const lock = await client.getMailboxLock("INBOX");
+    try {
+      const status = await client.status("INBOX", { messages: true });
+      const total = status.messages || 0;
+      if (total) {
+        const from = Math.max(1, total - 60);
+        for await (const msg of client.fetch(`${from}:*`, { uid: true, source: true })) {
+          processed++;
+          try {
+            const parsed = await (0, import_mailparser2.simpleParser)(msg.source);
+            const messageId = parsed.messageId || `pec_${msg.uid}`;
+            if (db_default.prepare(`SELECT 1 FROM pec_events WHERE message_id = ?`).get(messageId)) continue;
+            const fromVal = parsed.from?.value?.[0] || {};
+            const atts = (parsed.attachments || []).map((a) => a.filename || "allegato");
+            const id = ingestPecMessage({
+              messageId,
+              uid: msg.uid,
+              fromAddr: fromVal.address || "",
+              subject: parsed.subject || "(senza oggetto)",
+              body: parsed.text || "",
+              attachments: atts,
+              receivedAt: (parsed.date || /* @__PURE__ */ new Date()).toISOString()
+            });
+            if (id) created++;
+          } catch (e) {
+            console.error("[PEC] parse messaggio fallito:", e?.message);
+          }
+        }
+      }
+    } finally {
+      lock.release();
+    }
+    await client.logout().catch(() => {
+    });
+    setSetting4("pec_last_poll", (/* @__PURE__ */ new Date()).toISOString());
+    return { enabled: true, processed, created };
+  } catch (e) {
+    try {
+      await client.logout().catch(() => {
+      });
+    } catch {
+    }
+    console.error("[PEC] poll fallito:", e?.message);
+    setSetting4("pec_last_error", `${(/* @__PURE__ */ new Date()).toISOString()} ${e?.message}`);
+    return { enabled: true, processed, created, error: e?.message };
+  }
+}
+function getPecEvents(limit = 100) {
+  const rows = db_default.prepare(`SELECT * FROM pec_events ORDER BY created_at DESC LIMIT ?`).all(Math.min(Math.max(limit, 1), 500));
+  return rows.map((r) => ({ ...r, dates: r.dates_json ? JSON.parse(r.dates_json) : [], attachments: r.attachments_json ? JSON.parse(r.attachments_json) : [] }));
+}
+function getPecStatus() {
+  const c = pecConfig();
+  const counts = {};
+  try {
+    for (const r of db_default.prepare(`SELECT status, COUNT(*) n FROM pec_events GROUP BY status`).all()) counts[r.status] = r.n;
+  } catch {
+  }
+  return {
+    enabled: pecEnabled(),
+    host: c.host,
+    port: c.port,
+    user: c.user,
+    // niente password: mai esposta
+    lastPoll: getSetting4("pec_last_poll"),
+    lastError: getSetting4("pec_last_error"),
+    counts
+  };
+}
+
 // server/routes.ts
 var router = (0, import_express.Router)();
 try {
@@ -102261,7 +102477,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.11.4", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.12.0", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/selftest", (_req, res) => {
   res.json(getLastSelfCheck() || { note: "mai eseguito" });
@@ -103593,6 +103809,27 @@ router.get("/bot/briefing", (_req, res) => {
     const data = getBriefingData();
     const { text, empty } = composeBriefing(data);
     res.json({ preview: text, empty, data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.get("/pec/status", (_req, res) => {
+  try {
+    res.json(getPecStatus());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.get("/pec/events", (req, res) => {
+  try {
+    res.json(getPecEvents(parseInt(String(req.query.limit || "100"), 10)));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.post("/pec/poll/run", async (_req, res) => {
+  try {
+    res.json(await pollPec(true));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

@@ -61,6 +61,7 @@ import { getAllAppointments, setAppointmentOutcome, getAppointmentRow } from './
 import { selectPendingOutcome, isValidOutcome } from './agenda_logic.js';
 import { createChecklist, getChecklist, getChecklistGrouped, markDocReceived, buildDocRequestText } from './practices.js';
 import { smsStatus } from './sms.js';
+import { getPecEvents, getPecStatus, pollPec } from './pec.js';
 
 const router = Router();
 
@@ -84,7 +85,7 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.11.4', built: new Date().toISOString() });
+  res.json({ version: '2.12.0', built: new Date().toISOString() });
 });
 
 // ─── Autocheck (self-test + autocorrezione) ──────────────────────────────────
@@ -1608,6 +1609,20 @@ router.get('/bot/briefing', (_req: Request, res: Response) => {
     const { text, empty } = composeBriefing(data);
     res.json({ preview: text, empty, data });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── PEC contenzioso (SOLA LETTURA; nessuna risposta/deposito automatico) ────────
+router.get('/pec/status', (_req: Request, res: Response) => {
+  try { res.json(getPecStatus()); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+router.get('/pec/events', (req: Request, res: Response) => {
+  try { res.json(getPecEvents(parseInt(String(req.query.limit || '100'), 10))); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+router.post('/pec/poll/run', async (_req: Request, res: Response) => {
+  try { res.json(await pollPec(true)); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
 // ─── SMS (scaffold): stato configurazione. OFF finché SMS_PROVIDER non è impostato ──
