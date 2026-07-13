@@ -61,9 +61,10 @@ import { getAllAppointments, setAppointmentOutcome, getAppointmentRow } from './
 import { selectPendingOutcome, isValidOutcome } from './agenda_logic.js';
 import { createChecklist, getChecklist, getChecklistGrouped, markDocReceived, buildDocRequestText } from './practices.js';
 import { smsStatus } from './sms.js';
-import { getPecEvents, getPecStatus, pollPec } from './pec.js';
-import { classifyPec, extractDates, extractHearingDate, extractRG, extractHearingLink, classifyOutcome, extractLiquidatedAmount } from './pec_logic.js';
-import { computeDeadlinesFromEvent, computeRecoveryDeadline } from './pec_terms.js';
+import { getPecEvents, getPecStatus, pollPec, getNotifiche, sendNotifica, pecAutosendNotifica } from './pec.js';
+import { classifyPec, extractDates, extractHearingDate, extractRG, extractHearingLink, classifyOutcome, extractLiquidatedAmount,
+  hasSentenceNotification, extractSentenceRef, extractOrgano, extractSentenceDate, selectCounterpartyPec, formatDateIT, composeNotificaText } from './pec_logic.js';
+import { computeDeadlinesFromEvent, computeRecoveryDeadline, computeAppealDeadline } from './pec_terms.js';
 
 const router = Router();
 
@@ -87,7 +88,7 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.13.0', built: new Date().toISOString() });
+  res.json({ version: '2.14.0', built: new Date().toISOString() });
 });
 
 // ─── Autocheck (self-test + autocorrezione) ──────────────────────────────────
@@ -1642,13 +1643,49 @@ router.post('/pec/simulate', (req: Request, res: Response) => {
     const recupero = (oc.esito === 'favorevole' || oc.esito === 'parziale')  // CASO 3
       ? computeRecoveryDeadline(base, parseInt(String(req.query.recoveryDays || process.env.PEC_RECOVERY_DAYS || '60'), 10) || 60, amount)
       : null;
+    // (A) TERMINE DI APPELLO: breve 60gg se sentenza notificata, altrimenti lungo 6 mesi.
+    const previewDays = parseInt(String(req.query.appealPreviewDays || process.env.APPEAL_PREVIEW_DAYS || '5'), 10) || 5;
+    const notified = oc.isSentenza && hasSentenceNotification(text);
+    const appello = oc.isSentenza
+      ? computeAppealDeadline({ depositDate: base, notificationDate: notified ? base : null, previewDays })
+      : null;
+    // (B) NOTIFICA ex L.53/1994 COMPOSTA (dry-run): testo + destinatari + allegato, SENZA invio.
+    const sentenceRef = extractSentenceRef(text);
+    const organo = extractOrgano(text);
+    const sentDate = extractSentenceDate(text);
+    const recipients = selectCounterpartyPec(text, String(sender), String(sender));
+    const notifica = (oc.esito === 'favorevole' || oc.esito === 'parziale') ? {
+      testo: composeNotificaText({ sentenceRef, organo, sentenceDateHuman: formatDateIT(sentDate) }),
+      sentenceRef, organo, sentenceDate: sentDate,
+      destinatari: recipients,
+      statoDestinatari: recipients.length ? 'ok' : 'destinatari_da_verificare',
+      allegato: 'copia informatica della sentenza (PDF ricevuto) — non incluso nel dry-run',
+      inviato: false,
+      nota: 'DRY-RUN: notifica COMPOSTA ma NON inviata. Invio reale solo via POST /api/pec/notifiche/:id/approva-invia (o flag PEC_AUTOSEND_NOTIFICA).',
+    } : null;
     res.json({
       classification: cls, hearingDate: hearing, rg: extractRG(text), dates: extractDates(text), termini: terms,
       udienzaTelematica: { remote: link.remote, provider: link.provider, url: link.url, linkDaVerificare: link.remote && !link.url },
-      sentenza: { isSentenza: oc.isSentenza, esito: oc.esito, importoLiquidato: amount, importoNota: '[DA VERIFICARE]' },
+      sentenza: { isSentenza: oc.isSentenza, esito: oc.esito, importoLiquidato: amount, importoNota: '[DA VERIFICARE]', notificata: notified },
       recuperoSomme: recupero,
-      nota: 'DRY-RUN: nessuna scrittura, nessun calendario. Termini/importi [DA CONFERMARE]/[DA VERIFICARE].',
+      appello,
+      notificaL53: notifica,
+      nota: 'DRY-RUN: nessuna scrittura, nessun calendario, nessun invio. Termini/importi [DA CONFERMARE]/[DA VERIFICARE].',
     });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── NOTIFICHE ex L. 53/1994 (coda ad alta priorità; invio SOLO su approvazione) ──
+// Lettura della coda: NON espone il base64 dell'allegato.
+router.get('/pec/notifiche', (req: Request, res: Response) => {
+  try { res.json({ autosend: pecAutosendNotifica(), items: getNotifiche(parseInt(String(req.query.limit || '100'), 10)) }); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+// VIA LIBERA UMANO: unico punto da cui parte l'invio reale della notifica alla controparte.
+router.post('/pec/notifiche/:id/approva-invia', async (req: Request, res: Response) => {
+  try {
+    const r = await sendNotifica(parseInt(String(req.params.id), 10));
+    res.status(r.ok ? 200 : 409).json(r);
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 

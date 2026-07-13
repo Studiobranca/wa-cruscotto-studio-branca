@@ -118,3 +118,89 @@ export function extractLiquidatedAmount(text: string): string | null {
   const any = t.match(/(?:€|euro|eur)\s*([\d.]+,\d{2})/i);
   return any ? any[1] : null;
 }
+
+
+// ─── ESTENSIONI (rev. 13/07/2026 — bis): notifica sentenza & appello ───────────
+
+/** Rileva se dalla PEC risulta una NOTIFICA della sentenza (per/da controparte o eseguita).
+ *  Serve a scegliere il termine BREVE (60 gg) vs LUNGO (6 mesi) per l'appello. */
+export function hasSentenceNotification(text: string): boolean {
+  const t = String(text || '').toLowerCase();
+  return /notific\w*\s+(?:della\s+|la\s+|l['’]?\s*)?sentenz/.test(t)
+    || /sentenz\w*[\s\S]{0,120}notificat/.test(t)
+    || /notificat\w*[\s\S]{0,40}(?:a\s+mezzo\s+)?pec/.test(t)
+    || (/(?:ai sensi|ex)\s+(?:della\s+)?(?:l\.?|legge)\s*(?:21\s+gennaio\s+1994,?\s*n\.?\s*)?53/.test(t) && /sentenz/.test(t));
+}
+
+/** Numero/anno della sentenza (es. "123/2026"), o null. Estrazione: sempre da verificare. */
+export function extractSentenceRef(text: string): string | null {
+  const t = String(text || '');
+  const m = t.match(/sentenz\w*\s+n\.?\s*(\d+\s*\/\s*\d{2,4})/i)
+    || t.match(/n\.?\s*(\d+\s*\/\s*\d{4})\s*(?:del|resa|pronunciat|deposit|pubblicat)/i);
+  return m ? m[1].replace(/\s+/g, '') : null;
+}
+
+/** Organo giudicante (es. "Corte di Giustizia Tributaria ... di Messina"), o null. */
+export function extractOrgano(text: string): string | null {
+  const t = String(text || '');
+  const m = t.match(/(Corte di Giustizia Tributaria[^\n.,;:()—–]{0,80})/i)
+    || t.match(/(Commissione Tributaria[^\n.,;:()—–]{0,80})/i);
+  if (!m) return null;
+  return m[1].replace(/\s+/g, ' ').replace(/\s+(sentenz\w*|n\.?)$/i, '').trim();
+}
+
+/** Data ISO della sentenza (vicino a "sentenza"/"depositat"/"pubblicat"/"resa in data"), o null. */
+export function extractSentenceDate(text: string): string | null {
+  const t = String(text || '');
+  const re = /(sentenz|deposit|pubblicat|resa|pronunciat)/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(t)) !== null) {
+    const near = extractDates(t.slice(m.index, m.index + 120));
+    if (near.length) return near[0];
+  }
+  const all = extractDates(t);
+  return all.length ? all[0] : null;
+}
+
+const PEC_RX = /[a-z0-9._%+\-]+@[a-z0-9.\-]*(?:pec|legalmail|postecert|cert\.legalmail|pce\.finanze|ptt|giustiziatributaria)[a-z0-9.\-]*\.[a-z]{2,}/gi;
+
+/** Tutti gli indirizzi PEC presenti nel testo (dedup, minuscolo). */
+export function extractPecAddresses(text: string): string[] {
+  const t = String(text || '');
+  const out = new Set<string>();
+  for (const m of t.matchAll(PEC_RX)) out.add(m[0].toLowerCase());
+  return [...out];
+}
+
+// Mittenti "di sistema" (corte/PTT/gestori PEC): NON sono destinatari da notificare.
+// NB: Agenzia Entrate / Agenzia Entrate-Riscossione sono CONTROPARTI (vanno notificate),
+// quindi NON compaiono qui. Escludiamo solo il PTT/corte e i gestori PEC/ricevute.
+const SYSTEM_PEC = /(posta-certificata@|@pec\.postecert|@sicurezzapostale|sigit@|giustiziatributaria|@pec\.mef|mef\.gov|pce\.finanze|@legalmail\.it$)/i;
+
+/** Seleziona gli indirizzi PEC delle CONTROPARTI: esclude il proprio utente, il mittente PEC
+ *  e i domini di sistema. Se non ricavabili con certezza ⇒ array vuoto (NON inventare). */
+export function selectCounterpartyPec(text: string, ownUser?: string, senderAddr?: string): string[] {
+  const own = String(ownUser || '').toLowerCase();
+  const sender = String(senderAddr || '').toLowerCase();
+  return extractPecAddresses(text).filter((a) => {
+    if (a === own || a === sender) return false;
+    if (SYSTEM_PEC.test(a)) return false;
+    return true;
+  });
+}
+
+/** Formatta ISO YYYY-MM-DD → GG/MM/AAAA (o stringa vuota se non valida). */
+export function formatDateIT(iso?: string | null): string {
+  if (!iso) return '';
+  const m = String(iso).match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  return m ? `${m[3]}/${m[2]}/${m[1]}` : String(iso);
+}
+
+/** Testo ESATTO della notifica ex L. 53/1994 (art. mandato). Campi non ricavati ⇒ placeholder
+ *  con "…" così l'operatore vede subito cosa completare prima dell'invio. */
+export function composeNotificaText(input: { sentenceRef?: string | null; organo?: string | null; sentenceDateHuman?: string | null }): string {
+  const nAnno = (input.sentenceRef || '…/…').replace(/^n\.?\s*/i, '');
+  const organo = input.organo || 'Corte di Giustizia Tributaria di Messina';
+  const data = input.sentenceDateHuman || '../../….';
+  return `Ai sensi e per gli effetti della Legge 21 gennaio 1994, n. 53, si trasmettono in allegato copia informatica della sentenza n. ${nAnno} resa dalla ${organo} in data ${data}. Distinti saluti. La presente valevole ad ogni fine di legge.`;
+}

@@ -89,3 +89,43 @@ export function computeRecoveryDeadline(baseDateISO: string, days = 60, importo?
     uncertain: true,
   };
 }
+
+
+/** Aggiunge N mesi a una data ISO (clamp del giorno a fine mese). */
+export function addMonths(iso: string, months: number): string {
+  const [y, m, d] = iso.split('-').map(Number);
+  let nm = (m - 1) + months;
+  const ny = y + Math.floor(nm / 12);
+  nm = ((nm % 12) + 12) % 12;
+  const daysIn = new Date(Date.UTC(ny, nm + 1, 0)).getUTCDate();
+  const nd = Math.min(d, daysIn);
+  return `${ny}-${String(nm + 1).padStart(2, '0')}-${String(nd).padStart(2, '0')}`;
+}
+
+export interface AppealInput { depositDate: string; notificationDate?: string | null; previewDays?: number }
+
+/** Termine di APPELLO: BREVE 60 gg (art. 51 D.Lgs 546/1992) se c'è la NOTIFICA della sentenza;
+ *  altrimenti LUNGO 6 mesi (art. 327 c.p.c. richiamato dall'art. 38 c.3 D.Lgs 546/1992) dalla
+ *  pubblicazione/deposito. Sospensione feriale 1–31/8 applicata. SEMPRE [DA CONFERMARE].
+ *  Ritorna anche `previewDate` (scadenza − previewDays) per il promemoria anticipato. */
+export function computeAppealDeadline(inp: AppealInput): TermProposal & { previewDate: string; tipoTermine: 'breve' | 'lungo' } {
+  const preview = inp.previewDays ?? 5;
+  let dueDate: string, tipo: string, norma: string, note: string, tipoTermine: 'breve' | 'lungo';
+  if (inp.notificationDate) {
+    dueDate = addDaysForward(inp.notificationDate, 60, true);
+    tipoTermine = 'breve';
+    tipo = 'Appello — termine BREVE (60 gg dalla notifica della sentenza)';
+    norma = 'art. 51 D.Lgs 546/1992 (60 gg dalla notifica) + sospensione feriale L. 742/1969';
+    note = 'Decorre dalla NOTIFICA della sentenza: verificare la data di notifica. Feriale 1–31/8 applicata.';
+  } else {
+    let end = addMonths(inp.depositDate, 6);
+    if (ferialeOverlaps(inp.depositDate, end)) end = addDaysForward(end, 31, false);
+    dueDate = end;
+    tipoTermine = 'lungo';
+    tipo = 'Appello — termine LUNGO (6 mesi dalla pubblicazione)';
+    norma = 'art. 327 c.p.c. (richiamato dall\'art. 38 c.3 D.Lgs 546/1992) — 6 mesi + sospensione feriale L. 742/1969';
+    note = 'Nessuna notifica risultante: termine lungo dalla PUBBLICAZIONE/DEPOSITO. Verificare la data di deposito. Feriale 1–31/8 applicata.';
+  }
+  const previewDate = addDaysForward(dueDate, -preview, false);
+  return { tipo, dueDate, norma, note, daConfermare: true, uncertain: false, previewDate, tipoTermine };
+}

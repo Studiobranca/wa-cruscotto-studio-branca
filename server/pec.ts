@@ -11,12 +11,14 @@
 import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import db from './db.js';
-import { classifyPec, extractDates, extractHearingDate, extractRG, extractHearingLink, classifyOutcome, extractLiquidatedAmount } from './pec_logic.js';
-import { computeDeadlinesFromEvent, computeRecoveryDeadline } from './pec_terms.js';
+import { classifyPec, extractDates, extractHearingDate, extractRG, extractHearingLink, classifyOutcome, extractLiquidatedAmount,
+  hasSentenceNotification, extractSentenceRef, extractOrgano, extractSentenceDate, selectCounterpartyPec, formatDateIT, composeNotificaText } from './pec_logic.js';
+import { computeDeadlinesFromEvent, computeRecoveryDeadline, computeAppealDeadline } from './pec_terms.js';
 import { createCalendarEvent } from './integrations.js';
 import { createDeadline } from './deadlines.js';
 import { sendTextMessage } from './zapi.js';
 import { getControlNumber } from './chatbot.js';
+import nodemailer from 'nodemailer';
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS pec_events (
@@ -46,9 +48,49 @@ try { db.exec(`ALTER TABLE pec_events ADD COLUMN hearing_link TEXT`); } catch { 
 try { db.exec(`ALTER TABLE pec_events ADD COLUMN is_remote INTEGER DEFAULT 0`); } catch { /* già presente */ }
 try { db.exec(`ALTER TABLE pec_events ADD COLUMN outcome TEXT`); } catch { /* già presente */ }
 try { db.exec(`ALTER TABLE pec_events ADD COLUMN amount TEXT`); } catch { /* già presente */ }
+// Migrazione (rev. 13/07 — bis): flag "sentenza notificata" per il termine di appello.
+try { db.exec(`ALTER TABLE pec_events ADD COLUMN sentence_notified INTEGER DEFAULT 0`); } catch { /* già presente */ }
+
+// ═══ CODA NOTIFICHE ex L. 53/1994 (feature B) ════════════════════════════════
+// Le notifiche della sentenza favorevole alle controparti sono PREPARATE e messe in coda
+// ad ALTA PRIORITÀ. L'INVIO REALE parte SOLO su approvazione umana
+// (POST /api/pec/notifiche/:id/approva-invia) — oppure, se PEC_AUTOSEND_NOTIFICA=1
+// (default OFF), automaticamente. Idempotente per pec_event_id.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS pec_notifiche (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pec_event_id INTEGER UNIQUE,
+    rg_ref TEXT,
+    sentence_ref TEXT,
+    organo TEXT,
+    sentence_date TEXT,
+    subject TEXT,
+    body_text TEXT,                     -- testo ESATTO ex L.53/1994
+    recipients_json TEXT,               -- PEC controparti (o [] se da verificare)
+    attachment_name TEXT,
+    attachment_b64 TEXT,                -- PDF della sentenza (base64) per l'invio
+    status TEXT DEFAULT 'pronta',       -- pronta | destinatari_da_verificare | inviata | errore
+    autosend INTEGER DEFAULT 0,
+    last_error TEXT,
+    sent_at TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_pec_notifiche_status ON pec_notifiche(status, created_at);
+`);
 
 function envSetting(key: string, def = ''): string { return (process.env[key] || def).trim(); }
 function recoveryDays(): number { return parseInt(envSetting('PEC_RECOVERY_DAYS', '60'), 10) || 60; }
+function appealPreviewDays(): number { return parseInt(envSetting('APPEAL_PREVIEW_DAYS', '5'), 10) || 5; }
+/** Auto-invio notifica SENZA via libera umano: default OFF. Documentato come RISCHIOSO. */
+export function pecAutosendNotifica(): boolean { return /^(1|true|on|yes)$/i.test(envSetting('PEC_AUTOSEND_NOTIFICA', '')); }
+function pecSmtpConfig() {
+  return {
+    host: envSetting('PEC_SMTP_HOST', 'sendm.cert.legalmail.it'),
+    port: parseInt(envSetting('PEC_SMTP_PORT', '465'), 10) || 465,
+    user: pecConfig().user,
+    pass: process.env.PEC_PASS || '',
+  };
+}
 export function pecConfig() {
   return {
     host: envSetting('PEC_IMAP_HOST', 'mbox.cert.legalmail.it'),
@@ -77,15 +119,16 @@ export function ingestPecMessage(m: {
   const link = extractHearingLink(full);
   const oc = classifyOutcome(full);
   const amount = oc.isSentenza ? extractLiquidatedAmount(full) : null;
+  const notified = oc.isSentenza && hasSentenceNotification(full) ? 1 : 0;
   const status = cls.confident ? 'nuovo' : 'da_rivedere';
   const info = db.prepare(`
     INSERT INTO pec_events (message_id, pec_uid, from_addr, subject, category, event_type, confident,
       hearing_date, rg_ref, dates_json, attachments_json, body_excerpt, status, received_at,
-      hearing_link, is_remote, outcome, amount)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      hearing_link, is_remote, outcome, amount, sentence_notified)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(m.messageId, m.uid ?? null, m.fromAddr, m.subject, cls.category, cls.eventType, cls.confident ? 1 : 0,
     hearing, rg, JSON.stringify(dates), JSON.stringify(m.attachments || []), String(m.body || '').slice(0, 500), status, m.receivedAt,
-    link.url || null, link.remote ? 1 : 0, oc.isSentenza ? oc.esito : null, amount);
+    link.url || null, link.remote ? 1 : 0, oc.isSentenza ? oc.esito : null, amount, notified);
   return Number(info.lastInsertRowid);
 }
 
@@ -163,6 +206,32 @@ export async function processPecEvent(row: any): Promise<{ ok: boolean; created:
     lines.push(`💶 [DA CONFERMARE] Recupero somme: ${rec.dueDate} (+${recoveryDays()}gg dalla notifica alla controparte — decorrenza da confermare)`);
   }
 
+  // 4) TERMINE DI APPELLO (per QUALSIASI sentenza): BREVE 60 gg se risulta la NOTIFICA
+  //    (art. 51 D.Lgs 546/1992); altrimenti LUNGO 6 mesi (art. 327 c.p.c. via art. 38 c.3
+  //    D.Lgs 546/1992) dalla pubblicazione/deposito. Feriale 1–31/8 applicata. [DA CONFERMARE].
+  //    Oltre all'evento, crea un PROMEMORIA a −N giorni (APPEAL_PREVIEW_DAYS, default 5).
+  if (row.outcome) {
+    const base = row.received_at ? String(row.received_at).slice(0, 10) : new Date().toISOString().slice(0, 10);
+    const notified = row.sentence_notified === 1;
+    const preview = appealPreviewDays();
+    const ap = computeAppealDeadline({ depositDate: base, notificationDate: notified ? base : null, previewDays: preview });
+    const decorrenza = notified
+      ? 'Decorrenza: DATA DI NOTIFICA della sentenza (prudenzialmente = data PEC) — DA CONFERMARE.'
+      : 'Decorrenza: DATA DI PUBBLICAZIONE/DEPOSITO (prudenzialmente = data PEC) — DA CONFERMARE.';
+    const aTitle = `[DA CONFERMARE] ${ap.tipo}${rg}`;
+    const aDesc = `${ap.norma}\n${ap.note}\n${decorrenza}\nFascicolo: ${row.rg_ref || 'n/d'} · PEC: ${row.subject}`;
+    const aEid = await calEvent(aTitle, aDesc, ap.dueDate, '09:00', 30);
+    if (aEid) { ids.push(`appello:${aEid}`); created++; }
+    createDeadline({ clientKey: row.rg_ref || null, tipo: `[DA CONFERMARE] ${ap.tipo}`, description: `${ap.norma} — ${ap.note}`, dueDate: ap.dueDate });
+    // Promemoria anticipato (−N gg) sul calendario + scadenzario, al numero di controllo.
+    const pTitle = `⏰ PREAVVISO ${preview}gg — scadenza appello${rg}`;
+    const pDesc = `Promemoria: fra ${preview} giorni scade il termine di appello (${ap.dueDate}).\n${ap.norma}\nVERIFICARE decorrenza (notifica/pubblicazione), giorni liberi e feriale prima di agire.`;
+    const pEid = await calEvent(pTitle, pDesc, ap.previewDate, '09:00', 30);
+    if (pEid) { ids.push(`appello_preavviso:${pEid}`); created++; }
+    createDeadline({ clientKey: row.rg_ref || null, tipo: `⏰ Preavviso appello (−${preview}gg)`, description: `Scadenza appello ${ap.dueDate} — ${ap.norma}`, dueDate: ap.previewDate });
+    lines.push(`⚖️ [DA CONFERMARE] ${ap.tipoTermine === 'breve' ? 'Appello 60gg (notifica)' : 'Appello 6 mesi (deposito)'}: ${ap.dueDate} · preavviso ${preview}gg il ${ap.previewDate}`);
+  }
+
   db.prepare(`UPDATE pec_events SET status = 'processato', calendar_event_ids = ? WHERE id = ?`).run(JSON.stringify(ids), row.id);
 
   if (lines.length) {
@@ -181,6 +250,91 @@ export async function runPecProcessing(): Promise<{ processed: number; created: 
     catch (e: any) { console.error('[PEC] processing evento', r.id, e?.message); }
   }
   return { processed, created };
+}
+
+// ═══ FEATURE B — NOTIFICA SENTENZA FAVOREVOLE ex L. 53/1994 ══════════════════
+// PREPARA la notifica alle controparti (testo esatto + allegato PDF), la mette in coda ad
+// ALTA PRIORITÀ con alert immediato ("pronto-invio a un tap"). L'INVIO REALE parte SOLO su
+// approvazione (POST .../approva-invia) o, se PEC_AUTOSEND_NOTIFICA=1 (default OFF), da solo.
+export interface PrepareNotificaInput {
+  pecEventId: number; rgRef?: string | null; fullText: string; subject: string;
+  ownUser?: string; senderAddr?: string;
+  attachment?: { filename: string; contentB64: string } | null;
+}
+
+/** Prepara (idempotente per pec_event_id) la notifica e la mette in coda. NON invia. */
+export async function prepareNotifica(inp: PrepareNotificaInput): Promise<{ ok: boolean; id?: number; status?: string; skipped?: boolean }> {
+  const exists = db.prepare(`SELECT id, status FROM pec_notifiche WHERE pec_event_id = ?`).get(inp.pecEventId) as any;
+  if (exists) return { ok: true, id: exists.id, status: exists.status, skipped: true };
+  const sentenceRef = extractSentenceRef(inp.fullText);
+  const organo = extractOrgano(inp.fullText);
+  const sentDateISO = extractSentenceDate(inp.fullText);
+  const bodyText = composeNotificaText({ sentenceRef, organo, sentenceDateHuman: formatDateIT(sentDateISO) });
+  const recipients = selectCounterpartyPec(inp.fullText, inp.ownUser, inp.senderAddr);
+  const attName = inp.attachment?.filename || null;
+  const attB64 = inp.attachment?.contentB64 || null;
+  const status = recipients.length ? 'pronta' : 'destinatari_da_verificare';
+  const subject = `Notifica ex L. 53/1994 — sentenza n. ${sentenceRef || '…/…'}${inp.rgRef ? ` — R.G. ${inp.rgRef}` : ''}`;
+  const info = db.prepare(`
+    INSERT INTO pec_notifiche (pec_event_id, rg_ref, sentence_ref, organo, sentence_date, subject,
+      body_text, recipients_json, attachment_name, attachment_b64, status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(inp.pecEventId, inp.rgRef || null, sentenceRef, organo, sentDateISO, subject,
+    bodyText, JSON.stringify(recipients), attName, attB64, status);
+  const id = Number(info.lastInsertRowid);
+
+  // Alert IMMEDIATO ad ALTA PRIORITÀ (pronto-invio a un tap).
+  const missing: string[] = [];
+  if (!recipients.length) missing.push('destinatari da verificare');
+  if (!attB64) missing.push('allegato PDF non disponibile');
+  if (!sentenceRef) missing.push('n. sentenza da completare');
+  if (!organo) missing.push('organo da completare');
+  const alert = `🚨 *NOTIFICA SENTENZA (L.53/1994) PRONTA — richiede il TUO VIA LIBERA*${inp.rgRef ? `\nR.G. ${inp.rgRef}` : ''}\n`
+    + `Destinatari: ${recipients.length ? recipients.join(', ') : '⚠️ DA VERIFICARE (nessuna PEC controparte certa)'}\n`
+    + `Allegato: ${attName || '⚠️ non disponibile'}\n\n"${bodyText}"\n\n`
+    + (missing.length ? `⚠️ Da completare: ${missing.join('; ')}.\n` : '')
+    + `➡️ Invio SOLO su approvazione: POST /api/pec/notifiche/${id}/approva-invia\n`
+    + `⚠️ La notifica fa DECORRERE il termine breve d'appello per TUTTE le parti: irreversibile.`;
+  try { await sendTextMessage(getControlNumber(), alert); } catch { /* best-effort */ }
+
+  // Auto-invio SENZA via libera SOLO se esplicitamente abilitato (default OFF) e destinatari certi.
+  if (pecAutosendNotifica() && status === 'pronta') {
+    db.prepare(`UPDATE pec_notifiche SET autosend = 1 WHERE id = ?`).run(id);
+    try { await sendNotifica(id, { viaAutosend: true }); } catch (e: any) { console.error('[PEC] autosend notifica', id, e?.message); }
+  }
+  return { ok: true, id, status };
+}
+
+/** Invio REALE via SMTP Legalmail. Parte SOLO da approvazione umana o da autosend flag.
+ *  Idempotente: se già 'inviata' → skip. Se PEC non configurata → resta in coda "pronta". */
+export async function sendNotifica(id: number, opts: { viaAutosend?: boolean } = {}): Promise<{ ok: boolean; status: string; error?: string }> {
+  const row = db.prepare(`SELECT * FROM pec_notifiche WHERE id = ?`).get(id) as any;
+  if (!row) return { ok: false, status: 'inesistente', error: 'notifica inesistente' };
+  if (row.status === 'inviata') return { ok: true, status: 'inviata' };
+  const recipients: string[] = row.recipients_json ? JSON.parse(row.recipients_json) : [];
+  if (!recipients.length) { db.prepare(`UPDATE pec_notifiche SET last_error = ? WHERE id = ?`).run('destinatari da verificare', id); return { ok: false, status: row.status, error: 'destinatari da verificare: completa i destinatari prima di inviare' }; }
+  const smtp = pecSmtpConfig();
+  if (!smtp.user || !smtp.pass) { db.prepare(`UPDATE pec_notifiche SET last_error = ? WHERE id = ?`).run('PEC non configurata (SMTP)', id); return { ok: false, status: row.status, error: 'PEC non configurata: la notifica resta in coda "pronta"' }; }
+  try {
+    const transporter = nodemailer.createTransport({ host: smtp.host, port: smtp.port, secure: true, auth: { user: smtp.user, pass: smtp.pass } });
+    const attachments = row.attachment_b64 ? [{ filename: row.attachment_name || 'sentenza.pdf', content: Buffer.from(row.attachment_b64, 'base64') }] : [];
+    await transporter.sendMail({ from: smtp.user, to: recipients.join(', '), subject: row.subject, text: row.body_text, attachments });
+    db.prepare(`UPDATE pec_notifiche SET status = 'inviata', sent_at = datetime('now'), last_error = NULL WHERE id = ?`).run(id);
+    const done = `✅ Notifica L.53/1994 INVIATA${opts.viaAutosend ? ' (autosend)' : ' (approvata)'}${row.rg_ref ? ` — R.G. ${row.rg_ref}` : ''}\nDestinatari: ${recipients.join(', ')}`;
+    try { await sendTextMessage(getControlNumber(), done); } catch { /* noop */ }
+    return { ok: true, status: 'inviata' };
+  } catch (e: any) {
+    db.prepare(`UPDATE pec_notifiche SET status = 'errore', last_error = ? WHERE id = ?`).run(String(e?.message || e).slice(0, 300), id);
+    return { ok: false, status: 'errore', error: e?.message };
+  }
+}
+
+/** Lista notifiche (SOLA LETTURA): non espone il base64 dell'allegato. */
+export function getNotifiche(limit = 100): any[] {
+  const rows = db.prepare(`SELECT id, pec_event_id, rg_ref, sentence_ref, organo, sentence_date, subject, body_text,
+    recipients_json, attachment_name, status, autosend, last_error, sent_at, created_at
+    FROM pec_notifiche ORDER BY created_at DESC LIMIT ?`).all(Math.min(Math.max(limit, 1), 500)) as any[];
+  return rows.map((r) => ({ ...r, recipients: r.recipients_json ? JSON.parse(r.recipients_json) : [], has_attachment: !!r.attachment_name }));
 }
 
 /** Poll IMAP della casella PEC (sola lettura). Idempotente per Message-ID. Non lancia mai. */
@@ -204,12 +358,26 @@ export async function pollPec(force = false): Promise<{ enabled: boolean; proces
             const messageId = parsed.messageId || `pec_${msg.uid}`;
             if (db.prepare(`SELECT 1 FROM pec_events WHERE message_id = ?`).get(messageId)) continue;
             const fromVal = (parsed.from as any)?.value?.[0] || {};
-            const atts = (parsed.attachments || []).map((a: any) => a.filename || 'allegato');
+            const attsFull = (parsed.attachments || []) as any[];
+            const atts = attsFull.map((a: any) => a.filename || 'allegato');
             const id = ingestPecMessage({
               messageId, uid: msg.uid, fromAddr: fromVal.address || '', subject: parsed.subject || '(senza oggetto)',
               body: parsed.text || '', attachments: atts, receivedAt: (parsed.date || new Date()).toISOString(),
             });
-            if (id) created++;
+            if (id) {
+              created++;
+              // FEATURE B — sentenza FAVOREVOLE/PARZIALE con PDF → PREPARA notifica ex L.53/1994
+              // (coda ad alta priorità, NESSUN invio automatico salvo flag). Isolato.
+              try {
+                const full = `${parsed.subject || ''}\n${parsed.text || ''}`;
+                const oc = classifyOutcome(full);
+                if (oc.isSentenza && (oc.esito === 'favorevole' || oc.esito === 'parziale')) {
+                  const pdf = attsFull.find((a: any) => /\.pdf$/i.test(a.filename || '') || /pdf/i.test(a.contentType || ''));
+                  const attachment = pdf && pdf.content ? { filename: pdf.filename || 'sentenza.pdf', contentB64: Buffer.from(pdf.content).toString('base64') } : null;
+                  await prepareNotifica({ pecEventId: id, rgRef: extractRG(full), fullText: full, subject: parsed.subject || '', ownUser: c.user, senderAddr: fromVal.address || '', attachment });
+                }
+              } catch (e: any) { console.error('[PEC] prepareNotifica:', e?.message); }
+            }
           } catch (e: any) { console.error('[PEC] parse messaggio fallito:', e?.message); }
         }
       }
