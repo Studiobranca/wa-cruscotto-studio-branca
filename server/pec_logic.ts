@@ -74,3 +74,47 @@ export function extractRG(text: string): string | null {
     || t.match(/\bn\.?\s*(\d+\s*\/\s*\d{4})\s*R\.?G/i);
   return m ? m[1].replace(/\s+/g, '') : null;
 }
+
+
+// ─── ESTENSIONI (rev. 13/07/2026): udienza telematica, esito sentenza, importo ──
+
+const REMOTE_MARKERS = /(udienza\s+(?:da|a)\s+(?:remoto|distanza)|da\s+remoto|videoconferenz|collegament|microsoft\s+teams|\bteams\b|skype(?:\s+for\s+business)?|\bzoom\b|meet\.google|a\s+distanza)/i;
+
+/** Udienza telematica: rileva marcatori "da remoto" ed estrae il LINK di collegamento. */
+export function extractHearingLink(text: string): { remote: boolean; url: string | null; provider: string | null } {
+  const t = String(text || '');
+  const urlm = t.match(/https?:\/\/[^\s"'<>()\]]+/i);
+  const url = urlm ? urlm[0].replace(/[.,;:)\]]+$/, '') : null;
+  let provider: string | null = null;
+  if (url) {
+    if (/teams\.microsoft\.com|teams\.live|teams\.gov/i.test(url)) provider = 'Teams';
+    else if (/skype/i.test(url)) provider = 'Skype';
+    else if (/zoom\.us/i.test(url)) provider = 'Zoom';
+    else if (/meet\.google/i.test(url)) provider = 'Google Meet';
+    else provider = 'URL';
+  } else if (/microsoft\s+teams|\bteams\b/i.test(t)) provider = 'Teams';
+  else if (/skype/i.test(t)) provider = 'Skype';
+  const remote = REMOTE_MARKERS.test(t) || !!url;
+  return { remote, url, provider };
+}
+
+/** Classifica una sentenza e il suo ESITO (dal dispositivo). Estrazione da testo/PDF: da verificare. */
+export function classifyOutcome(text: string): { isSentenza: boolean; esito: 'favorevole' | 'parziale' | 'sfavorevole' | 'incerto' } {
+  const t = String(text || '').toLowerCase();
+  const isSentenza = /sentenza|dispositivo|p\.?\s?q\.?\s?m\.?|per questi motivi/.test(t);
+  let esito: 'favorevole' | 'parziale' | 'sfavorevole' | 'incerto' = 'incerto';
+  if (/accoglie\s+parzialment|parzialment\w*\s+.*accogli|accoglie\s+in\s+parte|in\s+parte\s+il\s+ricorso/.test(t)) esito = 'parziale';
+  else if (/accoglie\s+il\s+ricorso|in\s+accoglimento|annulla\s+l['’ ]?atto|dichiara\s+illegittim|accoglie\s+l['’ ]?appello/.test(t)) esito = 'favorevole';
+  else if (/rigetta\s+il\s+ricorso|respinge\s+il\s+ricorso|dichiara\s+inammissibil|rigetta\s+l['’ ]?appello|respinge\s+l['’ ]?appello/.test(t)) esito = 'sfavorevole';
+  return { isSentenza, esito };
+}
+
+/** Importo delle spese/compenso liquidato (dispositivo). Ritorna la stringa italiana (es. "1.500,00")
+ *  o null. È un'estrazione: SEMPRE [DA VERIFICARE] dal Dott. Branca. */
+export function extractLiquidatedAmount(text: string): string | null {
+  const t = String(text || '');
+  const ctx = t.match(/(?:spese[\s\S]{0,60}?liquidat[ei][\s\S]{0,40}?|condann[a-z]+[\s\S]{0,80}?pagamento[\s\S]{0,60}?)(?:€|euro|eur)\s*([\d.]+,\d{2})/i);
+  if (ctx) return ctx[1];
+  const any = t.match(/(?:€|euro|eur)\s*([\d.]+,\d{2})/i);
+  return any ? any[1] : null;
+}

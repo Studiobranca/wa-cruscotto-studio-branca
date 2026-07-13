@@ -62,8 +62,8 @@ import { selectPendingOutcome, isValidOutcome } from './agenda_logic.js';
 import { createChecklist, getChecklist, getChecklistGrouped, markDocReceived, buildDocRequestText } from './practices.js';
 import { smsStatus } from './sms.js';
 import { getPecEvents, getPecStatus, pollPec } from './pec.js';
-import { classifyPec, extractDates, extractHearingDate, extractRG } from './pec_logic.js';
-import { computeDeadlinesFromEvent } from './pec_terms.js';
+import { classifyPec, extractDates, extractHearingDate, extractRG, extractHearingLink, classifyOutcome, extractLiquidatedAmount } from './pec_logic.js';
+import { computeDeadlinesFromEvent, computeRecoveryDeadline } from './pec_terms.js';
 
 const router = Router();
 
@@ -87,7 +87,7 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.12.4', built: new Date().toISOString() });
+  res.json({ version: '2.13.0', built: new Date().toISOString() });
 });
 
 // ─── Autocheck (self-test + autocorrezione) ──────────────────────────────────
@@ -1634,8 +1634,21 @@ router.post('/pec/simulate', (req: Request, res: Response) => {
     const text = `${subject}\n${body}`;
     const cls = classifyPec(String(sender), String(subject), String(body));
     const hearing = extractHearingDate(text);
-    const terms = computeDeadlinesFromEvent({ eventType: cls.eventType, category: cls.category, hearingDate: hearing, baseDate: baseDate || new Date().toISOString().slice(0, 10) });
-    res.json({ classification: cls, hearingDate: hearing, rg: extractRG(text), dates: extractDates(text), termini: terms, nota: 'DRY-RUN: nessuna scrittura, nessun calendario, i termini sono [DA CONFERMARE].' });
+    const base = baseDate || new Date().toISOString().slice(0, 10);
+    const terms = computeDeadlinesFromEvent({ eventType: cls.eventType, category: cls.category, hearingDate: hearing, baseDate: base });
+    const link = extractHearingLink(text);           // CASO 1
+    const oc = classifyOutcome(text);                // CASO 2
+    const amount = oc.isSentenza ? extractLiquidatedAmount(text) : null;
+    const recupero = (oc.esito === 'favorevole' || oc.esito === 'parziale')  // CASO 3
+      ? computeRecoveryDeadline(base, parseInt(String(req.query.recoveryDays || process.env.PEC_RECOVERY_DAYS || '60'), 10) || 60, amount)
+      : null;
+    res.json({
+      classification: cls, hearingDate: hearing, rg: extractRG(text), dates: extractDates(text), termini: terms,
+      udienzaTelematica: { remote: link.remote, provider: link.provider, url: link.url, linkDaVerificare: link.remote && !link.url },
+      sentenza: { isSentenza: oc.isSentenza, esito: oc.esito, importoLiquidato: amount, importoNota: '[DA VERIFICARE]' },
+      recuperoSomme: recupero,
+      nota: 'DRY-RUN: nessuna scrittura, nessun calendario. Termini/importi [DA CONFERMARE]/[DA VERIFICARE].',
+    });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 

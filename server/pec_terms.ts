@@ -74,3 +74,18 @@ export function computeDeadlinesFromEvent(ev: PecTermInput): TermProposal[] {
   }
   return out;
 }
+
+
+/** Scadenza "recupero somme" a +N gg (default 60) dalla notifica della sentenza alla controparte.
+ *  Se la data di notifica alla controparte non è certa, il chiamante passa la data disponibile più
+ *  prudente e lo segnala. SEMPRE [DA CONFERMARE]. */
+export function computeRecoveryDeadline(baseDateISO: string, days = 60, importo?: string | null): TermProposal {
+  return {
+    tipo: `Richiesta somme / recupero compenso liquidato${importo ? ` (€ ${importo} [DA VERIFICARE])` : ''}`,
+    dueDate: addDaysForward(baseDateISO, days, false),
+    norma: `Termine prudenziale +${days} gg dalla notifica della sentenza alla controparte`,
+    note: 'DECORRENZA DA CONFERMARE: verificare la data di notifica della sentenza alla controparte; qui usata la data disponibile più prudente (non inventata).',
+    daConfermare: true,
+    uncertain: true,
+  };
+}

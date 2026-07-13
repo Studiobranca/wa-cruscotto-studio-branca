@@ -24593,6 +24593,7 @@ async function createCalendarEvent(params) {
     const event = {
       summary: params.title,
       description: params.description,
+      ...params.location ? { location: params.location } : {},
       start: { dateTime: params.startDate, timeZone: "Europe/Rome" },
       end: { dateTime: params.endDate, timeZone: "Europe/Rome" },
       reminders: {
@@ -101008,11 +101009,44 @@ function extractRG(text) {
   const m = t.match(/R\.?\s*G\.?\s*R?\.?\s*(?:n\.?\s*)?(\d+\s*\/\s*\d{4})/i) || t.match(/ruolo\s+generale[^\d]{0,20}(\d+\s*\/\s*\d{4})/i) || t.match(/\bn\.?\s*(\d+\s*\/\s*\d{4})\s*R\.?G/i);
   return m ? m[1].replace(/\s+/g, "") : null;
 }
-var MESI;
+function extractHearingLink(text) {
+  const t = String(text || "");
+  const urlm = t.match(/https?:\/\/[^\s"'<>()\]]+/i);
+  const url = urlm ? urlm[0].replace(/[.,;:)\]]+$/, "") : null;
+  let provider = null;
+  if (url) {
+    if (/teams\.microsoft\.com|teams\.live|teams\.gov/i.test(url)) provider = "Teams";
+    else if (/skype/i.test(url)) provider = "Skype";
+    else if (/zoom\.us/i.test(url)) provider = "Zoom";
+    else if (/meet\.google/i.test(url)) provider = "Google Meet";
+    else provider = "URL";
+  } else if (/microsoft\s+teams|\bteams\b/i.test(t)) provider = "Teams";
+  else if (/skype/i.test(t)) provider = "Skype";
+  const remote = REMOTE_MARKERS.test(t) || !!url;
+  return { remote, url, provider };
+}
+function classifyOutcome(text) {
+  const t = String(text || "").toLowerCase();
+  const isSentenza = /sentenza|dispositivo|p\.?\s?q\.?\s?m\.?|per questi motivi/.test(t);
+  let esito = "incerto";
+  if (/accoglie\s+parzialment|parzialment\w*\s+.*accogli|accoglie\s+in\s+parte|in\s+parte\s+il\s+ricorso/.test(t)) esito = "parziale";
+  else if (/accoglie\s+il\s+ricorso|in\s+accoglimento|annulla\s+l['’ ]?atto|dichiara\s+illegittim|accoglie\s+l['’ ]?appello/.test(t)) esito = "favorevole";
+  else if (/rigetta\s+il\s+ricorso|respinge\s+il\s+ricorso|dichiara\s+inammissibil|rigetta\s+l['’ ]?appello|respinge\s+l['’ ]?appello/.test(t)) esito = "sfavorevole";
+  return { isSentenza, esito };
+}
+function extractLiquidatedAmount(text) {
+  const t = String(text || "");
+  const ctx = t.match(/(?:spese[\s\S]{0,60}?liquidat[ei][\s\S]{0,40}?|condann[a-z]+[\s\S]{0,80}?pagamento[\s\S]{0,60}?)(?:€|euro|eur)\s*([\d.]+,\d{2})/i);
+  if (ctx) return ctx[1];
+  const any = t.match(/(?:€|euro|eur)\s*([\d.]+,\d{2})/i);
+  return any ? any[1] : null;
+}
+var MESI, REMOTE_MARKERS;
 var init_pec_logic = __esm({
   "server/pec_logic.ts"() {
     "use strict";
     MESI = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"];
+    REMOTE_MARKERS = /(udienza\s+(?:da|a)\s+(?:remoto|distanza)|da\s+remoto|videoconferenz|collegament|microsoft\s+teams|\bteams\b|skype(?:\s+for\s+business)?|\bzoom\b|meet\.google|a\s+distanza)/i;
   }
 });
 
@@ -101083,6 +101117,16 @@ function computeDeadlinesFromEvent(ev) {
   }
   return out;
 }
+function computeRecoveryDeadline(baseDateISO, days = 60, importo) {
+  return {
+    tipo: `Richiesta somme / recupero compenso liquidato${importo ? ` (\u20AC ${importo} [DA VERIFICARE])` : ""}`,
+    dueDate: addDaysForward(baseDateISO, days, false),
+    norma: `Termine prudenziale +${days} gg dalla notifica della sentenza alla controparte`,
+    note: "DECORRENZA DA CONFERMARE: verificare la data di notifica della sentenza alla controparte; qui usata la data disponibile pi\xF9 prudente (non inventata).",
+    daConfermare: true,
+    uncertain: true
+  };
+}
 var init_pec_terms = __esm({
   "server/pec_terms.ts"() {
     "use strict";
@@ -101103,6 +101147,9 @@ __export(pec_exports, {
 });
 function envSetting(key, def = "") {
   return (process.env[key] || def).trim();
+}
+function recoveryDays() {
+  return parseInt(envSetting("PEC_RECOVERY_DAYS", "60"), 10) || 60;
 }
 function pecConfig() {
   return {
@@ -101132,18 +101179,21 @@ function getSetting3(k) {
 function ingestPecMessage(m) {
   const exists = db_default.prepare(`SELECT id FROM pec_events WHERE message_id = ?`).get(m.messageId);
   if (exists) return null;
+  const full = `${m.subject}
+${m.body}`;
   const cls = classifyPec(m.fromAddr, m.subject, m.body);
-  const hearing = extractHearingDate(`${m.subject}
-${m.body}`);
-  const rg = extractRG(`${m.subject}
-${m.body}`);
-  const dates = extractDates(`${m.subject}
-${m.body}`);
+  const hearing = extractHearingDate(full);
+  const rg = extractRG(full);
+  const dates = extractDates(full);
+  const link = extractHearingLink(full);
+  const oc = classifyOutcome(full);
+  const amount = oc.isSentenza ? extractLiquidatedAmount(full) : null;
   const status = cls.confident ? "nuovo" : "da_rivedere";
   const info = db_default.prepare(`
     INSERT INTO pec_events (message_id, pec_uid, from_addr, subject, category, event_type, confident,
-      hearing_date, rg_ref, dates_json, attachments_json, body_excerpt, status, received_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      hearing_date, rg_ref, dates_json, attachments_json, body_excerpt, status, received_at,
+      hearing_link, is_remote, outcome, amount)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     m.messageId,
     m.uid ?? null,
@@ -101158,16 +101208,20 @@ ${m.body}`);
     JSON.stringify(m.attachments || []),
     String(m.body || "").slice(0, 500),
     status,
-    m.receivedAt
+    m.receivedAt,
+    link.url || null,
+    link.remote ? 1 : 0,
+    oc.isSentenza ? oc.esito : null,
+    amount
   );
   return Number(info.lastInsertRowid);
 }
-async function calEvent(title, description, dateISO, startHHMM = "09:00", durMin = 60) {
+async function calEvent(title, description, dateISO, startHHMM = "09:00", durMin = 60, location) {
   const start = `${dateISO}T${startHHMM}:00`;
   const endMs = Date.parse(start) + durMin * 6e4;
   const end = new Date(endMs).toISOString().slice(0, 19);
   try {
-    const r = await createCalendarEvent({ title, description, startDate: start, endDate: end });
+    const r = await createCalendarEvent({ title, description, startDate: start, endDate: end, location });
     return r.success ? r.eventId || "created" : null;
   } catch {
     return null;
@@ -101181,17 +101235,23 @@ async function processPecEvent(row) {
   let created = 0;
   const lines = [];
   if (row.hearing_date) {
-    const title = `\u2696\uFE0F UDIENZA${rg} \u2014 ${row.category}`;
+    const isRemote = row.is_remote === 1;
+    const link = row.hearing_link || null;
+    const remoteTag = isRemote ? link ? " (da remoto \u2014 link in agenda)" : " (da remoto \u2014 [link da verificare])" : "";
+    const title = `\u2696\uFE0F UDIENZA${rg} \u2014 ${row.category}${isRemote ? " [TELEMATICA]" : ""}`;
+    const linkLine = isRemote ? link ? `
+\u{1F517} Collegamento: ${link}` : `
+\u{1F517} Udienza da remoto \u2014 [link da verificare] (non estratto con certezza dalla PEC)` : "";
     const desc = `Udienza fissata (fonte PEC). Oggetto: ${row.subject}
 Mittente: ${who}
-\u23F0 Orario da verificare sull'avviso.`;
-    const eid = await calEvent(title, desc, row.hearing_date, "09:00", 60);
+\u23F0 Orario da verificare sull'avviso.${linkLine}`;
+    const eid = await calEvent(title, desc, row.hearing_date, "09:00", 60, link || void 0);
     if (eid) {
       ids.push(`hearing:${eid}`);
       created++;
     }
-    createDeadline({ clientKey: row.rg_ref || null, tipo: "Udienza CGT", description: `${row.subject} (orario da verificare)`, dueDate: row.hearing_date });
-    lines.push(`\u2696\uFE0F Udienza${rg}: ${row.hearing_date} (orario da verificare)`);
+    createDeadline({ clientKey: row.rg_ref || null, tipo: `Udienza CGT${isRemote ? " (telematica)" : ""}`, description: `${row.subject}${isRemote ? link ? ` \u2014 link: ${link}` : " \u2014 [link da verificare]" : ""} (orario da verificare)`, dueDate: row.hearing_date });
+    lines.push(`\u2696\uFE0F Udienza${rg}: ${row.hearing_date}${remoteTag}`);
   }
   const terms = computeDeadlinesFromEvent({ eventType: row.event_type, category: row.category, hearingDate: row.hearing_date, baseDate: row.received_at ? String(row.received_at).slice(0, 10) : null });
   for (const t of terms) {
@@ -101207,6 +101267,34 @@ Fascicolo: ${row.rg_ref || "n/d"} \xB7 PEC: ${row.subject}`;
     createDeadline({ clientKey: row.rg_ref || null, tipo: `[DA CONFERMARE] ${t.tipo}`, description: `${t.norma} \u2014 ${t.note}`, dueDate: t.dueDate });
     lines.push(`\u2022 [DA CONFERMARE] ${t.tipo}: ${t.dueDate} (${t.norma})`);
   }
+  if (row.outcome === "favorevole" || row.outcome === "parziale") {
+    const base = row.received_at ? String(row.received_at).slice(0, 10) : (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
+    const importo = row.amount || null;
+    const impTxt = importo ? `\u20AC ${importo} [DA VERIFICARE]` : "importo non estratto [DA VERIFICARE]";
+    const cTitle = `[DA VERIFICARE] Compenso liquidato${rg} \u2014 ${impTxt}`;
+    const cDesc = `Sentenza ${row.outcome} (fonte PEC). Compenso/spese liquidate a favore: ${impTxt}.
+L'importo \xE8 un'ESTRAZIONE dal testo/PDF e va CONFERMATO dal Dott. Branca.
+PEC: ${row.subject}`;
+    const cEid = await calEvent(cTitle, cDesc, base, "09:00", 30);
+    if (cEid) {
+      ids.push(`compenso:${cEid}`);
+      created++;
+    }
+    createDeadline({ clientKey: row.rg_ref || null, tipo: `[DA VERIFICARE] Compenso liquidato`, description: `Sentenza ${row.outcome} \u2014 ${impTxt}`, dueDate: base });
+    lines.push(`\u2696\uFE0F Sentenza ${row.outcome}${rg}: compenso ${impTxt}`);
+    const rec = computeRecoveryDeadline(base, recoveryDays(), importo);
+    const rTitle = `[DA CONFERMARE] ${rec.tipo}${rg}`;
+    const rDesc = `${rec.norma}
+${rec.note}
+Fascicolo: ${row.rg_ref || "n/d"} \xB7 PEC: ${row.subject}`;
+    const rEid = await calEvent(rTitle, rDesc, rec.dueDate, "09:00", 30);
+    if (rEid) {
+      ids.push(`recupero:${rEid}`);
+      created++;
+    }
+    createDeadline({ clientKey: row.rg_ref || null, tipo: `[DA CONFERMARE] ${rec.tipo}`, description: `${rec.norma} \u2014 ${rec.note}`, dueDate: rec.dueDate });
+    lines.push(`\u{1F4B6} [DA CONFERMARE] Recupero somme: ${rec.dueDate} (+${recoveryDays()}gg dalla notifica alla controparte \u2014 decorrenza da confermare)`);
+  }
   db_default.prepare(`UPDATE pec_events SET status = 'processato', calendar_event_ids = ? WHERE id = ?`).run(JSON.stringify(ids), row.id);
   if (lines.length) {
     const alert = `\u{1F4E9} *PEC contenzioso* \u2014 nuovo evento${rg}
@@ -101214,7 +101302,7 @@ ${row.subject}
 
 ${lines.join("\n")}
 
-\u26A0\uFE0F I termini sono PROPOSTE [DA CONFERMARE]: verifica sull'atto (date di notifica, giorni liberi, feriale).`;
+\u26A0\uFE0F Termini/importi sono PROPOSTE [DA CONFERMARE]/[DA VERIFICARE]: verifica sull'atto (notifiche, giorni liberi, feriale, importo).`;
     try {
       await sendTextMessage(getControlNumber(), alert);
     } catch {
@@ -101353,6 +101441,22 @@ var init_pec = __esm({
   );
   CREATE INDEX IF NOT EXISTS idx_pec_events_status ON pec_events(status, created_at);
 `);
+    try {
+      db_default.exec(`ALTER TABLE pec_events ADD COLUMN hearing_link TEXT`);
+    } catch {
+    }
+    try {
+      db_default.exec(`ALTER TABLE pec_events ADD COLUMN is_remote INTEGER DEFAULT 0`);
+    } catch {
+    }
+    try {
+      db_default.exec(`ALTER TABLE pec_events ADD COLUMN outcome TEXT`);
+    } catch {
+    }
+    try {
+      db_default.exec(`ALTER TABLE pec_events ADD COLUMN amount TEXT`);
+    } catch {
+    }
   }
 });
 
@@ -102682,7 +102786,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.12.4", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.13.0", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/selftest", (_req, res) => {
   res.json(getLastSelfCheck() || { note: "mai eseguito" });
@@ -104046,8 +104150,23 @@ router.post("/pec/simulate", (req, res) => {
 ${body}`;
     const cls = classifyPec(String(sender), String(subject), String(body));
     const hearing = extractHearingDate(text);
-    const terms = computeDeadlinesFromEvent({ eventType: cls.eventType, category: cls.category, hearingDate: hearing, baseDate: baseDate || (/* @__PURE__ */ new Date()).toISOString().slice(0, 10) });
-    res.json({ classification: cls, hearingDate: hearing, rg: extractRG(text), dates: extractDates(text), termini: terms, nota: "DRY-RUN: nessuna scrittura, nessun calendario, i termini sono [DA CONFERMARE]." });
+    const base = baseDate || (/* @__PURE__ */ new Date()).toISOString().slice(0, 10);
+    const terms = computeDeadlinesFromEvent({ eventType: cls.eventType, category: cls.category, hearingDate: hearing, baseDate: base });
+    const link = extractHearingLink(text);
+    const oc = classifyOutcome(text);
+    const amount = oc.isSentenza ? extractLiquidatedAmount(text) : null;
+    const recupero = oc.esito === "favorevole" || oc.esito === "parziale" ? computeRecoveryDeadline(base, parseInt(String(req.query.recoveryDays || process.env.PEC_RECOVERY_DAYS || "60"), 10) || 60, amount) : null;
+    res.json({
+      classification: cls,
+      hearingDate: hearing,
+      rg: extractRG(text),
+      dates: extractDates(text),
+      termini: terms,
+      udienzaTelematica: { remote: link.remote, provider: link.provider, url: link.url, linkDaVerificare: link.remote && !link.url },
+      sentenza: { isSentenza: oc.isSentenza, esito: oc.esito, importoLiquidato: amount, importoNota: "[DA VERIFICARE]" },
+      recuperoSomme: recupero,
+      nota: "DRY-RUN: nessuna scrittura, nessun calendario. Termini/importi [DA CONFERMARE]/[DA VERIFICARE]."
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

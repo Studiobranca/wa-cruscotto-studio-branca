@@ -11,8 +11,8 @@
 import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import db from './db.js';
-import { classifyPec, extractDates, extractHearingDate, extractRG } from './pec_logic.js';
-import { computeDeadlinesFromEvent } from './pec_terms.js';
+import { classifyPec, extractDates, extractHearingDate, extractRG, extractHearingLink, classifyOutcome, extractLiquidatedAmount } from './pec_logic.js';
+import { computeDeadlinesFromEvent, computeRecoveryDeadline } from './pec_terms.js';
 import { createCalendarEvent } from './integrations.js';
 import { createDeadline } from './deadlines.js';
 import { sendTextMessage } from './zapi.js';
@@ -41,8 +41,14 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_pec_events_status ON pec_events(status, created_at);
 `);
+// Migrazioni (rev. 13/07): udienza telematica (link), esito sentenza + importo liquidato.
+try { db.exec(`ALTER TABLE pec_events ADD COLUMN hearing_link TEXT`); } catch { /* già presente */ }
+try { db.exec(`ALTER TABLE pec_events ADD COLUMN is_remote INTEGER DEFAULT 0`); } catch { /* già presente */ }
+try { db.exec(`ALTER TABLE pec_events ADD COLUMN outcome TEXT`); } catch { /* già presente */ }
+try { db.exec(`ALTER TABLE pec_events ADD COLUMN amount TEXT`); } catch { /* già presente */ }
 
 function envSetting(key: string, def = ''): string { return (process.env[key] || def).trim(); }
+function recoveryDays(): number { return parseInt(envSetting('PEC_RECOVERY_DAYS', '60'), 10) || 60; }
 export function pecConfig() {
   return {
     host: envSetting('PEC_IMAP_HOST', 'mbox.cert.legalmail.it'),
@@ -63,17 +69,23 @@ export function ingestPecMessage(m: {
 }): number | null {
   const exists = db.prepare(`SELECT id FROM pec_events WHERE message_id = ?`).get(m.messageId) as any;
   if (exists) return null;
+  const full = `${m.subject}\n${m.body}`;
   const cls = classifyPec(m.fromAddr, m.subject, m.body);
-  const hearing = extractHearingDate(`${m.subject}\n${m.body}`);
-  const rg = extractRG(`${m.subject}\n${m.body}`);
-  const dates = extractDates(`${m.subject}\n${m.body}`);
+  const hearing = extractHearingDate(full);
+  const rg = extractRG(full);
+  const dates = extractDates(full);
+  const link = extractHearingLink(full);
+  const oc = classifyOutcome(full);
+  const amount = oc.isSentenza ? extractLiquidatedAmount(full) : null;
   const status = cls.confident ? 'nuovo' : 'da_rivedere';
   const info = db.prepare(`
     INSERT INTO pec_events (message_id, pec_uid, from_addr, subject, category, event_type, confident,
-      hearing_date, rg_ref, dates_json, attachments_json, body_excerpt, status, received_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      hearing_date, rg_ref, dates_json, attachments_json, body_excerpt, status, received_at,
+      hearing_link, is_remote, outcome, amount)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(m.messageId, m.uid ?? null, m.fromAddr, m.subject, cls.category, cls.eventType, cls.confident ? 1 : 0,
-    hearing, rg, JSON.stringify(dates), JSON.stringify(m.attachments || []), String(m.body || '').slice(0, 500), status, m.receivedAt);
+    hearing, rg, JSON.stringify(dates), JSON.stringify(m.attachments || []), String(m.body || '').slice(0, 500), status, m.receivedAt,
+    link.url || null, link.remote ? 1 : 0, oc.isSentenza ? oc.esito : null, amount);
   return Number(info.lastInsertRowid);
 }
 
@@ -82,11 +94,11 @@ export function ingestPecMessage(m: {
 // nello scadenzario (bot_deadlines). I termini calcolati hanno prefisso "[DA CONFERMARE]".
 // Idempotente: se il pec_event è già 'processato' (calendar_event_ids valorizzato) → skip.
 // Nessun invio ai clienti/enti: solo agenda interna + alert al numero di controllo.
-async function calEvent(title: string, description: string, dateISO: string, startHHMM = '09:00', durMin = 60): Promise<string | null> {
+async function calEvent(title: string, description: string, dateISO: string, startHHMM = '09:00', durMin = 60, location?: string): Promise<string | null> {
   const start = `${dateISO}T${startHHMM}:00`;
   const endMs = Date.parse(start) + durMin * 60000;
   const end = new Date(endMs).toISOString().slice(0, 19); // locale-naive ISO; timeZone gestita dall'integrazione
-  try { const r = await createCalendarEvent({ title, description, startDate: start, endDate: end }); return r.success ? (r.eventId || 'created') : null; }
+  try { const r = await createCalendarEvent({ title, description, startDate: start, endDate: end, location }); return r.success ? (r.eventId || 'created') : null; }
   catch { return null; }
 }
 
@@ -100,13 +112,18 @@ export async function processPecEvent(row: any): Promise<{ ok: boolean; created:
   const lines: string[] = [];
 
   // 1) UDIENZA (data certa comunicata dall'ente → NON [DA CONFERMARE], ma orario da verificare)
+  //    CASO 1: se telematica, il link di collegamento va nell'evento (location + descrizione).
   if (row.hearing_date) {
-    const title = `⚖️ UDIENZA${rg} — ${row.category}`;
-    const desc = `Udienza fissata (fonte PEC). Oggetto: ${row.subject}\nMittente: ${who}\n⏰ Orario da verificare sull'avviso.`;
-    const eid = await calEvent(title, desc, row.hearing_date, '09:00', 60);
+    const isRemote = row.is_remote === 1;
+    const link: string | null = row.hearing_link || null;
+    const remoteTag = isRemote ? (link ? ' (da remoto — link in agenda)' : ' (da remoto — [link da verificare])') : '';
+    const title = `⚖️ UDIENZA${rg} — ${row.category}${isRemote ? ' [TELEMATICA]' : ''}`;
+    const linkLine = isRemote ? (link ? `\n🔗 Collegamento: ${link}` : `\n🔗 Udienza da remoto — [link da verificare] (non estratto con certezza dalla PEC)`) : '';
+    const desc = `Udienza fissata (fonte PEC). Oggetto: ${row.subject}\nMittente: ${who}\n⏰ Orario da verificare sull'avviso.${linkLine}`;
+    const eid = await calEvent(title, desc, row.hearing_date, '09:00', 60, link || undefined);
     if (eid) { ids.push(`hearing:${eid}`); created++; }
-    createDeadline({ clientKey: row.rg_ref || null, tipo: 'Udienza CGT', description: `${row.subject} (orario da verificare)`, dueDate: row.hearing_date });
-    lines.push(`⚖️ Udienza${rg}: ${row.hearing_date} (orario da verificare)`);
+    createDeadline({ clientKey: row.rg_ref || null, tipo: `Udienza CGT${isRemote ? ' (telematica)' : ''}`, description: `${row.subject}${isRemote ? (link ? ` — link: ${link}` : ' — [link da verificare]') : ''} (orario da verificare)`, dueDate: row.hearing_date });
+    lines.push(`⚖️ Udienza${rg}: ${row.hearing_date}${remoteTag}`);
   }
 
   // 2) TERMINI calcolati → SEMPRE [DA CONFERMARE]
@@ -120,10 +137,36 @@ export async function processPecEvent(row: any): Promise<{ ok: boolean; created:
     lines.push(`• [DA CONFERMARE] ${t.tipo}: ${t.dueDate} (${t.norma})`);
   }
 
+  // 3) SENTENZA FAVOREVOLE → compenso liquidato [DA VERIFICARE] + recupero somme +N gg [DA CONFERMARE]
+  //    (CASO 2 e CASO 3). L'importo è un'estrazione da testo/PDF: SEMPRE da verificare.
+  if (row.outcome === 'favorevole' || row.outcome === 'parziale') {
+    const base = row.received_at ? String(row.received_at).slice(0, 10) : new Date().toISOString().slice(0, 10);
+    const importo = row.amount || null;
+    const impTxt = importo ? `€ ${importo} [DA VERIFICARE]` : 'importo non estratto [DA VERIFICARE]';
+    // Nota compenso sul giorno della sentenza (fonte PEC).
+    const cTitle = `[DA VERIFICARE] Compenso liquidato${rg} — ${impTxt}`;
+    const cDesc = `Sentenza ${row.outcome} (fonte PEC). Compenso/spese liquidate a favore: ${impTxt}.\nL'importo è un'ESTRAZIONE dal testo/PDF e va CONFERMATO dal Dott. Branca.\nPEC: ${row.subject}`;
+    const cEid = await calEvent(cTitle, cDesc, base, '09:00', 30);
+    if (cEid) { ids.push(`compenso:${cEid}`); created++; }
+    createDeadline({ clientKey: row.rg_ref || null, tipo: `[DA VERIFICARE] Compenso liquidato`, description: `Sentenza ${row.outcome} — ${impTxt}`, dueDate: base });
+    lines.push(`⚖️ Sentenza ${row.outcome}${rg}: compenso ${impTxt}`);
+
+    // CASO 3: scadenza recupero somme a +N gg dalla notifica alla controparte.
+    // La data di notifica alla controparte spesso NON è nella PEC della sentenza:
+    // si usa la data disponibile più prudente (base) e lo si segnala esplicitamente.
+    const rec = computeRecoveryDeadline(base, recoveryDays(), importo);
+    const rTitle = `[DA CONFERMARE] ${rec.tipo}${rg}`;
+    const rDesc = `${rec.norma}\n${rec.note}\nFascicolo: ${row.rg_ref || 'n/d'} · PEC: ${row.subject}`;
+    const rEid = await calEvent(rTitle, rDesc, rec.dueDate, '09:00', 30);
+    if (rEid) { ids.push(`recupero:${rEid}`); created++; }
+    createDeadline({ clientKey: row.rg_ref || null, tipo: `[DA CONFERMARE] ${rec.tipo}`, description: `${rec.norma} — ${rec.note}`, dueDate: rec.dueDate });
+    lines.push(`💶 [DA CONFERMARE] Recupero somme: ${rec.dueDate} (+${recoveryDays()}gg dalla notifica alla controparte — decorrenza da confermare)`);
+  }
+
   db.prepare(`UPDATE pec_events SET status = 'processato', calendar_event_ids = ? WHERE id = ?`).run(JSON.stringify(ids), row.id);
 
   if (lines.length) {
-    const alert = `📩 *PEC contenzioso* — nuovo evento${rg}\n${row.subject}\n\n${lines.join('\n')}\n\n⚠️ I termini sono PROPOSTE [DA CONFERMARE]: verifica sull'atto (date di notifica, giorni liberi, feriale).`;
+    const alert = `📩 *PEC contenzioso* — nuovo evento${rg}\n${row.subject}\n\n${lines.join('\n')}\n\n⚠️ Termini/importi sono PROPOSTE [DA CONFERMARE]/[DA VERIFICARE]: verifica sull'atto (notifiche, giorni liberi, feriale, importo).`;
     try { await sendTextMessage(getControlNumber(), alert); } catch { /* best-effort */ }
   }
   return { ok: true, created };
