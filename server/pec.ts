@@ -12,6 +12,11 @@ import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import db from './db.js';
 import { classifyPec, extractDates, extractHearingDate, extractRG } from './pec_logic.js';
+import { computeDeadlinesFromEvent } from './pec_terms.js';
+import { createCalendarEvent } from './integrations.js';
+import { createDeadline } from './deadlines.js';
+import { sendTextMessage } from './zapi.js';
+import { getControlNumber } from './chatbot.js';
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS pec_events (
@@ -72,6 +77,69 @@ export function ingestPecMessage(m: {
   return Number(info.lastInsertRowid);
 }
 
+// ═══ BLOCCO 3 — CALENDARIZZAZIONE (idempotente) ══════════════════════════════
+// Per ogni UDIENZA e ogni TERMINE calcolato crea un evento Google Calendar + una voce
+// nello scadenzario (bot_deadlines). I termini calcolati hanno prefisso "[DA CONFERMARE]".
+// Idempotente: se il pec_event è già 'processato' (calendar_event_ids valorizzato) → skip.
+// Nessun invio ai clienti/enti: solo agenda interna + alert al numero di controllo.
+async function calEvent(title: string, description: string, dateISO: string, startHHMM = '09:00', durMin = 60): Promise<string | null> {
+  const start = `${dateISO}T${startHHMM}:00`;
+  const endMs = Date.parse(start) + durMin * 60000;
+  const end = new Date(endMs).toISOString().slice(0, 19); // locale-naive ISO; timeZone gestita dall'integrazione
+  try { const r = await createCalendarEvent({ title, description, startDate: start, endDate: end }); return r.success ? (r.eventId || 'created') : null; }
+  catch { return null; }
+}
+
+/** Processa UN pec_event (confident): crea eventi Calendar + scadenze. Idempotente. */
+export async function processPecEvent(row: any): Promise<{ ok: boolean; created: number; skipped?: boolean }> {
+  if (!row || row.status === 'processato' || row.calendar_event_ids) return { ok: true, created: 0, skipped: true };
+  const rg = row.rg_ref ? ` R.G. ${row.rg_ref}` : '';
+  const who = row.from_addr || '';
+  const ids: string[] = [];
+  let created = 0;
+  const lines: string[] = [];
+
+  // 1) UDIENZA (data certa comunicata dall'ente → NON [DA CONFERMARE], ma orario da verificare)
+  if (row.hearing_date) {
+    const title = `⚖️ UDIENZA${rg} — ${row.category}`;
+    const desc = `Udienza fissata (fonte PEC). Oggetto: ${row.subject}\nMittente: ${who}\n⏰ Orario da verificare sull'avviso.`;
+    const eid = await calEvent(title, desc, row.hearing_date, '09:00', 60);
+    if (eid) { ids.push(`hearing:${eid}`); created++; }
+    createDeadline({ clientKey: row.rg_ref || null, tipo: 'Udienza CGT', description: `${row.subject} (orario da verificare)`, dueDate: row.hearing_date });
+    lines.push(`⚖️ Udienza${rg}: ${row.hearing_date} (orario da verificare)`);
+  }
+
+  // 2) TERMINI calcolati → SEMPRE [DA CONFERMARE]
+  const terms = computeDeadlinesFromEvent({ eventType: row.event_type, category: row.category, hearingDate: row.hearing_date, baseDate: row.received_at ? String(row.received_at).slice(0, 10) : null });
+  for (const t of terms) {
+    const title = `[DA CONFERMARE] ${t.tipo}${rg}`;
+    const desc = `Termine PROPOSTO (da confermare) — ${t.norma}\n${t.note}${t.uncertain ? '\n⚠️ Regola incerta: verificare.' : ''}\nFascicolo: ${row.rg_ref || 'n/d'} · PEC: ${row.subject}`;
+    const eid = await calEvent(title, desc, t.dueDate, '09:00', 30);
+    if (eid) { ids.push(`term:${eid}`); created++; }
+    createDeadline({ clientKey: row.rg_ref || null, tipo: `[DA CONFERMARE] ${t.tipo}`, description: `${t.norma} — ${t.note}`, dueDate: t.dueDate });
+    lines.push(`• [DA CONFERMARE] ${t.tipo}: ${t.dueDate} (${t.norma})`);
+  }
+
+  db.prepare(`UPDATE pec_events SET status = 'processato', calendar_event_ids = ? WHERE id = ?`).run(JSON.stringify(ids), row.id);
+
+  if (lines.length) {
+    const alert = `📩 *PEC contenzioso* — nuovo evento${rg}\n${row.subject}\n\n${lines.join('\n')}\n\n⚠️ I termini sono PROPOSTE [DA CONFERMARE]: verifica sull'atto (date di notifica, giorni liberi, feriale).`;
+    try { await sendTextMessage(getControlNumber(), alert); } catch { /* best-effort */ }
+  }
+  return { ok: true, created };
+}
+
+/** Processa tutti i pec_events 'nuovo' (confident). I 'da_rivedere' restano per revisione umana. */
+export async function runPecProcessing(): Promise<{ processed: number; created: number }> {
+  const rows = db.prepare(`SELECT * FROM pec_events WHERE status = 'nuovo' ORDER BY id ASC LIMIT 50`).all() as any[];
+  let processed = 0, created = 0;
+  for (const r of rows) {
+    try { const res = await processPecEvent(r); processed++; created += res.created; }
+    catch (e: any) { console.error('[PEC] processing evento', r.id, e?.message); }
+  }
+  return { processed, created };
+}
+
 /** Poll IMAP della casella PEC (sola lettura). Idempotente per Message-ID. Non lancia mai. */
 export async function pollPec(force = false): Promise<{ enabled: boolean; processed: number; created: number; error?: string }> {
   if (!pecEnabled()) return { enabled: false, processed: 0, created: 0, error: 'PEC non configurata (mancano PEC_USER/PEC_PASS)' };
@@ -105,6 +173,8 @@ export async function pollPec(force = false): Promise<{ enabled: boolean; proces
     } finally { lock.release(); }
     await client.logout().catch(() => {});
     setSetting('pec_last_poll', new Date().toISOString());
+    // Dopo l'ingestione, calendarizza gli eventi confident (idempotente, isolato).
+    try { await runPecProcessing(); } catch (e: any) { console.error('[PEC] processing:', e?.message); }
     return { enabled: true, processed, created };
   } catch (e: any) {
     try { await client.logout().catch(() => {}); } catch { /* noop */ }

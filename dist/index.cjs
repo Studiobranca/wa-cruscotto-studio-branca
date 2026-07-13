@@ -102298,7 +102298,78 @@ function extractRG(text) {
   return m ? m[1].replace(/\s+/g, "") : null;
 }
 
+// server/pec_terms.ts
+function isoToUTC(iso) {
+  const [y, m, d] = iso.split("-").map(Number);
+  return Date.UTC(y, m - 1, d);
+}
+function pad(n) {
+  return String(n).padStart(2, "0");
+}
+function utcToISO(ms) {
+  const dt = new Date(ms);
+  return `${dt.getUTCFullYear()}-${pad(dt.getUTCMonth() + 1)}-${pad(dt.getUTCDate())}`;
+}
+function ferialeOverlaps(startISO, endISO) {
+  const s = Math.min(isoToUTC(startISO), isoToUTC(endISO));
+  const e = Math.max(isoToUTC(startISO), isoToUTC(endISO));
+  for (let y = new Date(s).getUTCFullYear(); y <= new Date(e).getUTCFullYear(); y++) {
+    const a1 = Date.UTC(y, 7, 1), a31 = Date.UTC(y, 7, 31);
+    if (a1 <= e && a31 >= s) return true;
+  }
+  return false;
+}
+function addDaysForward(startISO, days, applyFeriale) {
+  let endMs = isoToUTC(startISO) + days * 864e5;
+  if (applyFeriale && days > 0 && ferialeOverlaps(startISO, utcToISO(endMs))) endMs += 31 * 864e5;
+  return utcToISO(endMs);
+}
+function computeDeadlinesFromEvent(ev) {
+  const out = [];
+  const notiziaAtto = ev.eventType === "notifica_atto" || ev.eventType === "comunicazione" && (ev.category === "AGENZIA_ENTRATE" || ev.category === "RISCOSSIONE");
+  if (notiziaAtto && ev.baseDate) {
+    out.push({
+      tipo: "Ricorso/impugnazione \u2014 termine 60 gg",
+      dueDate: addDaysForward(ev.baseDate, 60, true),
+      norma: "art. 21 D.Lgs 546/1992 (60 gg dalla notifica) + sospensione feriale L. 742/1969",
+      note: "VERIFICARE la data di notifica esatta sull'atto (qui usata la data PEC come proxy). Sospensione feriale 1\u201331/8 applicata.",
+      daConfermare: true,
+      uncertain: false
+    });
+  }
+  if (ev.eventType === "fissazione_udienza" && ev.hearingDate) {
+    out.push({
+      tipo: "Deposito documenti (fino a 20 gg liberi prima dell'udienza)",
+      dueDate: addDaysForward(ev.hearingDate, -20, false),
+      norma: "art. 32 c.1 D.Lgs 546/1992",
+      note: "Termine A RITROSO: verificare il computo dei giorni LIBERI ed eventuale sospensione feriale (non applicata automaticamente).",
+      daConfermare: true,
+      uncertain: true
+    });
+    out.push({
+      tipo: "Memorie illustrative (fino a 10 gg liberi prima)",
+      dueDate: addDaysForward(ev.hearingDate, -10, false),
+      norma: "art. 32 c.1 D.Lgs 546/1992",
+      note: "Termine a ritroso: verificare giorni liberi/feriale.",
+      daConfermare: true,
+      uncertain: true
+    });
+    out.push({
+      tipo: "Repliche (fino a 5 gg liberi prima)",
+      dueDate: addDaysForward(ev.hearingDate, -5, false),
+      norma: "art. 32 c.2 D.Lgs 546/1992",
+      note: "Termine a ritroso: verificare giorni liberi/feriale.",
+      daConfermare: true,
+      uncertain: true
+    });
+  }
+  return out;
+}
+
 // server/pec.ts
+init_integrations();
+init_zapi();
+init_chatbot();
 db_default.exec(`
   CREATE TABLE IF NOT EXISTS pec_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102383,6 +102454,80 @@ ${m.body}`);
   );
   return Number(info.lastInsertRowid);
 }
+async function calEvent(title, description, dateISO, startHHMM = "09:00", durMin = 60) {
+  const start = `${dateISO}T${startHHMM}:00`;
+  const endMs = Date.parse(start) + durMin * 6e4;
+  const end = new Date(endMs).toISOString().slice(0, 19);
+  try {
+    const r = await createCalendarEvent({ title, description, startDate: start, endDate: end });
+    return r.success ? r.eventId || "created" : null;
+  } catch {
+    return null;
+  }
+}
+async function processPecEvent(row) {
+  if (!row || row.status === "processato" || row.calendar_event_ids) return { ok: true, created: 0, skipped: true };
+  const rg = row.rg_ref ? ` R.G. ${row.rg_ref}` : "";
+  const who = row.from_addr || "";
+  const ids = [];
+  let created = 0;
+  const lines = [];
+  if (row.hearing_date) {
+    const title = `\u2696\uFE0F UDIENZA${rg} \u2014 ${row.category}`;
+    const desc = `Udienza fissata (fonte PEC). Oggetto: ${row.subject}
+Mittente: ${who}
+\u23F0 Orario da verificare sull'avviso.`;
+    const eid = await calEvent(title, desc, row.hearing_date, "09:00", 60);
+    if (eid) {
+      ids.push(`hearing:${eid}`);
+      created++;
+    }
+    createDeadline({ clientKey: row.rg_ref || null, tipo: "Udienza CGT", description: `${row.subject} (orario da verificare)`, dueDate: row.hearing_date });
+    lines.push(`\u2696\uFE0F Udienza${rg}: ${row.hearing_date} (orario da verificare)`);
+  }
+  const terms = computeDeadlinesFromEvent({ eventType: row.event_type, category: row.category, hearingDate: row.hearing_date, baseDate: row.received_at ? String(row.received_at).slice(0, 10) : null });
+  for (const t of terms) {
+    const title = `[DA CONFERMARE] ${t.tipo}${rg}`;
+    const desc = `Termine PROPOSTO (da confermare) \u2014 ${t.norma}
+${t.note}${t.uncertain ? "\n\u26A0\uFE0F Regola incerta: verificare." : ""}
+Fascicolo: ${row.rg_ref || "n/d"} \xB7 PEC: ${row.subject}`;
+    const eid = await calEvent(title, desc, t.dueDate, "09:00", 30);
+    if (eid) {
+      ids.push(`term:${eid}`);
+      created++;
+    }
+    createDeadline({ clientKey: row.rg_ref || null, tipo: `[DA CONFERMARE] ${t.tipo}`, description: `${t.norma} \u2014 ${t.note}`, dueDate: t.dueDate });
+    lines.push(`\u2022 [DA CONFERMARE] ${t.tipo}: ${t.dueDate} (${t.norma})`);
+  }
+  db_default.prepare(`UPDATE pec_events SET status = 'processato', calendar_event_ids = ? WHERE id = ?`).run(JSON.stringify(ids), row.id);
+  if (lines.length) {
+    const alert = `\u{1F4E9} *PEC contenzioso* \u2014 nuovo evento${rg}
+${row.subject}
+
+${lines.join("\n")}
+
+\u26A0\uFE0F I termini sono PROPOSTE [DA CONFERMARE]: verifica sull'atto (date di notifica, giorni liberi, feriale).`;
+    try {
+      await sendTextMessage(getControlNumber(), alert);
+    } catch {
+    }
+  }
+  return { ok: true, created };
+}
+async function runPecProcessing() {
+  const rows = db_default.prepare(`SELECT * FROM pec_events WHERE status = 'nuovo' ORDER BY id ASC LIMIT 50`).all();
+  let processed = 0, created = 0;
+  for (const r of rows) {
+    try {
+      const res = await processPecEvent(r);
+      processed++;
+      created += res.created;
+    } catch (e) {
+      console.error("[PEC] processing evento", r.id, e?.message);
+    }
+  }
+  return { processed, created };
+}
 async function pollPec(force = false) {
   if (!pecEnabled()) return { enabled: false, processed: 0, created: 0, error: "PEC non configurata (mancano PEC_USER/PEC_PASS)" };
   const c = pecConfig();
@@ -102425,6 +102570,11 @@ async function pollPec(force = false) {
     await client.logout().catch(() => {
     });
     setSetting4("pec_last_poll", (/* @__PURE__ */ new Date()).toISOString());
+    try {
+      await runPecProcessing();
+    } catch (e) {
+      console.error("[PEC] processing:", e?.message);
+    }
     return { enabled: true, processed, created };
   } catch (e) {
     try {
@@ -102477,7 +102627,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.12.1", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.12.2", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/selftest", (_req, res) => {
   res.json(getLastSelfCheck() || { note: "mai eseguito" });
