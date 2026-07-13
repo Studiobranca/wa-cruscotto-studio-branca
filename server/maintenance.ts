@@ -314,6 +314,10 @@ export function startMaintenance(): void {
       await remindersTick();
       // Monitoraggio sessione Z-API (alert via email se il device cade).
       try { await runMonitoring(); } catch (e: any) { console.error('[Monitor] tick:', e.message); }
+      // PEC contenzioso (modulo ISOLATO): poll IMAP + calendarizzazione. Attivo SOLO se
+      // PEC_USER/PEC_PASS sono impostate; un suo errore non tocca il resto.
+      try { const pec = await import('./pec.js'); if (pec.pecEnabled()) await pec.pollPec(); }
+      catch (e: any) { console.error('[PEC] tick:', e.message); }
     } catch (e: any) {
       console.error('[Maintenance] tick error:', e.message);
     }

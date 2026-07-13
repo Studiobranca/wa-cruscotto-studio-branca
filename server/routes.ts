@@ -62,6 +62,8 @@ import { selectPendingOutcome, isValidOutcome } from './agenda_logic.js';
 import { createChecklist, getChecklist, getChecklistGrouped, markDocReceived, buildDocRequestText } from './practices.js';
 import { smsStatus } from './sms.js';
 import { getPecEvents, getPecStatus, pollPec } from './pec.js';
+import { classifyPec, extractDates, extractHearingDate, extractRG } from './pec_logic.js';
+import { computeDeadlinesFromEvent } from './pec_terms.js';
 
 const router = Router();
 
@@ -85,7 +87,7 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.12.2', built: new Date().toISOString() });
+  res.json({ version: '2.12.3', built: new Date().toISOString() });
 });
 
 // ─── Autocheck (self-test + autocorrezione) ──────────────────────────────────
@@ -1623,6 +1625,18 @@ router.get('/pec/events', (req: Request, res: Response) => {
 router.post('/pec/poll/run', async (_req: Request, res: Response) => {
   try { res.json(await pollPec(true)); }
   catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+// SIMULAZIONE (dry-run): classifica e calcola i termini da un testo PEC di prova, SENZA
+// scrivere nulla, senza toccare la casella reale né il calendario. Serve per verifica.
+router.post('/pec/simulate', (req: Request, res: Response) => {
+  try {
+    const { sender = '', subject = '', body = '', baseDate } = req.body || {};
+    const text = `${subject}\n${body}`;
+    const cls = classifyPec(String(sender), String(subject), String(body));
+    const hearing = extractHearingDate(text);
+    const terms = computeDeadlinesFromEvent({ eventType: cls.eventType, category: cls.category, hearingDate: hearing, baseDate: baseDate || new Date().toISOString().slice(0, 10) });
+    res.json({ classification: cls, hearingDate: hearing, rg: extractRG(text), dates: extractDates(text), termini: terms, nota: 'DRY-RUN: nessuna scrittura, nessun calendario, i termini sono [DA CONFERMARE].' });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
 // ─── SMS (scaffold): stato configurazione. OFF finché SMS_PROVIDER non è impostato ──

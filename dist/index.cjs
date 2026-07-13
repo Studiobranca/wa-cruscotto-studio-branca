@@ -26288,6 +26288,85 @@ SOLO IL TESTO PER IL CLIENTE (INDEROGABILE \u2014 la tua risposta viene inviata 
   }
 });
 
+// server/deadlines_logic.ts
+function selectImminentDeadlines(rows, todayISO, withinDays = 7) {
+  const limit = addDaysISO(todayISO, withinDays);
+  return rows.filter((r) => r.status === "aperto" && !!r.due_date && r.due_date <= limit).map((r) => ({ ...r, overdue: r.due_date < todayISO })).sort((a, b) => a.due_date.localeCompare(b.due_date));
+}
+function addDaysISO(iso, days) {
+  const [y, m, d] = iso.split("-").map((n) => parseInt(n, 10));
+  const t = Date.UTC(y, m - 1, d) + days * 864e5;
+  const dt = new Date(t);
+  return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, "0")}-${String(dt.getUTCDate()).padStart(2, "0")}`;
+}
+function composeDeadlineDigest(list) {
+  if (!list.length) return { text: "", empty: true };
+  const L = ["\u{1F4CC} *Scadenze adempimenti in arrivo* (o gi\xE0 scadute):"];
+  for (const d of list.slice(0, 20)) {
+    const tag = d.overdue ? " \u26A0\uFE0F SCADUTA" : "";
+    const who = d.who ? ` \u2014 ${d.who}` : "";
+    L.push(`- ${d.due_date} \xB7 *${d.tipo || "adempimento"}*${who}${d.description ? ` (${d.description})` : ""}${tag}`);
+  }
+  L.push("\nApri il Cruscotto per gestire lo scadenzario.");
+  return { text: L.join("\n"), empty: false };
+}
+var init_deadlines_logic = __esm({
+  "server/deadlines_logic.ts"() {
+    "use strict";
+  }
+});
+
+// server/deadlines.ts
+function createDeadline(e) {
+  const info = db_default.prepare(`INSERT INTO bot_deadlines (client_key, contact_name, tipo, description, due_date) VALUES (?, ?, ?, ?, ?)`).run(e.clientKey || null, e.contactName || null, e.tipo || null, e.description || null, e.dueDate);
+  return Number(info.lastInsertRowid);
+}
+function listDeadlines(opts = {}) {
+  let sql = `SELECT * FROM bot_deadlines WHERE 1=1`;
+  const a = [];
+  if (opts.status) {
+    sql += ` AND status = ?`;
+    a.push(opts.status);
+  }
+  if (opts.client) {
+    sql += ` AND client_key = ?`;
+    a.push(opts.client);
+  }
+  sql += ` ORDER BY due_date ASC`;
+  return db_default.prepare(sql).all(...a);
+}
+function completeDeadline(id) {
+  return db_default.prepare(`UPDATE bot_deadlines SET status = 'completato', completed_at = datetime('now') WHERE id = ? AND status != 'completato'`).run(id).changes > 0;
+}
+function deleteDeadline(id) {
+  return db_default.prepare(`DELETE FROM bot_deadlines WHERE id = ?`).run(id).changes > 0;
+}
+function getImminentDeadlines(todayISO, withinDays = 7) {
+  const rows = db_default.prepare(`SELECT id, tipo, description, contact_name, due_date, status FROM bot_deadlines WHERE status = 'aperto'`).all().map((r) => ({ id: r.id, tipo: r.tipo, description: r.description, who: r.contact_name, due_date: r.due_date, status: r.status }));
+  return selectImminentDeadlines(rows, todayISO, withinDays);
+}
+var init_deadlines = __esm({
+  "server/deadlines.ts"() {
+    "use strict";
+    init_db();
+    init_deadlines_logic();
+    db_default.exec(`
+  CREATE TABLE IF NOT EXISTS bot_deadlines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    client_key TEXT,                 -- telefono, email:<addr>, o nome cliente
+    contact_name TEXT,
+    tipo TEXT,                       -- es. F24, Dichiarazione redditi, IVA, ...
+    description TEXT,
+    due_date TEXT NOT NULL,          -- YYYY-MM-DD
+    status TEXT DEFAULT 'aperto',    -- aperto | completato
+    created_at TEXT DEFAULT (datetime('now')),
+    completed_at TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_bot_deadlines_due ON bot_deadlines(status, due_date);
+`);
+  }
+});
+
 // node_modules/pino-std-serializers/lib/err-helpers.js
 var require_err_helpers = __commonJS({
   "node_modules/pino-std-serializers/lib/err-helpers.js"(exports2, module2) {
@@ -100881,6 +100960,401 @@ var init_email = __esm({
   }
 });
 
+// server/pec_logic.ts
+function classifyPec(sender, subject, body) {
+  const s = String(sender || "").toLowerCase();
+  const t = `${subject || ""} ${body || ""}`.toLowerCase();
+  const all = `${s} ${t}`;
+  let category = "ALTRO";
+  if (/sigit|processo tributario telematico|\bptt\b|giustiziatributaria|corte di giustizia tributaria|commissione tributaria|\bcgt\b|mef\.gov/.test(all)) category = "CGT_PTT";
+  else if (/agenzia.?entrate.?riscossione|agenzia delle entrate-riscossione|riscossione|\bader\b|agenziariscossione/.test(all)) category = "RISCOSSIONE";
+  else if (/agenzia delle entrate|agenziaentrate|\bade\b/.test(all)) category = "AGENZIA_ENTRATE";
+  else if (/avvocatura|studio legale|\bavv\.|controparte|@pec\./.test(s)) category = "CONTROPARTE";
+  let eventType = "incerto";
+  if (/fissazione|avviso di trattazione|avviso di udienza|udienza .*(fissat|del )|data (di )?udienza|trattazione .*fissat/.test(t)) eventType = "fissazione_udienza";
+  else if (/ricevuta di accettazione/.test(t)) eventType = "accettazione";
+  else if (/ricevuta di (avvenuta )?consegna/.test(t)) eventType = "consegna";
+  else if (/deposito|iscrizione a ruolo|attestazione di deposito|nir\b|numero informatico di registrazione/.test(t)) eventType = "ricevuta_deposito";
+  else if (/notific|ricorso|appello|controdeduzioni|memoria|atto di/.test(t)) eventType = "notifica_atto";
+  else if (/comunicazione|avviso/.test(t)) eventType = "comunicazione";
+  const confident = category !== "ALTRO" && eventType !== "incerto";
+  return { category, eventType, confident };
+}
+function extractDates(text) {
+  const out = [];
+  const t = String(text || "");
+  const push = (y, m, d) => {
+    if (m >= 1 && m <= 12 && d >= 1 && d <= 31 && y >= 2e3 && y <= 2100) {
+      out.push(`${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`);
+    }
+  };
+  for (const mm of t.matchAll(/\b(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})\b/g)) push(+mm[3], +mm[2], +mm[1]);
+  const rx = new RegExp(`\\b(\\d{1,2})\\s+(${MESI.join("|")})\\s+(\\d{4})\\b`, "gi");
+  for (const mm of t.matchAll(rx)) push(+mm[3], MESI.indexOf(mm[2].toLowerCase()) + 1, +mm[1]);
+  return [...new Set(out)];
+}
+function extractHearingDate(text) {
+  const t = String(text || "");
+  const m = t.match(/(udienza|trattazione)[\s\S]{0,120}/i);
+  if (m) {
+    const near = extractDates(m[0]);
+    if (near.length) return near[0];
+  }
+  return null;
+}
+function extractRG(text) {
+  const t = String(text || "");
+  const m = t.match(/R\.?\s*G\.?\s*R?\.?\s*(?:n\.?\s*)?(\d+\s*\/\s*\d{4})/i) || t.match(/ruolo\s+generale[^\d]{0,20}(\d+\s*\/\s*\d{4})/i) || t.match(/\bn\.?\s*(\d+\s*\/\s*\d{4})\s*R\.?G/i);
+  return m ? m[1].replace(/\s+/g, "") : null;
+}
+var MESI;
+var init_pec_logic = __esm({
+  "server/pec_logic.ts"() {
+    "use strict";
+    MESI = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"];
+  }
+});
+
+// server/pec_terms.ts
+function isoToUTC(iso) {
+  const [y, m, d] = iso.split("-").map(Number);
+  return Date.UTC(y, m - 1, d);
+}
+function pad(n) {
+  return String(n).padStart(2, "0");
+}
+function utcToISO(ms) {
+  const dt = new Date(ms);
+  return `${dt.getUTCFullYear()}-${pad(dt.getUTCMonth() + 1)}-${pad(dt.getUTCDate())}`;
+}
+function ferialeOverlaps(startISO, endISO) {
+  const s = Math.min(isoToUTC(startISO), isoToUTC(endISO));
+  const e = Math.max(isoToUTC(startISO), isoToUTC(endISO));
+  for (let y = new Date(s).getUTCFullYear(); y <= new Date(e).getUTCFullYear(); y++) {
+    const a1 = Date.UTC(y, 7, 1), a31 = Date.UTC(y, 7, 31);
+    if (a1 <= e && a31 >= s) return true;
+  }
+  return false;
+}
+function addDaysForward(startISO, days, applyFeriale) {
+  let endMs = isoToUTC(startISO) + days * 864e5;
+  if (applyFeriale && days > 0 && ferialeOverlaps(startISO, utcToISO(endMs))) endMs += 31 * 864e5;
+  return utcToISO(endMs);
+}
+function computeDeadlinesFromEvent(ev) {
+  const out = [];
+  const notiziaAtto = ev.eventType === "notifica_atto" || ev.eventType === "comunicazione" && (ev.category === "AGENZIA_ENTRATE" || ev.category === "RISCOSSIONE");
+  if (notiziaAtto && ev.baseDate) {
+    out.push({
+      tipo: "Ricorso/impugnazione \u2014 termine 60 gg",
+      dueDate: addDaysForward(ev.baseDate, 60, true),
+      norma: "art. 21 D.Lgs 546/1992 (60 gg dalla notifica) + sospensione feriale L. 742/1969",
+      note: "VERIFICARE la data di notifica esatta sull'atto (qui usata la data PEC come proxy). Sospensione feriale 1\u201331/8 applicata.",
+      daConfermare: true,
+      uncertain: false
+    });
+  }
+  if (ev.eventType === "fissazione_udienza" && ev.hearingDate) {
+    out.push({
+      tipo: "Deposito documenti (fino a 20 gg liberi prima dell'udienza)",
+      dueDate: addDaysForward(ev.hearingDate, -20, false),
+      norma: "art. 32 c.1 D.Lgs 546/1992",
+      note: "Termine A RITROSO: verificare il computo dei giorni LIBERI ed eventuale sospensione feriale (non applicata automaticamente).",
+      daConfermare: true,
+      uncertain: true
+    });
+    out.push({
+      tipo: "Memorie illustrative (fino a 10 gg liberi prima)",
+      dueDate: addDaysForward(ev.hearingDate, -10, false),
+      norma: "art. 32 c.1 D.Lgs 546/1992",
+      note: "Termine a ritroso: verificare giorni liberi/feriale.",
+      daConfermare: true,
+      uncertain: true
+    });
+    out.push({
+      tipo: "Repliche (fino a 5 gg liberi prima)",
+      dueDate: addDaysForward(ev.hearingDate, -5, false),
+      norma: "art. 32 c.2 D.Lgs 546/1992",
+      note: "Termine a ritroso: verificare giorni liberi/feriale.",
+      daConfermare: true,
+      uncertain: true
+    });
+  }
+  return out;
+}
+var init_pec_terms = __esm({
+  "server/pec_terms.ts"() {
+    "use strict";
+  }
+});
+
+// server/pec.ts
+var pec_exports = {};
+__export(pec_exports, {
+  getPecEvents: () => getPecEvents,
+  getPecStatus: () => getPecStatus,
+  ingestPecMessage: () => ingestPecMessage,
+  pecConfig: () => pecConfig,
+  pecEnabled: () => pecEnabled,
+  pollPec: () => pollPec,
+  processPecEvent: () => processPecEvent,
+  runPecProcessing: () => runPecProcessing
+});
+function envSetting(key, def = "") {
+  return (process.env[key] || def).trim();
+}
+function pecConfig() {
+  return {
+    host: envSetting("PEC_IMAP_HOST", "mbox.cert.legalmail.it"),
+    port: parseInt(envSetting("PEC_IMAP_PORT", "993"), 10) || 993,
+    user: envSetting("PEC_USER", "studiotributariobrancamariano@legalmail.it"),
+    pass: process.env.PEC_PASS || ""
+  };
+}
+function pecEnabled() {
+  const c = pecConfig();
+  return !!(c.user && c.pass);
+}
+function setSetting3(k, v) {
+  try {
+    db_default.prepare(`INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(k, v);
+  } catch {
+  }
+}
+function getSetting3(k) {
+  try {
+    return db_default.prepare(`SELECT value FROM app_settings WHERE key = ?`).get(k)?.value ?? null;
+  } catch {
+    return null;
+  }
+}
+function ingestPecMessage(m) {
+  const exists = db_default.prepare(`SELECT id FROM pec_events WHERE message_id = ?`).get(m.messageId);
+  if (exists) return null;
+  const cls = classifyPec(m.fromAddr, m.subject, m.body);
+  const hearing = extractHearingDate(`${m.subject}
+${m.body}`);
+  const rg = extractRG(`${m.subject}
+${m.body}`);
+  const dates = extractDates(`${m.subject}
+${m.body}`);
+  const status = cls.confident ? "nuovo" : "da_rivedere";
+  const info = db_default.prepare(`
+    INSERT INTO pec_events (message_id, pec_uid, from_addr, subject, category, event_type, confident,
+      hearing_date, rg_ref, dates_json, attachments_json, body_excerpt, status, received_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    m.messageId,
+    m.uid ?? null,
+    m.fromAddr,
+    m.subject,
+    cls.category,
+    cls.eventType,
+    cls.confident ? 1 : 0,
+    hearing,
+    rg,
+    JSON.stringify(dates),
+    JSON.stringify(m.attachments || []),
+    String(m.body || "").slice(0, 500),
+    status,
+    m.receivedAt
+  );
+  return Number(info.lastInsertRowid);
+}
+async function calEvent(title, description, dateISO, startHHMM = "09:00", durMin = 60) {
+  const start = `${dateISO}T${startHHMM}:00`;
+  const endMs = Date.parse(start) + durMin * 6e4;
+  const end = new Date(endMs).toISOString().slice(0, 19);
+  try {
+    const r = await createCalendarEvent({ title, description, startDate: start, endDate: end });
+    return r.success ? r.eventId || "created" : null;
+  } catch {
+    return null;
+  }
+}
+async function processPecEvent(row) {
+  if (!row || row.status === "processato" || row.calendar_event_ids) return { ok: true, created: 0, skipped: true };
+  const rg = row.rg_ref ? ` R.G. ${row.rg_ref}` : "";
+  const who = row.from_addr || "";
+  const ids = [];
+  let created = 0;
+  const lines = [];
+  if (row.hearing_date) {
+    const title = `\u2696\uFE0F UDIENZA${rg} \u2014 ${row.category}`;
+    const desc = `Udienza fissata (fonte PEC). Oggetto: ${row.subject}
+Mittente: ${who}
+\u23F0 Orario da verificare sull'avviso.`;
+    const eid = await calEvent(title, desc, row.hearing_date, "09:00", 60);
+    if (eid) {
+      ids.push(`hearing:${eid}`);
+      created++;
+    }
+    createDeadline({ clientKey: row.rg_ref || null, tipo: "Udienza CGT", description: `${row.subject} (orario da verificare)`, dueDate: row.hearing_date });
+    lines.push(`\u2696\uFE0F Udienza${rg}: ${row.hearing_date} (orario da verificare)`);
+  }
+  const terms = computeDeadlinesFromEvent({ eventType: row.event_type, category: row.category, hearingDate: row.hearing_date, baseDate: row.received_at ? String(row.received_at).slice(0, 10) : null });
+  for (const t of terms) {
+    const title = `[DA CONFERMARE] ${t.tipo}${rg}`;
+    const desc = `Termine PROPOSTO (da confermare) \u2014 ${t.norma}
+${t.note}${t.uncertain ? "\n\u26A0\uFE0F Regola incerta: verificare." : ""}
+Fascicolo: ${row.rg_ref || "n/d"} \xB7 PEC: ${row.subject}`;
+    const eid = await calEvent(title, desc, t.dueDate, "09:00", 30);
+    if (eid) {
+      ids.push(`term:${eid}`);
+      created++;
+    }
+    createDeadline({ clientKey: row.rg_ref || null, tipo: `[DA CONFERMARE] ${t.tipo}`, description: `${t.norma} \u2014 ${t.note}`, dueDate: t.dueDate });
+    lines.push(`\u2022 [DA CONFERMARE] ${t.tipo}: ${t.dueDate} (${t.norma})`);
+  }
+  db_default.prepare(`UPDATE pec_events SET status = 'processato', calendar_event_ids = ? WHERE id = ?`).run(JSON.stringify(ids), row.id);
+  if (lines.length) {
+    const alert = `\u{1F4E9} *PEC contenzioso* \u2014 nuovo evento${rg}
+${row.subject}
+
+${lines.join("\n")}
+
+\u26A0\uFE0F I termini sono PROPOSTE [DA CONFERMARE]: verifica sull'atto (date di notifica, giorni liberi, feriale).`;
+    try {
+      await sendTextMessage(getControlNumber(), alert);
+    } catch {
+    }
+  }
+  return { ok: true, created };
+}
+async function runPecProcessing() {
+  const rows = db_default.prepare(`SELECT * FROM pec_events WHERE status = 'nuovo' ORDER BY id ASC LIMIT 50`).all();
+  let processed = 0, created = 0;
+  for (const r of rows) {
+    try {
+      const res = await processPecEvent(r);
+      processed++;
+      created += res.created;
+    } catch (e) {
+      console.error("[PEC] processing evento", r.id, e?.message);
+    }
+  }
+  return { processed, created };
+}
+async function pollPec(force = false) {
+  if (!pecEnabled()) return { enabled: false, processed: 0, created: 0, error: "PEC non configurata (mancano PEC_USER/PEC_PASS)" };
+  const c = pecConfig();
+  const client = new import_imapflow2.ImapFlow({ host: c.host, port: c.port, secure: true, auth: { user: c.user, pass: c.pass }, logger: false });
+  let processed = 0, created = 0;
+  try {
+    await client.connect();
+    const lock = await client.getMailboxLock("INBOX");
+    try {
+      const status = await client.status("INBOX", { messages: true });
+      const total = status.messages || 0;
+      if (total) {
+        const from = Math.max(1, total - 60);
+        for await (const msg of client.fetch(`${from}:*`, { uid: true, source: true })) {
+          processed++;
+          try {
+            const parsed = await (0, import_mailparser2.simpleParser)(msg.source);
+            const messageId = parsed.messageId || `pec_${msg.uid}`;
+            if (db_default.prepare(`SELECT 1 FROM pec_events WHERE message_id = ?`).get(messageId)) continue;
+            const fromVal = parsed.from?.value?.[0] || {};
+            const atts = (parsed.attachments || []).map((a) => a.filename || "allegato");
+            const id = ingestPecMessage({
+              messageId,
+              uid: msg.uid,
+              fromAddr: fromVal.address || "",
+              subject: parsed.subject || "(senza oggetto)",
+              body: parsed.text || "",
+              attachments: atts,
+              receivedAt: (parsed.date || /* @__PURE__ */ new Date()).toISOString()
+            });
+            if (id) created++;
+          } catch (e) {
+            console.error("[PEC] parse messaggio fallito:", e?.message);
+          }
+        }
+      }
+    } finally {
+      lock.release();
+    }
+    await client.logout().catch(() => {
+    });
+    setSetting3("pec_last_poll", (/* @__PURE__ */ new Date()).toISOString());
+    try {
+      await runPecProcessing();
+    } catch (e) {
+      console.error("[PEC] processing:", e?.message);
+    }
+    return { enabled: true, processed, created };
+  } catch (e) {
+    try {
+      await client.logout().catch(() => {
+      });
+    } catch {
+    }
+    console.error("[PEC] poll fallito:", e?.message);
+    setSetting3("pec_last_error", `${(/* @__PURE__ */ new Date()).toISOString()} ${e?.message}`);
+    return { enabled: true, processed, created, error: e?.message };
+  }
+}
+function getPecEvents(limit = 100) {
+  const rows = db_default.prepare(`SELECT * FROM pec_events ORDER BY created_at DESC LIMIT ?`).all(Math.min(Math.max(limit, 1), 500));
+  return rows.map((r) => ({ ...r, dates: r.dates_json ? JSON.parse(r.dates_json) : [], attachments: r.attachments_json ? JSON.parse(r.attachments_json) : [] }));
+}
+function getPecStatus() {
+  const c = pecConfig();
+  const counts = {};
+  try {
+    for (const r of db_default.prepare(`SELECT status, COUNT(*) n FROM pec_events GROUP BY status`).all()) counts[r.status] = r.n;
+  } catch {
+  }
+  return {
+    enabled: pecEnabled(),
+    host: c.host,
+    port: c.port,
+    user: c.user,
+    // niente password: mai esposta
+    lastPoll: getSetting3("pec_last_poll"),
+    lastError: getSetting3("pec_last_error"),
+    counts
+  };
+}
+var import_imapflow2, import_mailparser2;
+var init_pec = __esm({
+  "server/pec.ts"() {
+    "use strict";
+    import_imapflow2 = __toESM(require_imap_flow(), 1);
+    import_mailparser2 = __toESM(require_mailparser(), 1);
+    init_db();
+    init_pec_logic();
+    init_pec_terms();
+    init_integrations();
+    init_deadlines();
+    init_zapi();
+    init_chatbot();
+    db_default.exec(`
+  CREATE TABLE IF NOT EXISTS pec_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id TEXT UNIQUE,
+    pec_uid INTEGER,
+    from_addr TEXT,
+    subject TEXT,
+    category TEXT,
+    event_type TEXT,
+    confident INTEGER DEFAULT 0,
+    hearing_date TEXT,
+    rg_ref TEXT,
+    dates_json TEXT,
+    attachments_json TEXT,
+    body_excerpt TEXT,
+    client_key TEXT,
+    status TEXT DEFAULT 'nuovo',       -- nuovo | da_rivedere | processato
+    calendar_event_ids TEXT,           -- JSON: idempotenza calendarizzazione (BLOCCO 3)
+    received_at TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_pec_events_status ON pec_events(status, created_at);
+`);
+  }
+});
+
 // server/transcription.ts
 var transcription_exports = {};
 __export(transcription_exports, {
@@ -101060,75 +101534,9 @@ Apri il Cruscotto per gestire bozze, agenda e messaggi.`);
   return { text: L.join("\n"), empty };
 }
 
-// server/deadlines.ts
-init_db();
-
-// server/deadlines_logic.ts
-function selectImminentDeadlines(rows, todayISO, withinDays = 7) {
-  const limit = addDaysISO(todayISO, withinDays);
-  return rows.filter((r) => r.status === "aperto" && !!r.due_date && r.due_date <= limit).map((r) => ({ ...r, overdue: r.due_date < todayISO })).sort((a, b) => a.due_date.localeCompare(b.due_date));
-}
-function addDaysISO(iso, days) {
-  const [y, m, d] = iso.split("-").map((n) => parseInt(n, 10));
-  const t = Date.UTC(y, m - 1, d) + days * 864e5;
-  const dt = new Date(t);
-  return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, "0")}-${String(dt.getUTCDate()).padStart(2, "0")}`;
-}
-function composeDeadlineDigest(list) {
-  if (!list.length) return { text: "", empty: true };
-  const L = ["\u{1F4CC} *Scadenze adempimenti in arrivo* (o gi\xE0 scadute):"];
-  for (const d of list.slice(0, 20)) {
-    const tag = d.overdue ? " \u26A0\uFE0F SCADUTA" : "";
-    const who = d.who ? ` \u2014 ${d.who}` : "";
-    L.push(`- ${d.due_date} \xB7 *${d.tipo || "adempimento"}*${who}${d.description ? ` (${d.description})` : ""}${tag}`);
-  }
-  L.push("\nApri il Cruscotto per gestire lo scadenzario.");
-  return { text: L.join("\n"), empty: false };
-}
-
-// server/deadlines.ts
-db_default.exec(`
-  CREATE TABLE IF NOT EXISTS bot_deadlines (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    client_key TEXT,                 -- telefono, email:<addr>, o nome cliente
-    contact_name TEXT,
-    tipo TEXT,                       -- es. F24, Dichiarazione redditi, IVA, ...
-    description TEXT,
-    due_date TEXT NOT NULL,          -- YYYY-MM-DD
-    status TEXT DEFAULT 'aperto',    -- aperto | completato
-    created_at TEXT DEFAULT (datetime('now')),
-    completed_at TEXT
-  );
-  CREATE INDEX IF NOT EXISTS idx_bot_deadlines_due ON bot_deadlines(status, due_date);
-`);
-function createDeadline(e) {
-  const info = db_default.prepare(`INSERT INTO bot_deadlines (client_key, contact_name, tipo, description, due_date) VALUES (?, ?, ?, ?, ?)`).run(e.clientKey || null, e.contactName || null, e.tipo || null, e.description || null, e.dueDate);
-  return Number(info.lastInsertRowid);
-}
-function listDeadlines(opts = {}) {
-  let sql = `SELECT * FROM bot_deadlines WHERE 1=1`;
-  const a = [];
-  if (opts.status) {
-    sql += ` AND status = ?`;
-    a.push(opts.status);
-  }
-  if (opts.client) {
-    sql += ` AND client_key = ?`;
-    a.push(opts.client);
-  }
-  sql += ` ORDER BY due_date ASC`;
-  return db_default.prepare(sql).all(...a);
-}
-function completeDeadline(id) {
-  return db_default.prepare(`UPDATE bot_deadlines SET status = 'completato', completed_at = datetime('now') WHERE id = ? AND status != 'completato'`).run(id).changes > 0;
-}
-function deleteDeadline(id) {
-  return db_default.prepare(`DELETE FROM bot_deadlines WHERE id = ?`).run(id).changes > 0;
-}
-function getImminentDeadlines(todayISO, withinDays = 7) {
-  const rows = db_default.prepare(`SELECT id, tipo, description, contact_name, due_date, status FROM bot_deadlines WHERE status = 'aperto'`).all().map((r) => ({ id: r.id, tipo: r.tipo, description: r.description, who: r.contact_name, due_date: r.due_date, status: r.status }));
-  return selectImminentDeadlines(rows, todayISO, withinDays);
-}
+// server/reminders.ts
+init_deadlines();
+init_deadlines_logic();
 
 // server/sms_logic.ts
 function toE164(raw, defaultCC = "39") {
@@ -101759,14 +102167,14 @@ var PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://wa-cruscotto-v2-pr
 var WEBHOOK_URL = `${PUBLIC_BASE_URL}/api/webhook/message`;
 var STALE_MINUTES = 180;
 var REPAIR_COOLDOWN_MIN = 360;
-function getSetting3(key) {
+function getSetting4(key) {
   try {
     return db_default.prepare(`SELECT value FROM app_settings WHERE key = ?`).get(key)?.value ?? null;
   } catch {
     return null;
   }
 }
-function setSetting3(key, value) {
+function setSetting4(key, value) {
   db_default.prepare(`INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(key, value);
 }
 function romeNow2() {
@@ -101820,14 +102228,14 @@ async function runDailyDigest(dateISO) {
   const date = dateISO || romeNow2().iso;
   const { title, description, total } = buildDigest(date);
   if (total === 0) {
-    setSetting3(`digest_done_${date}`, "1");
+    setSetting4(`digest_done_${date}`, "1");
     return { ok: true, date, total: 0, skipped: true };
   }
-  const prevId = getSetting3(`digest_event_${date}`);
+  const prevId = getSetting4(`digest_event_${date}`);
   const r = await upsertAllDayEvent({ title, description, date, eventId: prevId });
   if (r.success && r.eventId) {
-    setSetting3(`digest_event_${date}`, r.eventId);
-    setSetting3(`digest_done_${date}`, "1");
+    setSetting4(`digest_event_${date}`, r.eventId);
+    setSetting4(`digest_done_${date}`, "1");
     return { ok: true, date, total, eventId: r.eventId };
   }
   return { ok: false, date, total, error: r.error };
@@ -101851,13 +102259,13 @@ function getFlowHealth() {
 async function repairWebhook() {
   const previous = await getReceivedWebhook();
   const ok = await setReceivedWebhook(WEBHOOK_URL);
-  setSetting3("last_webhook_repair", (/* @__PURE__ */ new Date()).toISOString());
+  setSetting4("last_webhook_repair", (/* @__PURE__ */ new Date()).toISOString());
   broadcastEvent("flow_repair", { ok, webhook: WEBHOOK_URL, at: (/* @__PURE__ */ new Date()).toISOString() });
   console.log(`[Watchdog] Riparazione webhook: ${ok ? "OK" : "FALLITA"} \u2192 ${WEBHOOK_URL} (precedente: ${previous})`);
   return { ok, previous, set: WEBHOOK_URL };
 }
 function inRepairCooldown() {
-  const last = getSetting3("last_webhook_repair");
+  const last = getSetting4("last_webhook_repair");
   return !!(last && (Date.now() - Date.parse(last)) / 6e4 < REPAIR_COOLDOWN_MIN);
 }
 async function watchdogTick() {
@@ -101896,8 +102304,8 @@ async function runSelfCheck() {
   } catch (e) {
     items.push({ name: "webhook", status: "error", detail: e.message });
   }
-  if (getSetting3("bot_auto_send") === "1" && process.env.BOT_ALLOW_AUTOSEND !== "1") {
-    setSetting3("bot_auto_send", "0");
+  if (getSetting4("bot_auto_send") === "1" && process.env.BOT_ALLOW_AUTOSEND !== "1") {
+    setSetting4("bot_auto_send", "0");
     items.push({ name: "autoSend", status: "fixed", detail: "era ON senza BOT_ALLOW_AUTOSEND \u2192 forzato OFF" });
   } else items.push({ name: "autoSend", status: "ok", detail: isAutoSendEnabled() ? "ON (env autorizzata)" : "OFF" });
   try {
@@ -101922,7 +102330,7 @@ async function runSelfCheck() {
   }
   const at = (/* @__PURE__ */ new Date()).toISOString();
   const issues = items.filter((i) => i.status !== "ok").length;
-  setSetting3("selfcheck_last", JSON.stringify({ at, items, issues }));
+  setSetting4("selfcheck_last", JSON.stringify({ at, items, issues }));
   console.log(`[SelfCheck] ${at} \u2014 ${issues} anomalie/correzioni: ${items.map((i) => `${i.name}:${i.status}`).join(" ")}`);
   const notable = items.filter((i) => i.status !== "ok");
   if (notable.length) {
@@ -101943,7 +102351,7 @@ async function runSelfCheck() {
 }
 function getLastSelfCheck() {
   try {
-    return JSON.parse(getSetting3("selfcheck_last") || "null");
+    return JSON.parse(getSetting4("selfcheck_last") || "null");
   } catch {
     return null;
   }
@@ -101956,13 +102364,13 @@ async function runMonitoring(force = false) {
     status = null;
   }
   const { healthy, reason } = evaluateZapiHealth(status);
-  const lastState = getSetting3("monitor_zapi_state") || void 0;
-  const lastAtRaw = getSetting3("monitor_zapi_alert_at");
+  const lastState = getSetting4("monitor_zapi_state") || void 0;
+  const lastAtRaw = getSetting4("monitor_zapi_alert_at");
   const lastAlertMs = lastAtRaw ? Date.parse(lastAtRaw) : null;
   const { action, newState } = decideMonitorAlert(healthy, lastState || void 0, lastAlertMs != null && !isNaN(lastAlertMs) ? lastAlertMs : null, Date.now());
-  setSetting3("monitor_zapi_state", newState);
+  setSetting4("monitor_zapi_state", newState);
   if (action === "alert-down") {
-    setSetting3("monitor_zapi_alert_at", (/* @__PURE__ */ new Date()).toISOString());
+    setSetting4("monitor_zapi_alert_at", (/* @__PURE__ */ new Date()).toISOString());
     const html = `<h2 style="color:#b00020">\u26A0\uFE0F Sessione WhatsApp (Z-API) NON attiva</h2>
       <p>${reason}</p>
       <p>Il bot potrebbe non ricevere/inviare messaggi WhatsApp. <b>RUNBOOK</b>: riconnetti la
@@ -101984,8 +102392,8 @@ async function runMonitoring(force = false) {
 }
 function getMonitorStatus() {
   return {
-    zapiState: getSetting3("monitor_zapi_state") || "unknown",
-    lastZapiAlertAt: getSetting3("monitor_zapi_alert_at"),
+    zapiState: getSetting4("monitor_zapi_state") || "unknown",
+    lastZapiAlertAt: getSetting4("monitor_zapi_alert_at"),
     flow: getFlowHealth(),
     lastSelfCheck: getLastSelfCheck()
   };
@@ -102002,12 +102410,12 @@ function startMaintenance() {
   const tick = async () => {
     try {
       const { iso, hour } = romeNow2();
-      if (hour >= 20 && getSetting3(`digest_done_${iso}`) !== "1") {
+      if (hour >= 20 && getSetting4(`digest_done_${iso}`) !== "1") {
         const r = await runDailyDigest(iso);
         console.log(`[Digest] ${iso}: ${r.ok ? `evento aggiornato (${r.total} msg)` : `errore: ${r.error}`}`);
       }
-      if (hour >= 3 && hour < 6 && getSetting3(`selfcheck_done_${iso}`) !== "1") {
-        setSetting3(`selfcheck_done_${iso}`, "1");
+      if (hour >= 3 && hour < 6 && getSetting4(`selfcheck_done_${iso}`) !== "1") {
+        setSetting4(`selfcheck_done_${iso}`, "1");
         await runSelfCheck();
       }
       await watchdogTick();
@@ -102017,6 +102425,12 @@ function startMaintenance() {
       } catch (e) {
         console.error("[Monitor] tick:", e.message);
       }
+      try {
+        const pec = await Promise.resolve().then(() => (init_pec(), pec_exports));
+        if (pec.pecEnabled()) await pec.pollPec();
+      } catch (e) {
+        console.error("[PEC] tick:", e.message);
+      }
     } catch (e) {
       console.error("[Maintenance] tick error:", e.message);
     }
@@ -102025,6 +102439,9 @@ function startMaintenance() {
   setTimeout(tick, 60 * 1e3);
   console.log("[Maintenance] Scheduler avviato (digest 20:30 + watchdog flusso + promemoria/lista d'attesa/SLA).");
 }
+
+// server/routes.ts
+init_deadlines();
 
 // server/summary.ts
 init_db();
@@ -102244,373 +102661,10 @@ function buildDocRequestText(clientKey, pratica) {
   return { text: composeDocRequest(pratica, miss.map((m) => m.doc_name), contactName), missing: miss.map((m) => m.doc_name), contactName };
 }
 
-// server/pec.ts
-var import_imapflow2 = __toESM(require_imap_flow(), 1);
-var import_mailparser2 = __toESM(require_mailparser(), 1);
-init_db();
-
-// server/pec_logic.ts
-var MESI = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"];
-function classifyPec(sender, subject, body) {
-  const s = String(sender || "").toLowerCase();
-  const t = `${subject || ""} ${body || ""}`.toLowerCase();
-  const all = `${s} ${t}`;
-  let category = "ALTRO";
-  if (/sigit|processo tributario telematico|\bptt\b|giustiziatributaria|corte di giustizia tributaria|commissione tributaria|\bcgt\b|mef\.gov/.test(all)) category = "CGT_PTT";
-  else if (/agenzia.?entrate.?riscossione|agenzia delle entrate-riscossione|riscossione|\bader\b|agenziariscossione/.test(all)) category = "RISCOSSIONE";
-  else if (/agenzia delle entrate|agenziaentrate|\bade\b/.test(all)) category = "AGENZIA_ENTRATE";
-  else if (/avvocatura|studio legale|\bavv\.|controparte|@pec\./.test(s)) category = "CONTROPARTE";
-  let eventType = "incerto";
-  if (/fissazione|avviso di trattazione|avviso di udienza|udienza .*(fissat|del )|data (di )?udienza|trattazione .*fissat/.test(t)) eventType = "fissazione_udienza";
-  else if (/ricevuta di accettazione/.test(t)) eventType = "accettazione";
-  else if (/ricevuta di (avvenuta )?consegna/.test(t)) eventType = "consegna";
-  else if (/deposito|iscrizione a ruolo|attestazione di deposito|nir\b|numero informatico di registrazione/.test(t)) eventType = "ricevuta_deposito";
-  else if (/notific|ricorso|appello|controdeduzioni|memoria|atto di/.test(t)) eventType = "notifica_atto";
-  else if (/comunicazione|avviso/.test(t)) eventType = "comunicazione";
-  const confident = category !== "ALTRO" && eventType !== "incerto";
-  return { category, eventType, confident };
-}
-function extractDates(text) {
-  const out = [];
-  const t = String(text || "");
-  const push = (y, m, d) => {
-    if (m >= 1 && m <= 12 && d >= 1 && d <= 31 && y >= 2e3 && y <= 2100) {
-      out.push(`${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`);
-    }
-  };
-  for (const mm of t.matchAll(/\b(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})\b/g)) push(+mm[3], +mm[2], +mm[1]);
-  const rx = new RegExp(`\\b(\\d{1,2})\\s+(${MESI.join("|")})\\s+(\\d{4})\\b`, "gi");
-  for (const mm of t.matchAll(rx)) push(+mm[3], MESI.indexOf(mm[2].toLowerCase()) + 1, +mm[1]);
-  return [...new Set(out)];
-}
-function extractHearingDate(text) {
-  const t = String(text || "");
-  const m = t.match(/(udienza|trattazione)[\s\S]{0,120}/i);
-  if (m) {
-    const near = extractDates(m[0]);
-    if (near.length) return near[0];
-  }
-  return null;
-}
-function extractRG(text) {
-  const t = String(text || "");
-  const m = t.match(/R\.?\s*G\.?\s*R?\.?\s*(?:n\.?\s*)?(\d+\s*\/\s*\d{4})/i) || t.match(/ruolo\s+generale[^\d]{0,20}(\d+\s*\/\s*\d{4})/i) || t.match(/\bn\.?\s*(\d+\s*\/\s*\d{4})\s*R\.?G/i);
-  return m ? m[1].replace(/\s+/g, "") : null;
-}
-
-// server/pec_terms.ts
-function isoToUTC(iso) {
-  const [y, m, d] = iso.split("-").map(Number);
-  return Date.UTC(y, m - 1, d);
-}
-function pad(n) {
-  return String(n).padStart(2, "0");
-}
-function utcToISO(ms) {
-  const dt = new Date(ms);
-  return `${dt.getUTCFullYear()}-${pad(dt.getUTCMonth() + 1)}-${pad(dt.getUTCDate())}`;
-}
-function ferialeOverlaps(startISO, endISO) {
-  const s = Math.min(isoToUTC(startISO), isoToUTC(endISO));
-  const e = Math.max(isoToUTC(startISO), isoToUTC(endISO));
-  for (let y = new Date(s).getUTCFullYear(); y <= new Date(e).getUTCFullYear(); y++) {
-    const a1 = Date.UTC(y, 7, 1), a31 = Date.UTC(y, 7, 31);
-    if (a1 <= e && a31 >= s) return true;
-  }
-  return false;
-}
-function addDaysForward(startISO, days, applyFeriale) {
-  let endMs = isoToUTC(startISO) + days * 864e5;
-  if (applyFeriale && days > 0 && ferialeOverlaps(startISO, utcToISO(endMs))) endMs += 31 * 864e5;
-  return utcToISO(endMs);
-}
-function computeDeadlinesFromEvent(ev) {
-  const out = [];
-  const notiziaAtto = ev.eventType === "notifica_atto" || ev.eventType === "comunicazione" && (ev.category === "AGENZIA_ENTRATE" || ev.category === "RISCOSSIONE");
-  if (notiziaAtto && ev.baseDate) {
-    out.push({
-      tipo: "Ricorso/impugnazione \u2014 termine 60 gg",
-      dueDate: addDaysForward(ev.baseDate, 60, true),
-      norma: "art. 21 D.Lgs 546/1992 (60 gg dalla notifica) + sospensione feriale L. 742/1969",
-      note: "VERIFICARE la data di notifica esatta sull'atto (qui usata la data PEC come proxy). Sospensione feriale 1\u201331/8 applicata.",
-      daConfermare: true,
-      uncertain: false
-    });
-  }
-  if (ev.eventType === "fissazione_udienza" && ev.hearingDate) {
-    out.push({
-      tipo: "Deposito documenti (fino a 20 gg liberi prima dell'udienza)",
-      dueDate: addDaysForward(ev.hearingDate, -20, false),
-      norma: "art. 32 c.1 D.Lgs 546/1992",
-      note: "Termine A RITROSO: verificare il computo dei giorni LIBERI ed eventuale sospensione feriale (non applicata automaticamente).",
-      daConfermare: true,
-      uncertain: true
-    });
-    out.push({
-      tipo: "Memorie illustrative (fino a 10 gg liberi prima)",
-      dueDate: addDaysForward(ev.hearingDate, -10, false),
-      norma: "art. 32 c.1 D.Lgs 546/1992",
-      note: "Termine a ritroso: verificare giorni liberi/feriale.",
-      daConfermare: true,
-      uncertain: true
-    });
-    out.push({
-      tipo: "Repliche (fino a 5 gg liberi prima)",
-      dueDate: addDaysForward(ev.hearingDate, -5, false),
-      norma: "art. 32 c.2 D.Lgs 546/1992",
-      note: "Termine a ritroso: verificare giorni liberi/feriale.",
-      daConfermare: true,
-      uncertain: true
-    });
-  }
-  return out;
-}
-
-// server/pec.ts
-init_integrations();
-init_zapi();
-init_chatbot();
-db_default.exec(`
-  CREATE TABLE IF NOT EXISTS pec_events (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    message_id TEXT UNIQUE,
-    pec_uid INTEGER,
-    from_addr TEXT,
-    subject TEXT,
-    category TEXT,
-    event_type TEXT,
-    confident INTEGER DEFAULT 0,
-    hearing_date TEXT,
-    rg_ref TEXT,
-    dates_json TEXT,
-    attachments_json TEXT,
-    body_excerpt TEXT,
-    client_key TEXT,
-    status TEXT DEFAULT 'nuovo',       -- nuovo | da_rivedere | processato
-    calendar_event_ids TEXT,           -- JSON: idempotenza calendarizzazione (BLOCCO 3)
-    received_at TEXT,
-    created_at TEXT DEFAULT (datetime('now'))
-  );
-  CREATE INDEX IF NOT EXISTS idx_pec_events_status ON pec_events(status, created_at);
-`);
-function envSetting(key, def = "") {
-  return (process.env[key] || def).trim();
-}
-function pecConfig() {
-  return {
-    host: envSetting("PEC_IMAP_HOST", "mbox.cert.legalmail.it"),
-    port: parseInt(envSetting("PEC_IMAP_PORT", "993"), 10) || 993,
-    user: envSetting("PEC_USER", "studiotributariobrancamariano@legalmail.it"),
-    pass: process.env.PEC_PASS || ""
-  };
-}
-function pecEnabled() {
-  const c = pecConfig();
-  return !!(c.user && c.pass);
-}
-function setSetting4(k, v) {
-  try {
-    db_default.prepare(`INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(k, v);
-  } catch {
-  }
-}
-function getSetting4(k) {
-  try {
-    return db_default.prepare(`SELECT value FROM app_settings WHERE key = ?`).get(k)?.value ?? null;
-  } catch {
-    return null;
-  }
-}
-function ingestPecMessage(m) {
-  const exists = db_default.prepare(`SELECT id FROM pec_events WHERE message_id = ?`).get(m.messageId);
-  if (exists) return null;
-  const cls = classifyPec(m.fromAddr, m.subject, m.body);
-  const hearing = extractHearingDate(`${m.subject}
-${m.body}`);
-  const rg = extractRG(`${m.subject}
-${m.body}`);
-  const dates = extractDates(`${m.subject}
-${m.body}`);
-  const status = cls.confident ? "nuovo" : "da_rivedere";
-  const info = db_default.prepare(`
-    INSERT INTO pec_events (message_id, pec_uid, from_addr, subject, category, event_type, confident,
-      hearing_date, rg_ref, dates_json, attachments_json, body_excerpt, status, received_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    m.messageId,
-    m.uid ?? null,
-    m.fromAddr,
-    m.subject,
-    cls.category,
-    cls.eventType,
-    cls.confident ? 1 : 0,
-    hearing,
-    rg,
-    JSON.stringify(dates),
-    JSON.stringify(m.attachments || []),
-    String(m.body || "").slice(0, 500),
-    status,
-    m.receivedAt
-  );
-  return Number(info.lastInsertRowid);
-}
-async function calEvent(title, description, dateISO, startHHMM = "09:00", durMin = 60) {
-  const start = `${dateISO}T${startHHMM}:00`;
-  const endMs = Date.parse(start) + durMin * 6e4;
-  const end = new Date(endMs).toISOString().slice(0, 19);
-  try {
-    const r = await createCalendarEvent({ title, description, startDate: start, endDate: end });
-    return r.success ? r.eventId || "created" : null;
-  } catch {
-    return null;
-  }
-}
-async function processPecEvent(row) {
-  if (!row || row.status === "processato" || row.calendar_event_ids) return { ok: true, created: 0, skipped: true };
-  const rg = row.rg_ref ? ` R.G. ${row.rg_ref}` : "";
-  const who = row.from_addr || "";
-  const ids = [];
-  let created = 0;
-  const lines = [];
-  if (row.hearing_date) {
-    const title = `\u2696\uFE0F UDIENZA${rg} \u2014 ${row.category}`;
-    const desc = `Udienza fissata (fonte PEC). Oggetto: ${row.subject}
-Mittente: ${who}
-\u23F0 Orario da verificare sull'avviso.`;
-    const eid = await calEvent(title, desc, row.hearing_date, "09:00", 60);
-    if (eid) {
-      ids.push(`hearing:${eid}`);
-      created++;
-    }
-    createDeadline({ clientKey: row.rg_ref || null, tipo: "Udienza CGT", description: `${row.subject} (orario da verificare)`, dueDate: row.hearing_date });
-    lines.push(`\u2696\uFE0F Udienza${rg}: ${row.hearing_date} (orario da verificare)`);
-  }
-  const terms = computeDeadlinesFromEvent({ eventType: row.event_type, category: row.category, hearingDate: row.hearing_date, baseDate: row.received_at ? String(row.received_at).slice(0, 10) : null });
-  for (const t of terms) {
-    const title = `[DA CONFERMARE] ${t.tipo}${rg}`;
-    const desc = `Termine PROPOSTO (da confermare) \u2014 ${t.norma}
-${t.note}${t.uncertain ? "\n\u26A0\uFE0F Regola incerta: verificare." : ""}
-Fascicolo: ${row.rg_ref || "n/d"} \xB7 PEC: ${row.subject}`;
-    const eid = await calEvent(title, desc, t.dueDate, "09:00", 30);
-    if (eid) {
-      ids.push(`term:${eid}`);
-      created++;
-    }
-    createDeadline({ clientKey: row.rg_ref || null, tipo: `[DA CONFERMARE] ${t.tipo}`, description: `${t.norma} \u2014 ${t.note}`, dueDate: t.dueDate });
-    lines.push(`\u2022 [DA CONFERMARE] ${t.tipo}: ${t.dueDate} (${t.norma})`);
-  }
-  db_default.prepare(`UPDATE pec_events SET status = 'processato', calendar_event_ids = ? WHERE id = ?`).run(JSON.stringify(ids), row.id);
-  if (lines.length) {
-    const alert = `\u{1F4E9} *PEC contenzioso* \u2014 nuovo evento${rg}
-${row.subject}
-
-${lines.join("\n")}
-
-\u26A0\uFE0F I termini sono PROPOSTE [DA CONFERMARE]: verifica sull'atto (date di notifica, giorni liberi, feriale).`;
-    try {
-      await sendTextMessage(getControlNumber(), alert);
-    } catch {
-    }
-  }
-  return { ok: true, created };
-}
-async function runPecProcessing() {
-  const rows = db_default.prepare(`SELECT * FROM pec_events WHERE status = 'nuovo' ORDER BY id ASC LIMIT 50`).all();
-  let processed = 0, created = 0;
-  for (const r of rows) {
-    try {
-      const res = await processPecEvent(r);
-      processed++;
-      created += res.created;
-    } catch (e) {
-      console.error("[PEC] processing evento", r.id, e?.message);
-    }
-  }
-  return { processed, created };
-}
-async function pollPec(force = false) {
-  if (!pecEnabled()) return { enabled: false, processed: 0, created: 0, error: "PEC non configurata (mancano PEC_USER/PEC_PASS)" };
-  const c = pecConfig();
-  const client = new import_imapflow2.ImapFlow({ host: c.host, port: c.port, secure: true, auth: { user: c.user, pass: c.pass }, logger: false });
-  let processed = 0, created = 0;
-  try {
-    await client.connect();
-    const lock = await client.getMailboxLock("INBOX");
-    try {
-      const status = await client.status("INBOX", { messages: true });
-      const total = status.messages || 0;
-      if (total) {
-        const from = Math.max(1, total - 60);
-        for await (const msg of client.fetch(`${from}:*`, { uid: true, source: true })) {
-          processed++;
-          try {
-            const parsed = await (0, import_mailparser2.simpleParser)(msg.source);
-            const messageId = parsed.messageId || `pec_${msg.uid}`;
-            if (db_default.prepare(`SELECT 1 FROM pec_events WHERE message_id = ?`).get(messageId)) continue;
-            const fromVal = parsed.from?.value?.[0] || {};
-            const atts = (parsed.attachments || []).map((a) => a.filename || "allegato");
-            const id = ingestPecMessage({
-              messageId,
-              uid: msg.uid,
-              fromAddr: fromVal.address || "",
-              subject: parsed.subject || "(senza oggetto)",
-              body: parsed.text || "",
-              attachments: atts,
-              receivedAt: (parsed.date || /* @__PURE__ */ new Date()).toISOString()
-            });
-            if (id) created++;
-          } catch (e) {
-            console.error("[PEC] parse messaggio fallito:", e?.message);
-          }
-        }
-      }
-    } finally {
-      lock.release();
-    }
-    await client.logout().catch(() => {
-    });
-    setSetting4("pec_last_poll", (/* @__PURE__ */ new Date()).toISOString());
-    try {
-      await runPecProcessing();
-    } catch (e) {
-      console.error("[PEC] processing:", e?.message);
-    }
-    return { enabled: true, processed, created };
-  } catch (e) {
-    try {
-      await client.logout().catch(() => {
-      });
-    } catch {
-    }
-    console.error("[PEC] poll fallito:", e?.message);
-    setSetting4("pec_last_error", `${(/* @__PURE__ */ new Date()).toISOString()} ${e?.message}`);
-    return { enabled: true, processed, created, error: e?.message };
-  }
-}
-function getPecEvents(limit = 100) {
-  const rows = db_default.prepare(`SELECT * FROM pec_events ORDER BY created_at DESC LIMIT ?`).all(Math.min(Math.max(limit, 1), 500));
-  return rows.map((r) => ({ ...r, dates: r.dates_json ? JSON.parse(r.dates_json) : [], attachments: r.attachments_json ? JSON.parse(r.attachments_json) : [] }));
-}
-function getPecStatus() {
-  const c = pecConfig();
-  const counts = {};
-  try {
-    for (const r of db_default.prepare(`SELECT status, COUNT(*) n FROM pec_events GROUP BY status`).all()) counts[r.status] = r.n;
-  } catch {
-  }
-  return {
-    enabled: pecEnabled(),
-    host: c.host,
-    port: c.port,
-    user: c.user,
-    // niente password: mai esposta
-    lastPoll: getSetting4("pec_last_poll"),
-    lastError: getSetting4("pec_last_error"),
-    counts
-  };
-}
-
 // server/routes.ts
+init_pec();
+init_pec_logic();
+init_pec_terms();
 var router = (0, import_express.Router)();
 try {
   const bad = db_default.prepare(`SELECT id, timestamp FROM live_messages WHERE timestamp LIKE '+%'`).all();
@@ -102627,7 +102681,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.12.2", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.12.3", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.get("/selftest", (_req, res) => {
   res.json(getLastSelfCheck() || { note: "mai eseguito" });
@@ -103980,6 +104034,19 @@ router.get("/pec/events", (req, res) => {
 router.post("/pec/poll/run", async (_req, res) => {
   try {
     res.json(await pollPec(true));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+router.post("/pec/simulate", (req, res) => {
+  try {
+    const { sender = "", subject = "", body = "", baseDate } = req.body || {};
+    const text = `${subject}
+${body}`;
+    const cls = classifyPec(String(sender), String(subject), String(body));
+    const hearing = extractHearingDate(text);
+    const terms = computeDeadlinesFromEvent({ eventType: cls.eventType, category: cls.category, hearingDate: hearing, baseDate: baseDate || (/* @__PURE__ */ new Date()).toISOString().slice(0, 10) });
+    res.json({ classification: cls, hearingDate: hearing, rg: extractRG(text), dates: extractDates(text), termini: terms, nota: "DRY-RUN: nessuna scrittura, nessun calendario, i termini sono [DA CONFERMARE]." });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
