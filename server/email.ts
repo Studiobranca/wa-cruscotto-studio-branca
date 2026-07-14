@@ -30,6 +30,7 @@ import { generateReplyCore, materializeProposedEvent, getControlNumber, sendStud
 import { sendTextMessage } from './zapi.js';
 import * as contacts from './contacts.js';
 import { decideWorkAutoSend } from './autosend.js';
+import { dateCoherenceIssue } from './date_guard.js';
 import { saveEmailDraft, recordEmailSend, getEmailDraft, markEmailDraftSent, markEmailDraftRejected } from './emaildrafts.js';
 
 db.exec(`
@@ -302,6 +303,16 @@ async function maybeAutoReply(acc: MailAccount, row: {
     return draftIt(true, true, 'Guardrail anti-ragionamento: risposta email da rivedere a mano.');
   }
   if (san.changed) { res.draftText = san.clean; }
+
+  // GUARDIA COERENZA DATA/TESTO (incidente 13/07): data nel testo incoerente con
+  // l'appuntamento registrato/confermato → bozza, mai auto-invio col giorno sbagliato.
+  for (const evd of [res.proposedEvent?.date, res.confirmedEvent?.date]) {
+    const issue = evd ? dateCoherenceIssue(res.draftText, evd) : null;
+    if (issue) {
+      console.warn(`[DateGuard] Email ${fromAddr}: ${issue} → bozza.`);
+      return draftIt(true, true, 'Guardia date: giorno/data nel testo incoerente con l\'appuntamento registrato.');
+    }
+  }
 
   // DECISIONE: in autonomia SOLO il flusso appuntamenti; ogni altra risposta (merito,
   // conferme documenti non-appuntamento) → BOZZA. Fail-safe verso la bozza.

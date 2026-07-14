@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import db from './db.js';
 import { getAvailability, formatAvailabilityIT, isSlotBusy } from './appointments.js';
+import { dateCoherenceIssue } from './date_guard.js';
 import { siteLead, siteAvailability, siteBookingRequest, getSiteLeads, deleteSiteLead, cleanupTestLeads } from './site.js';
 import { sendTextMessage, syncContacts, zapiGet, getReceivedWebhook } from './zapi.js';
 import { addSSEClient, broadcastEvent, getClientCount } from './sse.js';
@@ -90,7 +91,7 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.16.1', built: new Date().toISOString() });
+  res.json({ version: '2.16.2', built: new Date().toISOString() });
 });
 
 // ─── Endpoint pubblici per il SITO (studiotributariobranca.eu) ───────────────
@@ -1087,6 +1088,17 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
             } else if (san.changed) {
               res.draftText = san.clean;
               console.warn(`[Sanitizer] ${cName} (${phone}): rimosso preambolo di ragionamento (${san.removed.length} blocco/i) prima dell'invio.`);
+            }
+            // ─── GUARDIA COERENZA DATA/TESTO (incidente 13/07, Conti Domenico) ────────
+            // Se il testo cita un giorno della settimana o un "N mese" incoerente con la
+            // data REALE dell'appuntamento registrato/confermato → niente auto-invio: il
+            // cliente riceverebbe una data sbagliata. Resta bozza da rivedere.
+            for (const evd of [res.proposedEvent?.date, res.confirmedEvent?.date]) {
+              const issue = evd ? dateCoherenceIssue(res.draftText, evd) : null;
+              if (issue) {
+                if (wouldAutoSend) { res.needsHuman = true; sanitizerDiverted = true; }
+                console.warn(`[DateGuard] ${cName} (${phone}): ${issue} → bozza da rivedere, nessun auto-invio.`);
+              }
             }
             const id = saveDraft({ phone, contactName: cName, incoming: content, result: res });
             // APPUNTAMENTI in autonomia: il flusso agenda (proposta/conferma/spostamento)

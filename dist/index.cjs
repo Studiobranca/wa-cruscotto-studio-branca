@@ -24178,6 +24178,12 @@ function formatDateIT(ds) {
   const day = parseInt(ds.slice(8, 10), 10), month = MONTH_IT[parseInt(ds.slice(5, 7), 10) - 1];
   return `${day} ${month}`;
 }
+function weekdayIT(ds) {
+  return DOW_IT[(/* @__PURE__ */ new Date(`${ds}T12:00:00Z`)).getUTCDay()] || "";
+}
+function formatDateFullIT(ds) {
+  return `${weekdayIT(ds)} ${formatDateIT(ds)} ${ds.slice(0, 4)}`;
+}
 async function getNowStatus() {
   const now = /* @__PURE__ */ new Date();
   const todayISO = new Intl.DateTimeFormat("en-CA", { timeZone: TZ }).format(now);
@@ -24241,6 +24247,41 @@ var init_appointments = __esm({
     CHIUSURA_A = "2026-08-31";
     DOW_IT = ["domenica", "luned\xEC", "marted\xEC", "mercoled\xEC", "gioved\xEC", "venerd\xEC", "sabato"];
     MONTH_IT = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"];
+  }
+});
+
+// server/date_guard.ts
+function weekdayOf(ds) {
+  return DOW_IT2[(/* @__PURE__ */ new Date(`${ds}T12:00:00Z`)).getUTCDay()] || "";
+}
+function norm(s) {
+  return s.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+}
+function dateCoherenceIssue(text, dateISO) {
+  if (!text || !/^\d{4}-\d{2}-\d{2}$/.test(dateISO || "")) return null;
+  const t = norm(text);
+  const issues = [];
+  const trueDow = norm(weekdayOf(dateISO));
+  const mentioned = DOW_IT2.map(norm).filter((d) => new RegExp(`\\b${d}\\b`).test(t));
+  if (mentioned.length && !mentioned.includes(trueDow)) {
+    issues.push(`il testo cita ${mentioned.join("/")} ma la data registrata (${dateISO}) \xE8 di ${trueDow}`);
+  }
+  const month = MONTH_IT2[parseInt(dateISO.slice(5, 7), 10) - 1];
+  const trueDay = parseInt(dateISO.slice(8, 10), 10);
+  const re = new RegExp(`\\b(\\d{1,2})\\s+${month}\\b`, "g");
+  const days = [];
+  for (let m = re.exec(t); m; m = re.exec(t)) days.push(parseInt(m[1], 10));
+  if (days.length && !days.includes(trueDay)) {
+    issues.push(`il testo cita il ${days.join("/il ")} ${month} ma la data registrata \xE8 il ${trueDay} ${month}`);
+  }
+  return issues.length ? issues.join("; ") : null;
+}
+var DOW_IT2, MONTH_IT2;
+var init_date_guard = __esm({
+  "server/date_guard.ts"() {
+    "use strict";
+    DOW_IT2 = ["domenica", "luned\xEC", "marted\xEC", "mercoled\xEC", "gioved\xEC", "venerd\xEC", "sabato"];
+    MONTH_IT2 = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"];
   }
 });
 
@@ -25125,14 +25166,22 @@ function sanitizeClientText(raw, toolNames) {
     removed.push(paras[i].trim());
     i++;
   }
-  const clean = paras.slice(i).join("\n\n").trim();
+  let rest = paras.slice(i);
+  if (rest.length > 1 && !GREETING_RE.test((rest[0] || "").trim())) {
+    const g = rest.findIndex((p, idx) => idx > 0 && GREETING_RE.test((p || "").trim()));
+    if (g > 0) {
+      removed.push(...rest.slice(0, g).map((p) => p.trim()));
+      rest = rest.slice(g);
+    }
+  }
+  const clean = rest.join("\n\n").trim();
   const residualTool = !!toolRe && toolRe.test(clean);
   const changed = removed.length > 0;
   const firstRemainingIsReasoning = clean ? isReasoning(clean.split(/\n{2,}/)[0], toolRe) : true;
   const safe = clean.length >= 20 && !residualTool && !firstRemainingIsReasoning;
   return { clean, original, removed, residualTool, changed, safe };
 }
-var META_MARKERS;
+var META_MARKERS, GREETING_RE;
 var init_sanitize = __esm({
   "server/sanitize.ts"() {
     "use strict";
@@ -25153,8 +25202,15 @@ var init_sanitize = __esm({
       /\bdallo\s+storico\b/i,
       /\bnello\s+storico\b/i,
       /\bdalla\s+conversazione\s+risulta\b/i,
-      /\bnon\s+emerge\s+che\b/i
+      /\bnon\s+emerge\s+che\b/i,
+      // Leak del 13/07 (Conti Domenico): deliberazione in "stage direction" senza i marcatori
+      // storici — il modello RACCONTA cosa sta per chiedere invece di chiederlo.
+      /\bglielo\s+chiedo\s+nel\s+messaggio\b/i,
+      /\bchiedo\s+quale\s+preferisc\w*\b/i,
+      /\bnon\s+è\s+chiaro\s+il\s+contesto\b/i,
+      /\bnel\s+frattempo\s+noto\b/i
     ];
+    GREETING_RE = /^(buongiorno|buonasera|buon\s+pomeriggio|salve|gentile\b|egregi|spett\.?|carissim|ciao\b)/i;
   }
 });
 
@@ -25524,6 +25580,7 @@ async function runTool(name, input, out, phone) {
       return `${calendarChecked ? "" : "(agenda non verificata su Calendar) "}NESSUNA disponibilit\xE0 nei prossimi ${days} giorni (agenda piena o chiusura dello studio). NON proporre MAI date o orari a mano. Proponi al cliente la LISTA D'ATTESA: se accetta di essere ricontattato quando si libereranno nuove date, chiama add_to_waitlist con il motivo dell'appuntamento; verr\xE0 ricontattato in automatico su questo stesso canale. Nel frattempo pu\xF2 inviare la documentazione su questa chat o via email.`;
     }
     const txt = formatAvailabilityIT(slots);
+    out.offeredSlots = slots.map((s) => `${s.date} ${s.start}`);
     const iso = slots.slice(0, 12).map((s) => `${s.date} ${s.start}`).join("; ");
     return `${calendarChecked ? "" : "(agenda non verificata su Calendar) "}Prossime disponibilit\xE0 (da mostrare al cliente):
 ${txt}
@@ -25551,9 +25608,12 @@ Slot con data esatta da usare in propose_booking (date=YYYY-MM-DD, start=HH:MM):
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !/^\d{1,2}:\d{2}$/.test(start)) {
       return "Errore: data o ora non valide. Usa get_availability e riprova con uno slot esatto.";
     }
+    if (out.offeredSlots && !out.offeredSlots.includes(`${date} ${start}`)) {
+      return `Errore: lo slot ${date} ${start} NON \xE8 tra le disponibilit\xE0 restituite da get_availability. Copia ESATTAMENTE una coppia date+start dall'elenco "Slot con data esatta" (controlla di non aver confuso il giorno della settimana con la data), poi richiama propose_booking.`;
+    }
     out.proposedEvent = { date, start, end: endTime(start), reason: String(input?.reason || "Appuntamento") };
     out.appointmentFlow = true;
-    return "Proposta registrata. Comunica al cliente lo slot e che resta in attesa di conferma, ringrazia e \u2014 se l'incontro riguarda documenti da esaminare \u2014 CHIARISCI che deve inviarli PRIMA dell'appuntamento (es. atti/cartelle notificate, fatture, dichiarazioni, contratti, avvisi), su questa chat WhatsApp OPPURE via email a studiobranca@tiscali.it o studiobranca@icloud.com: solo cos\xEC potranno essere visionati e poi discussi durante l'incontro. Infine chiedigli di confermare quando avr\xE0 la certezza di poter venire.";
+    return `Proposta registrata per ${formatDateFullIT(date)} alle ${start}. NEL MESSAGGIO al cliente scrivi giorno e data ESATTAMENTE cos\xEC: "${formatDateFullIT(date)}" (COPIALI, non ricalcolarli). Se questo NON \xE8 il giorno che il cliente aveva chiesto, NON rispondere: richiama propose_booking con lo slot giusto. Poi comunica al cliente lo slot e che resta in attesa di conferma, ringrazia e \u2014 se l'incontro riguarda documenti da esaminare \u2014 CHIARISCI che deve inviarli PRIMA dell'appuntamento (es. atti/cartelle notificate, fatture, dichiarazioni, contratti, avvisi), su questa chat WhatsApp OPPURE via email a studiobranca@tiscali.it o studiobranca@icloud.com: solo cos\xEC potranno essere visionati e poi discussi durante l'incontro. Infine chiedigli di confermare quando avr\xE0 la certezza di poter venire.`;
   }
   if (name === "confirm_appointment") {
     out.appointmentFlow = true;
@@ -25562,7 +25622,8 @@ Slot con data esatta da usare in propose_booking (date=YYYY-MM-DD, start=HH:MM):
       return "Non risulta alcun appuntamento in attesa di conferma per questo cliente: non confermare nulla, prosegui normalmente.";
     }
     const r = await confirmAppointmentRow(appt, { notify: true });
-    return `Appuntamento confermato e ${r.calendarUpdated ? "agenda aggiornata" : "segnalato al Dott. Branca"}. Scrivi al cliente un breve messaggio che CONFERMA l'appuntamento del ${appt.date} alle ${appt.start}, ringrazia, e \u2014 se l'incontro riguarda documenti da esaminare \u2014 RIBADISCI che deve inviarli PRIMA dell'appuntamento (su questa chat WhatsApp oppure via email a studiobranca@tiscali.it o studiobranca@icloud.com), cos\xEC potranno essere visionati e discussi durante l'incontro; indica che lo studio \xE8 in Via Operai 102, Barcellona P.G. (ME).`;
+    out.confirmedEvent = { date: appt.date, start: appt.start };
+    return `Appuntamento confermato e ${r.calendarUpdated ? "agenda aggiornata" : "segnalato al Dott. Branca"}. Scrivi al cliente un breve messaggio che CONFERMA l'appuntamento di ${formatDateFullIT(appt.date)} alle ${appt.start} \u2014 scrivi giorno e data ESATTAMENTE cos\xEC: "${formatDateFullIT(appt.date)}" (COPIALI, non ricalcolare il giorno della settimana) \u2014 ringrazia, e \u2014 se l'incontro riguarda documenti da esaminare \u2014 RIBADISCI che deve inviarli PRIMA dell'appuntamento (su questa chat WhatsApp oppure via email a studiobranca@tiscali.it o studiobranca@icloud.com), cos\xEC potranno essere visionati e discussi durante l'incontro; indica che lo studio \xE8 in Via Operai 102, Barcellona P.G. (ME).`;
   }
   if (name === "cancel_appointment") {
     out.appointmentFlow = true;
@@ -25590,7 +25651,7 @@ Agenda aggiornata (evento annullato).`
     } catch (e) {
       console.error("[Chatbot] notifica disdetta fallita:", e.message);
     }
-    return `Appuntamento del ${first.date} alle ${first.start} DISDETTO e agenda aggiornata. Scrivi al cliente un breve messaggio che conferma la disdetta, ringrazia, e resta a disposizione per fissare un nuovo appuntamento quando vorr\xE0 (se indica gi\xE0 una nuova preferenza, usa get_availability per proporre slot reali).`;
+    return `Appuntamento di ${formatDateFullIT(first.date)} alle ${first.start} DISDETTO e agenda aggiornata. Scrivi al cliente un breve messaggio che conferma la disdetta (se citi la data, scrivila ESATTAMENTE cos\xEC: "${formatDateFullIT(first.date)}"), ringrazia, e resta a disposizione per fissare un nuovo appuntamento quando vorr\xE0 (se indica gi\xE0 una nuova preferenza, usa get_availability per proporre slot reali).`;
   }
   if (name === "add_to_waitlist") {
     out.appointmentFlow = true;
@@ -25660,14 +25721,14 @@ async function generateReplyCore(key, contactName, userContent, channel = "whats
   if (upcomingAppt && upcomingAppt.status === "confermato") {
     apptBlock = `
 
-\u26A0\uFE0F QUESTO CLIENTE HA GI\xC0 UN APPUNTAMENTO CONFERMATO IN AGENDA: ${upcomingAppt.date} alle ${upcomingAppt.start}${upcomingAppt.reason ? ` (${upcomingAppt.reason})` : ""}.
+\u26A0\uFE0F QUESTO CLIENTE HA GI\xC0 UN APPUNTAMENTO CONFERMATO IN AGENDA: ${formatDateFullIT(upcomingAppt.date)} (${upcomingAppt.date}) alle ${upcomingAppt.start}${upcomingAppt.reason ? ` (${upcomingAppt.reason})` : ""}.
 - NON proporre e NON fissare un nuovo appuntamento per la stessa questione: l'appuntamento c'\xE8 gi\xE0. Ricordaglielo con garbo (data e ora).
 - Solo se il cliente chiede ESPLICITAMENTE di SPOSTARLO, usa get_availability per riproporre nuovi slot (alla registrazione del nuovo con propose_booking il vecchio si annulla da solo); se chiede di DISDIRE senza riprogrammare, chiama cancel_appointment.
 - Se serve, ricorda che la documentazione utile va inviata ${dest} PRIMA dell'incontro.`;
   } else if (pendingAppt) {
     apptBlock = `
 
-APPUNTAMENTO IN ATTESA DI CONFERMA per questo cliente: ${pendingAppt.date} alle ${pendingAppt.start}${pendingAppt.reason ? ` (${pendingAppt.reason})` : ""}.
+APPUNTAMENTO IN ATTESA DI CONFERMA per questo cliente: ${formatDateFullIT(pendingAppt.date)} (${pendingAppt.date}) alle ${pendingAppt.start}${pendingAppt.reason ? ` (${pendingAppt.reason})` : ""}.
 - NON proporre un secondo appuntamento per la stessa cosa: ce n'\xE8 gi\xE0 uno in attesa.
 - Se nell'ULTIMO messaggio il cliente CONFERMA che pu\xF2 venire (es. "confermo", "s\xEC va bene", "ci sono", "perfetto", "ok per quel giorno"), chiama confirm_appointment e poi conferma con garbo.
 - Se invece chiede di SPOSTARE l'orario, usa get_availability per riproporre nuovi slot; se vuole DISDIRE, chiama cancel_appointment; se \xE8 incerto, NON chiamare confirm_appointment.`;
@@ -26125,6 +26186,16 @@ GESTIONE OPERATIVA:
   5. Se resti in dubbio anche dopo aver cercato e chiesto, o la situazione ha margini di rischio
      (termini che potrebbero gi\xE0 decorrere, atto che non riesci a inquadrare con certezza):
      chiama need_human, non indovinare.
+
+DATE E GIORNI DELLA SETTIMANA (zero-errori \u2014 incidente 13/07/2026):
+- NON calcolare MAI a mente il giorno della settimana di una data: COPIA sempre la coppia
+  giorno+data esattamente come la restituiscono get_availability, propose_booking,
+  confirm_appointment e il blocco appuntamenti nel system (es. "gioved\xEC 16 luglio 2026").
+- In propose_booking la data va copiata CARATTERE PER CARATTERE da uno slot dell'elenco
+  "Slot con data esatta" di get_availability: verifica DUE volte che il giorno della
+  settimana che stai per scrivere al cliente corrisponda a quello slot.
+- Se il risultato di un tool indica un giorno DIVERSO da quello che intendevi proporre,
+  fermati e correggi (richiama il tool con lo slot giusto) PRIMA di scrivere al cliente.
 
 URGENZE (cartella esattoriale, avviso di accertamento, atto notificato con termini in
 decorrenza, udienza, pignoramento): chiama need_human per allertare il Dott. Branca, MA
@@ -100624,6 +100695,13 @@ ${row.body}`;
   if (san.changed) {
     res.draftText = san.clean;
   }
+  for (const evd of [res.proposedEvent?.date, res.confirmedEvent?.date]) {
+    const issue = evd ? dateCoherenceIssue(res.draftText, evd) : null;
+    if (issue) {
+      console.warn(`[DateGuard] Email ${fromAddr}: ${issue} \u2192 bozza.`);
+      return draftIt(true, true, "Guardia date: giorno/data nel testo incoerente con l'appuntamento registrato.");
+    }
+  }
   const decision = decideWorkAutoSend({
     appointmentFlow: !!res.appointmentFlow,
     needsHuman: false,
@@ -100871,6 +100949,7 @@ var init_email = __esm({
     init_zapi();
     init_contacts();
     init_autosend();
+    init_date_guard();
     init_emaildrafts();
     db.exec(`
   CREATE TABLE IF NOT EXISTS incoming_emails (
@@ -101899,6 +101978,7 @@ init_db();
 var import_express = __toESM(require_express2(), 1);
 init_db();
 init_appointments();
+init_date_guard();
 
 // node_modules/zod/v3/external.js
 var external_exports = {};
@@ -106337,11 +106417,11 @@ function isTooFresh(createdAt, nowMs) {
   if (isNaN(t)) return false;
   return nowMs - t < 6 * 36e5;
 }
-var MONTH_IT2 = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"];
+var MONTH_IT3 = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"];
 function humanDateIT(ds) {
   const d = /* @__PURE__ */ new Date(`${ds}T12:00:00Z`);
   const dow = new Intl.DateTimeFormat("it-IT", { weekday: "long", timeZone: "UTC" }).format(d);
-  return `${dow} ${parseInt(ds.slice(8, 10), 10)} ${MONTH_IT2[parseInt(ds.slice(5, 7), 10) - 1]}`;
+  return `${dow} ${parseInt(ds.slice(8, 10), 10)} ${MONTH_IT3[parseInt(ds.slice(5, 7), 10) - 1]}`;
 }
 function reminderMessageIT(a, channel) {
   const nome = (a.contact_name || "").trim();
@@ -107387,7 +107467,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.16.1", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.16.2", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.post("/site/lead", (req, res) => siteLead(req, res));
 router.get("/site/availability", (req, res) => siteAvailability(req, res));
@@ -108295,6 +108375,16 @@ Da confermare.`,
             } else if (san.changed) {
               res2.draftText = san.clean;
               console.warn(`[Sanitizer] ${cName} (${phone}): rimosso preambolo di ragionamento (${san.removed.length} blocco/i) prima dell'invio.`);
+            }
+            for (const evd of [res2.proposedEvent?.date, res2.confirmedEvent?.date]) {
+              const issue = evd ? dateCoherenceIssue(res2.draftText, evd) : null;
+              if (issue) {
+                if (wouldAutoSend) {
+                  res2.needsHuman = true;
+                  sanitizerDiverted = true;
+                }
+                console.warn(`[DateGuard] ${cName} (${phone}): ${issue} \u2192 bozza da rivedere, nessun auto-invio.`);
+              }
             }
             const id = saveDraft({ phone, contactName: cName, incoming: content, result: res2 });
             const decision = decideWorkAutoSend({

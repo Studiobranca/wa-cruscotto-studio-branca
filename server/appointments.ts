@@ -205,6 +205,19 @@ export function formatDateIT(ds: string): string {
   return `${day} ${month}`;
 }
 
+/** Giorno della settimana italiano di una data YYYY-MM-DD (calcolo a mezzogiorno UTC:
+ *  indipendente dal fuso del server). */
+export function weekdayIT(ds: string): string {
+  return DOW_IT[new Date(`${ds}T12:00:00Z`).getUTCDay()] || '';
+}
+
+/** Data COMPLETA in italiano con giorno della settimana, es. "giovedì 16 luglio 2026".
+ *  È la formulazione che il bot deve COPIARE nel testo al cliente (incidente 13/07:
+ *  il modello scriveva "giovedì 16" ma registrava il 17 — il giorno lo calcola il server). */
+export function formatDateFullIT(ds: string): string {
+  return `${weekdayIT(ds)} ${formatDateIT(ds)} ${ds.slice(0, 4)}`;
+}
+
 export interface NowStatus {
   isOpenNow: boolean;
   freeNow: boolean;
