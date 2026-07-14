@@ -55,3 +55,19 @@ Diagnostica rapida: `GET /api/health` · `GET /api/version` · `GET /api/bot/mon
 - Numero di controllo (notifiche a Mariano): `393762547718`. Device Z-API (linea studio): `393457050479`.
 - Env chiave: `ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY`, `ZAPI_*`, `GOOGLE_*`, `BREVO_API_KEY`, `ALERT_EMAIL`,
   `EMAIL_TISCALI_PASS`, `EMAIL_ICLOUD_PASS`. (Per SMS in futuro: `SMS_PROVIDER`, `SKEBBY_*`.)
+
+## 5) Data sbagliata in un messaggio appuntamento / leak di ragionamento (incidente 13/07)
+**Sintomi:** il bot scrive al cliente un giorno/data diverso da quello registrato in agenda
+("giovedì 16" nel testo, evento al 17), oppure nel messaggio compare la deliberazione interna
+del modello prima del vero testo.
+**Difese attive (v2.16.2):**
+1. `propose_booking` rifiuta slot non presenti nell'ultimo `get_availability` (stessa generazione).
+2. I tool restituiscono la data con giorno-settimana calcolato dal server (`formatDateFullIT`)
+   e obbligo di copiarla nel testo.
+3. `server/date_guard.ts`: testo incoerente con la data registrata → NIENTE auto-invio, bozza
+   (log `[DateGuard]` nei log Railway). Vale per WhatsApp ed email.
+4. `server/sanitize.ts`: regola del saluto (paragrafi prima di "Buongiorno/Gentile/…" = preambolo
+   rimosso) + marcatori meta (log `[Sanitizer]`).
+**Se ricapita:** cercare `[DateGuard]`/`[Sanitizer]` in `railway logs`; aggiungere il caso reale a
+`scripts/test_date_guard.ts` / `scripts/test_sanitize.ts` (riprodurre PRIMA, poi fixare);
+se serve fermare subito il flusso autonomo: `POST /api/bot/config {"autoAppointments": false}`.
