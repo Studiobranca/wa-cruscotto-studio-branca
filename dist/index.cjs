@@ -19996,14 +19996,14 @@ var require_etag = __commonJS({
   "node_modules/etag/index.js"(exports2, module2) {
     "use strict";
     module2.exports = etag;
-    var crypto2 = require("crypto");
+    var crypto3 = require("crypto");
     var Stats = require("fs").Stats;
     var toString = Object.prototype.toString;
     function entitytag(entity) {
       if (entity.length === 0) {
         return '"0-2jmj7l5rSw0yVb/vlWAYkK/YBwk"';
       }
-      var hash = crypto2.createHash("sha1").update(entity, "utf8").digest("base64").substring(0, 27);
+      var hash = crypto3.createHash("sha1").update(entity, "utf8").digest("base64").substring(0, 27);
       var len = typeof entity === "string" ? Buffer.byteLength(entity, "utf8") : entity.length;
       return '"' + len.toString(16) + "-" + hash + '"';
     }
@@ -22896,11 +22896,11 @@ var require_request = __commonJS({
 // node_modules/cookie-signature/index.js
 var require_cookie_signature = __commonJS({
   "node_modules/cookie-signature/index.js"(exports2) {
-    var crypto2 = require("crypto");
+    var crypto3 = require("crypto");
     exports2.sign = function(val, secret) {
       if ("string" !== typeof val) throw new TypeError("Cookie value must be provided as a string.");
       if (null == secret) throw new TypeError("Secret key must be provided.");
-      return val + "." + crypto2.createHmac("sha256", secret).update(val).digest("base64").replace(/\=+$/, "");
+      return val + "." + crypto3.createHmac("sha256", secret).update(val).digest("base64").replace(/\=+$/, "");
     };
     exports2.unsign = function(val, secret) {
       if ("string" !== typeof val) throw new TypeError("Signed cookie string must be provided.");
@@ -22909,7 +22909,7 @@ var require_cookie_signature = __commonJS({
       return sha1(mac) == sha1(val) ? str : false;
     };
     function sha1(str) {
-      return crypto2.createHash("sha1").update(str).digest("hex");
+      return crypto3.createHash("sha1").update(str).digest("hex");
     }
   }
 });
@@ -25948,14 +25948,14 @@ async function notifyUrgentByEmail(id) {
   const d = getDraft(id);
   if (!d) return;
   const base = process.env.PUBLIC_BASE_URL || "https://wa-cruscotto-v2-production.up.railway.app";
-  const esc2 = (s) => String(s ?? "").replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" })[c]);
+  const esc3 = (s) => String(s ?? "").replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" })[c]);
   const subject = `\u{1F534} URGENTE \u2014 bozza #${d.id} \u2014 ${d.contact_name || d.phone}`;
   const html = `
     <h2 style="color:#b00020;margin:0 0 8px">Richiesta urgente sul WhatsApp dello studio</h2>
-    <p><b>Cliente:</b> ${esc2(d.contact_name || d.phone)} (${esc2(d.phone)})</p>
-    ${d.incoming_excerpt ? `<p><b>Messaggio:</b><br>${esc2(d.incoming_excerpt)}</p>` : ""}
+    <p><b>Cliente:</b> ${esc3(d.contact_name || d.phone)} (${esc3(d.phone)})</p>
+    ${d.incoming_excerpt ? `<p><b>Messaggio:</b><br>${esc3(d.incoming_excerpt)}</p>` : ""}
     <p><b>Bozza predisposta dal bot (da approvare):</b></p>
-    <blockquote style="border-left:3px solid #b00020;margin:0;padding:4px 12px;color:#333">${esc2(d.draft_text).replace(/\n/g, "<br>")}</blockquote>
+    <blockquote style="border-left:3px solid #b00020;margin:0;padding:4px 12px;color:#333">${esc3(d.draft_text).replace(/\n/g, "<br>")}</blockquote>
     <p>\u{1F449} Apri il Cruscotto per approvare o rifiutare: <a href="${base}/bot">${base}/bot</a></p>
     <hr><p style="color:#888;font-size:12px">Alert automatico \u2014 bozza <code>need_human</code> del bot WhatsApp.</p>`;
   const ok = await sendBrevoEmail(subject, html);
@@ -26357,6 +26357,134 @@ SOLO IL TESTO PER IL CLIENTE (INDEROGABILE \u2014 la tua risposta viene inviata 
 `);
     BREVO_URL = "https://api.brevo.com/v3/smtp/email";
     ALERT_SENDER = { email: "studiobranca.mariano@gmail.com", name: "Bot WhatsApp \u2014 Studio Branca" };
+  }
+});
+
+// server/sentlog_logic.ts
+function hashText(text) {
+  return import_node_crypto.default.createHash("sha256").update(String(text ?? "")).digest("hex").slice(0, 16);
+}
+function buildSentEntry(e, nowISO) {
+  const text = String(e.text ?? "");
+  return {
+    phone: String(e.phone ?? ""),
+    contact_name: e.contactName ?? null,
+    kind: e.kind,
+    draft_id: e.draftId ?? null,
+    text_hash: hashText(text),
+    text_preview: text.replace(/\s+/g, " ").trim().slice(0, 140),
+    created_at: nowISO
+  };
+}
+var import_node_crypto;
+var init_sentlog_logic = __esm({
+  "server/sentlog_logic.ts"() {
+    "use strict";
+    import_node_crypto = __toESM(require("node:crypto"), 1);
+  }
+});
+
+// server/emaildrafts.ts
+function saveEmailDraft(e) {
+  try {
+    db.prepare(`UPDATE email_drafts SET status = 'rejected' WHERE to_addr = ? AND status = 'pending'`).run(e.toAddr);
+  } catch {
+  }
+  const info = db.prepare(`
+    INSERT INTO email_drafts (account, to_addr, to_name, subject, draft_text, in_reply_to, proposed_event, needs_human, incoming_id, status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+  `).run(
+    e.account ?? null,
+    e.toAddr,
+    e.toName ?? null,
+    e.subject,
+    e.draftText,
+    e.inReplyTo ?? null,
+    e.proposedEvent ? JSON.stringify(e.proposedEvent) : null,
+    e.needsHuman ? 1 : 0,
+    e.incomingId ?? null
+  );
+  return Number(info.lastInsertRowid);
+}
+function getEmailDrafts(status = "pending") {
+  const rows = db.prepare(`SELECT * FROM email_drafts WHERE status = ? ORDER BY created_at DESC`).all(status);
+  return rows.map((r) => ({ ...r, proposed_event: r.proposed_event ? JSON.parse(r.proposed_event) : null }));
+}
+function getEmailDraft(id) {
+  const r = db.prepare(`SELECT * FROM email_drafts WHERE id = ?`).get(id);
+  if (!r) return null;
+  return { ...r, proposed_event: r.proposed_event ? JSON.parse(r.proposed_event) : null };
+}
+function markEmailDraftSent(id) {
+  db.prepare(`UPDATE email_drafts SET status = 'sent', sent_at = datetime('now') WHERE id = ?`).run(id);
+}
+function markEmailDraftRejected(id) {
+  db.prepare(`UPDATE email_drafts SET status = 'rejected' WHERE id = ?`).run(id);
+}
+function recordEmailSend(e) {
+  try {
+    db.prepare(`INSERT INTO email_sent_log (to_addr, subject, kind, draft_id, text_hash, text_preview, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(e.toAddr, e.subject, e.kind, e.draftId ?? null, hashText(e.text), String(e.text || "").replace(/\s+/g, " ").trim().slice(0, 140), (/* @__PURE__ */ new Date()).toISOString());
+  } catch (err) {
+    console.error("[EmailSentLog] insert fallito:", err?.message);
+  }
+}
+function getEmailSentLog(sinceISO, limit = 200) {
+  const since = sinceISO || new Date(Date.now() - 7 * 864e5).toISOString();
+  const lim = Math.min(Math.max(Number(limit) || 200, 1), 1e3);
+  try {
+    return db.prepare(`SELECT id, to_addr AS toAddr, subject, kind, draft_id AS draftId, text_hash AS textHash, text_preview AS textPreview, created_at AS createdAt
+      FROM email_sent_log WHERE created_at >= ? ORDER BY created_at DESC LIMIT ?`).all(since, lim);
+  } catch {
+    return [];
+  }
+}
+function getEmailSentSummary(sinceISO) {
+  const since = sinceISO || new Date(Date.now() - 7 * 864e5).toISOString();
+  const byKind = {};
+  let total = 0;
+  try {
+    for (const r of db.prepare(`SELECT kind, COUNT(*) c FROM email_sent_log WHERE created_at >= ? GROUP BY kind`).all(since)) {
+      byKind[r.kind || "unknown"] = r.c;
+      total += r.c;
+    }
+  } catch {
+  }
+  return { since, total, byKind };
+}
+var init_emaildrafts = __esm({
+  "server/emaildrafts.ts"() {
+    "use strict";
+    init_db();
+    init_sentlog_logic();
+    db.exec(`
+  CREATE TABLE IF NOT EXISTS email_drafts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account TEXT,
+    to_addr TEXT NOT NULL,
+    to_name TEXT,
+    subject TEXT,
+    draft_text TEXT,
+    in_reply_to TEXT,
+    proposed_event TEXT,            -- JSON oppure NULL
+    needs_human INTEGER DEFAULT 0,
+    incoming_id INTEGER,            -- id in incoming_emails
+    status TEXT DEFAULT 'pending',  -- pending | sent | rejected
+    created_at TEXT DEFAULT (datetime('now')),
+    sent_at TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_email_drafts_status ON email_drafts(status);
+  CREATE TABLE IF NOT EXISTS email_sent_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    to_addr TEXT,
+    subject TEXT,
+    kind TEXT,                      -- 'appointment' | 'reply-approved'
+    draft_id INTEGER,
+    text_hash TEXT,
+    text_preview TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_email_sent_log_created ON email_sent_log(created_at);
+`);
   }
 });
 
@@ -48750,7 +48878,7 @@ var require_encoding_detect = __commonJS({
     function isJIS(data) {
       var i = 0;
       var len = data && data.length;
-      var b, esc1, esc2;
+      var b, esc1, esc22;
       for (; i < len; i++) {
         b = data[i];
         if (b > 255 || b >= 128 && b <= 255) {
@@ -48761,20 +48889,20 @@ var require_encoding_detect = __commonJS({
             return false;
           }
           esc1 = data[i + 1];
-          esc2 = data[i + 2];
+          esc22 = data[i + 2];
           if (esc1 === 36) {
-            if (esc2 === 40 || // JIS X 0208-1990/2000/2004
-            esc2 === 64 || // JIS X 0208-1978
-            esc2 === 66) {
+            if (esc22 === 40 || // JIS X 0208-1990/2000/2004
+            esc22 === 64 || // JIS X 0208-1978
+            esc22 === 66) {
               return true;
             }
           } else if (esc1 === 38 && // JIS X 0208-1990
-          esc2 === 64) {
+          esc22 === 64) {
             return true;
           } else if (esc1 === 40) {
-            if (esc2 === 66 || // ASCII
-            esc2 === 73 || // JIS X 0201 Halfwidth Katakana
-            esc2 === 74) {
+            if (esc22 === 66 || // ASCII
+            esc22 === 73 || // JIS X 0201 Halfwidth Katakana
+            esc22 === 74) {
               return true;
             }
           }
@@ -49196,7 +49324,7 @@ var require_encoding_convert = __commonJS({
       var len = data && data.length;
       var i = 0;
       var b1, b2;
-      var esc2 = [
+      var esc3 = [
         27,
         40,
         66,
@@ -49212,17 +49340,17 @@ var require_encoding_convert = __commonJS({
         if (b1 >= 161 && b1 <= 223) {
           if (index !== 2) {
             index = 2;
-            results[results.length] = esc2[6];
-            results[results.length] = esc2[7];
-            results[results.length] = esc2[8];
+            results[results.length] = esc3[6];
+            results[results.length] = esc3[7];
+            results[results.length] = esc3[8];
           }
           results[results.length] = b1 - 128 & 255;
         } else if (b1 >= 128) {
           if (index !== 1) {
             index = 1;
-            results[results.length] = esc2[3];
-            results[results.length] = esc2[4];
-            results[results.length] = esc2[5];
+            results[results.length] = esc3[3];
+            results[results.length] = esc3[4];
+            results[results.length] = esc3[5];
           }
           b1 <<= 1;
           b2 = data[++i];
@@ -49250,17 +49378,17 @@ var require_encoding_convert = __commonJS({
         } else {
           if (index !== 0) {
             index = 0;
-            results[results.length] = esc2[0];
-            results[results.length] = esc2[1];
-            results[results.length] = esc2[2];
+            results[results.length] = esc3[0];
+            results[results.length] = esc3[1];
+            results[results.length] = esc3[2];
           }
           results[results.length] = b1 & 255;
         }
       }
       if (index !== 0) {
-        results[results.length] = esc2[0];
-        results[results.length] = esc2[1];
-        results[results.length] = esc2[2];
+        results[results.length] = esc3[0];
+        results[results.length] = esc3[1];
+        results[results.length] = esc3[2];
       }
       return results;
     }
@@ -49312,7 +49440,7 @@ var require_encoding_convert = __commonJS({
       var len = data && data.length;
       var i = 0;
       var b;
-      var esc2 = [
+      var esc3 = [
         27,
         40,
         66,
@@ -49332,44 +49460,44 @@ var require_encoding_convert = __commonJS({
         if (b === 142) {
           if (index !== 2) {
             index = 2;
-            results[results.length] = esc2[6];
-            results[results.length] = esc2[7];
-            results[results.length] = esc2[8];
+            results[results.length] = esc3[6];
+            results[results.length] = esc3[7];
+            results[results.length] = esc3[8];
           }
           results[results.length] = data[++i] - 128 & 255;
         } else if (b === 143) {
           if (index !== 3) {
             index = 3;
-            results[results.length] = esc2[9];
-            results[results.length] = esc2[10];
-            results[results.length] = esc2[11];
-            results[results.length] = esc2[12];
+            results[results.length] = esc3[9];
+            results[results.length] = esc3[10];
+            results[results.length] = esc3[11];
+            results[results.length] = esc3[12];
           }
           results[results.length] = data[++i] - 128 & 255;
           results[results.length] = data[++i] - 128 & 255;
         } else if (b > 142) {
           if (index !== 1) {
             index = 1;
-            results[results.length] = esc2[3];
-            results[results.length] = esc2[4];
-            results[results.length] = esc2[5];
+            results[results.length] = esc3[3];
+            results[results.length] = esc3[4];
+            results[results.length] = esc3[5];
           }
           results[results.length] = b - 128 & 255;
           results[results.length] = data[++i] - 128 & 255;
         } else {
           if (index !== 0) {
             index = 0;
-            results[results.length] = esc2[0];
-            results[results.length] = esc2[1];
-            results[results.length] = esc2[2];
+            results[results.length] = esc3[0];
+            results[results.length] = esc3[1];
+            results[results.length] = esc3[2];
           }
           results[results.length] = b & 255;
         }
       }
       if (index !== 0) {
-        results[results.length] = esc2[0];
-        results[results.length] = esc2[1];
-        results[results.length] = esc2[2];
+        results[results.length] = esc3[0];
+        results[results.length] = esc3[1];
+        results[results.length] = esc3[2];
       }
       return results;
     }
@@ -49725,7 +49853,7 @@ var require_encoding_convert = __commonJS({
       var i = 0;
       var b, bytes, utf8, jis;
       var fallbackOption = options && options.fallback;
-      var esc2 = [
+      var esc3 = [
         27,
         40,
         66,
@@ -49745,9 +49873,9 @@ var require_encoding_convert = __commonJS({
         if (b < 128) {
           if (index !== 0) {
             index = 0;
-            results[results.length] = esc2[0];
-            results[results.length] = esc2[1];
-            results[results.length] = esc2[2];
+            results[results.length] = esc3[0];
+            results[results.length] = esc3[1];
+            results[results.length] = esc3[2];
           }
           results[results.length] = b & 255;
         } else {
@@ -49767,9 +49895,9 @@ var require_encoding_convert = __commonJS({
             if (jis == null) {
               if (index !== 0) {
                 index = 0;
-                results[results.length] = esc2[0];
-                results[results.length] = esc2[1];
-                results[results.length] = esc2[2];
+                results[results.length] = esc3[0];
+                results[results.length] = esc3[1];
+                results[results.length] = esc3[2];
               }
               if (fallbackOption) {
                 handleFallback(results, bytes, fallbackOption);
@@ -49779,10 +49907,10 @@ var require_encoding_convert = __commonJS({
             } else {
               if (index !== 3) {
                 index = 3;
-                results[results.length] = esc2[9];
-                results[results.length] = esc2[10];
-                results[results.length] = esc2[11];
-                results[results.length] = esc2[12];
+                results[results.length] = esc3[9];
+                results[results.length] = esc3[10];
+                results[results.length] = esc3[11];
+                results[results.length] = esc3[12];
               }
               results[results.length] = jis >> 8 & 255;
               results[results.length] = jis & 255;
@@ -49794,17 +49922,17 @@ var require_encoding_convert = __commonJS({
             if (jis < 255) {
               if (index !== 2) {
                 index = 2;
-                results[results.length] = esc2[6];
-                results[results.length] = esc2[7];
-                results[results.length] = esc2[8];
+                results[results.length] = esc3[6];
+                results[results.length] = esc3[7];
+                results[results.length] = esc3[8];
               }
               results[results.length] = jis & 255;
             } else {
               if (index !== 1) {
                 index = 1;
-                results[results.length] = esc2[3];
-                results[results.length] = esc2[4];
-                results[results.length] = esc2[5];
+                results[results.length] = esc3[3];
+                results[results.length] = esc3[4];
+                results[results.length] = esc3[5];
               }
               results[results.length] = jis >> 8 & 255;
               results[results.length] = jis & 255;
@@ -49813,9 +49941,9 @@ var require_encoding_convert = __commonJS({
         }
       }
       if (index !== 0) {
-        results[results.length] = esc2[0];
-        results[results.length] = esc2[1];
-        results[results.length] = esc2[2];
+        results[results.length] = esc3[0];
+        results[results.length] = esc3[1];
+        results[results.length] = esc3[2];
       }
       return results;
     }
@@ -69903,7 +70031,7 @@ var require_imap_flow = __commonJS({
     "use strict";
     var tls = require("tls");
     var net = require("net");
-    var crypto2 = require("crypto");
+    var crypto3 = require("crypto");
     var { EventEmitter } = require("events");
     var logger = require_logger();
     var libmime = require_libmime();
@@ -70174,7 +70302,7 @@ var require_imap_flow = __commonJS({
         this.emit("error", err);
       }
       getRandomId() {
-        let rid = BigInt("0x" + crypto2.randomBytes(13).toString("hex")).toString(36);
+        let rid = BigInt("0x" + crypto3.randomBytes(13).toString("hex")).toString(36);
         if (rid.length < 20) {
           rid = "0".repeat(20 - rid.length) + rid;
         }
@@ -73522,14 +73650,14 @@ var require_punycode2 = __commonJS({
 var require_stream_hash = __commonJS({
   "node_modules/mailparser/lib/stream-hash.js"(exports2, module2) {
     "use strict";
-    var crypto2 = require("crypto");
+    var crypto3 = require("crypto");
     var Transform = require("stream").Transform;
     var StreamHash = class extends Transform {
       constructor(attachment, algo) {
         super();
         this.attachment = attachment;
         this.algo = (algo || "md5").toLowerCase();
-        this.hash = crypto2.createHash(algo);
+        this.hash = crypto3.createHash(algo);
         this.byteCount = 0;
       }
       _transform(chunk, encoding, done) {
@@ -93133,7 +93261,7 @@ var require_le_unix = __commonJS({
 var require_mime_node2 = __commonJS({
   "node_modules/nodemailer/lib/mime-node/index.js"(exports2, module2) {
     "use strict";
-    var crypto2 = require("crypto");
+    var crypto3 = require("crypto");
     var fs2 = require("fs");
     var punycode = require_punycode3();
     var { PassThrough } = require("stream");
@@ -93152,7 +93280,7 @@ var require_mime_node2 = __commonJS({
       constructor(contentType, options) {
         this.nodeCounter = 0;
         options = options || {};
-        this.baseBoundary = options.baseBoundary || crypto2.randomBytes(8).toString("hex");
+        this.baseBoundary = options.baseBoundary || crypto3.randomBytes(8).toString("hex");
         this.boundaryPrefix = options.boundaryPrefix || "--_NmP";
         this.disableFileAccess = !!options.disableFileAccess;
         this.disableUrlAccess = !!options.disableUrlAccess;
@@ -94108,8 +94236,8 @@ var require_mime_node2 = __commonJS({
       _generateMessageId() {
         return "<" + [2, 2, 2, 6].reduce(
           // crux to generate UUID-like random strings
-          (prev, len) => prev + "-" + crypto2.randomBytes(len).toString("hex"),
-          crypto2.randomBytes(4).toString("hex")
+          (prev, len) => prev + "-" + crypto3.randomBytes(len).toString("hex"),
+          crypto3.randomBytes(4).toString("hex")
         ) + "@" + // try to use the domain of the FROM address or fallback to server hostname
         (this.getEnvelope().from || this.hostname || "localhost").split("@").pop() + ">";
       }
@@ -94739,14 +94867,14 @@ var require_relaxed_body = __commonJS({
   "node_modules/nodemailer/lib/dkim/relaxed-body.js"(exports2, module2) {
     "use strict";
     var { Transform } = require("stream");
-    var crypto2 = require("crypto");
+    var crypto3 = require("crypto");
     var RelaxedBody = class extends Transform {
       constructor(options) {
         super();
         options = options || {};
         this.chunkBuffer = [];
         this.chunkBufferLen = 0;
-        this.bodyHash = crypto2.createHash(options.hashAlgo || "sha256");
+        this.bodyHash = crypto3.createHash(options.hashAlgo || "sha256");
         this.remainder = "";
         this.byteLength = 0;
         this.debug = options.debug;
@@ -94849,7 +94977,7 @@ var require_sign2 = __commonJS({
     "use strict";
     var punycode = require_punycode3();
     var mimeFuncs = require_mime_funcs();
-    var crypto2 = require("crypto");
+    var crypto3 = require("crypto");
     module2.exports = (headers, hashAlgo, bodyHash, options) => {
       options = options || {};
       const defaultFieldNames = "From:Sender:Reply-To:Subject:Date:Message-ID:To:Cc:MIME-Version:Content-Type:Content-Transfer-Encoding:Content-ID:Content-Description:Resent-Date:Resent-From:Resent-Sender:Resent-To:Resent-Cc:Resent-Message-ID:In-Reply-To:References:List-Id:List-Help:List-Unsubscribe:List-Subscribe:List-Post:List-Owner:List-Archive";
@@ -94857,7 +94985,7 @@ var require_sign2 = __commonJS({
       const canonicalizedHeaderData = relaxedHeaders(headers, fieldNames, options.skipFields);
       const dkimHeader = generateDKIMHeader(options.domainName, options.keySelector, canonicalizedHeaderData.fieldNames, hashAlgo, bodyHash);
       canonicalizedHeaderData.headers += "dkim-signature:" + relaxedHeaderLine(dkimHeader);
-      const signer = crypto2.createSign(("rsa-" + hashAlgo).toUpperCase());
+      const signer = crypto3.createSign(("rsa-" + hashAlgo).toUpperCase());
       signer.update(canonicalizedHeaderData.headers);
       let signature;
       try {
@@ -94926,7 +95054,7 @@ var require_dkim = __commonJS({
     var { PassThrough } = require("stream");
     var fs2 = require("fs");
     var path3 = require("path");
-    var crypto2 = require("crypto");
+    var crypto3 = require("crypto");
     var DKIM_ALGO = "sha256";
     var MAX_MESSAGE_SIZE = 2 * 1024 * 1024;
     var DKIMSigner = class {
@@ -94939,7 +95067,7 @@ var require_dkim = __commonJS({
         this.chunks = [];
         this.chunklen = 0;
         this.readPos = 0;
-        this.cachePath = this.cacheDir ? path3.join(this.cacheDir, "message." + Date.now() + "-" + crypto2.randomBytes(14).toString("hex")) : false;
+        this.cachePath = this.cacheDir ? path3.join(this.cacheDir, "message." + Date.now() + "-" + crypto3.randomBytes(14).toString("hex")) : false;
         this.cache = false;
         this.headers = false;
         this.bodyHash = false;
@@ -95508,7 +95636,7 @@ var require_mailer = __commonJS({
     var MailMessage = require_mail_message();
     var net = require("net");
     var dns = require("dns");
-    var crypto2 = require("crypto");
+    var crypto3 = require("crypto");
     var Mail = class extends EventEmitter {
       constructor(transporter, options, defaults) {
         super();
@@ -95850,7 +95978,7 @@ var require_mailer = __commonJS({
             html = (html || "").toString().replace(
               /(<img\b[^<>]{0,1024} src\s{0,20}=[\s"']{0,20})(data:([^;]+);[^"'>\s]+)/gi,
               (match, prefix, dataUri, mimeType) => {
-                const cid = crypto2.randomBytes(10).toString("hex") + "@localhost";
+                const cid = crypto3.randomBytes(10).toString("hex") + "@localhost";
                 if (!mail.data.attachments) {
                   mail.data.attachments = [];
                 }
@@ -95977,7 +96105,7 @@ var require_smtp_connection = __commonJS({
     var net = require("net");
     var tls = require("tls");
     var os = require("os");
-    var crypto2 = require("crypto");
+    var crypto3 = require("crypto");
     var DataStream = require_data_stream();
     var { PassThrough } = require("stream");
     var shared = require_shared();
@@ -95997,7 +96125,7 @@ var require_smtp_connection = __commonJS({
     var SMTPConnection = class extends EventEmitter {
       constructor(options) {
         super(options);
-        this.id = crypto2.randomBytes(8).toString("base64").replace(/\W/g, "");
+        this.id = crypto3.randomBytes(8).toString("base64").replace(/\W/g, "");
         this.stage = "init";
         this.options = options || {};
         this.secureConnection = !!this.options.secure;
@@ -97182,7 +97310,7 @@ var require_smtp_connection = __commonJS({
           );
         }
         const base64decoded = Buffer.from(challengeMatch[1], "base64").toString("ascii");
-        const hmacMD5 = crypto2.createHmac("md5", this._auth.credentials.pass);
+        const hmacMD5 = crypto3.createHmac("md5", this._auth.credentials.pass);
         hmacMD5.update(base64decoded);
         const prepended = this._auth.credentials.user + " " + hmacMD5.digest("hex");
         this._responseActions.push((str2) => {
@@ -97475,7 +97603,7 @@ var require_xoauth2 = __commonJS({
     "use strict";
     var { Stream } = require("stream");
     var nmfetch = require_fetch2();
-    var crypto2 = require("crypto");
+    var crypto3 = require("crypto");
     var shared = require_shared();
     var errors = require_errors2();
     var XOAuth2 = class extends Stream {
@@ -97821,7 +97949,7 @@ var require_xoauth2 = __commonJS({
        */
       jwtSignRS256(payload) {
         payload = ['{"alg":"RS256","typ":"JWT"}', JSON.stringify(payload)].map((val) => this.toBase64URL(val)).join(".");
-        const signature = crypto2.createSign("RSA-SHA256").update(payload).sign(this.options.privateKey);
+        const signature = crypto3.createSign("RSA-SHA256").update(payload).sign(this.options.privateKey);
         return payload + "." + this.toBase64URL(signature);
       }
     };
@@ -100272,134 +100400,6 @@ var init_autosend = __esm({
   }
 });
 
-// server/sentlog_logic.ts
-function hashText(text) {
-  return import_node_crypto.default.createHash("sha256").update(String(text ?? "")).digest("hex").slice(0, 16);
-}
-function buildSentEntry(e, nowISO) {
-  const text = String(e.text ?? "");
-  return {
-    phone: String(e.phone ?? ""),
-    contact_name: e.contactName ?? null,
-    kind: e.kind,
-    draft_id: e.draftId ?? null,
-    text_hash: hashText(text),
-    text_preview: text.replace(/\s+/g, " ").trim().slice(0, 140),
-    created_at: nowISO
-  };
-}
-var import_node_crypto;
-var init_sentlog_logic = __esm({
-  "server/sentlog_logic.ts"() {
-    "use strict";
-    import_node_crypto = __toESM(require("node:crypto"), 1);
-  }
-});
-
-// server/emaildrafts.ts
-function saveEmailDraft(e) {
-  try {
-    db.prepare(`UPDATE email_drafts SET status = 'rejected' WHERE to_addr = ? AND status = 'pending'`).run(e.toAddr);
-  } catch {
-  }
-  const info = db.prepare(`
-    INSERT INTO email_drafts (account, to_addr, to_name, subject, draft_text, in_reply_to, proposed_event, needs_human, incoming_id, status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
-  `).run(
-    e.account ?? null,
-    e.toAddr,
-    e.toName ?? null,
-    e.subject,
-    e.draftText,
-    e.inReplyTo ?? null,
-    e.proposedEvent ? JSON.stringify(e.proposedEvent) : null,
-    e.needsHuman ? 1 : 0,
-    e.incomingId ?? null
-  );
-  return Number(info.lastInsertRowid);
-}
-function getEmailDrafts(status = "pending") {
-  const rows = db.prepare(`SELECT * FROM email_drafts WHERE status = ? ORDER BY created_at DESC`).all(status);
-  return rows.map((r) => ({ ...r, proposed_event: r.proposed_event ? JSON.parse(r.proposed_event) : null }));
-}
-function getEmailDraft(id) {
-  const r = db.prepare(`SELECT * FROM email_drafts WHERE id = ?`).get(id);
-  if (!r) return null;
-  return { ...r, proposed_event: r.proposed_event ? JSON.parse(r.proposed_event) : null };
-}
-function markEmailDraftSent(id) {
-  db.prepare(`UPDATE email_drafts SET status = 'sent', sent_at = datetime('now') WHERE id = ?`).run(id);
-}
-function markEmailDraftRejected(id) {
-  db.prepare(`UPDATE email_drafts SET status = 'rejected' WHERE id = ?`).run(id);
-}
-function recordEmailSend(e) {
-  try {
-    db.prepare(`INSERT INTO email_sent_log (to_addr, subject, kind, draft_id, text_hash, text_preview, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`).run(e.toAddr, e.subject, e.kind, e.draftId ?? null, hashText(e.text), String(e.text || "").replace(/\s+/g, " ").trim().slice(0, 140), (/* @__PURE__ */ new Date()).toISOString());
-  } catch (err) {
-    console.error("[EmailSentLog] insert fallito:", err?.message);
-  }
-}
-function getEmailSentLog(sinceISO, limit = 200) {
-  const since = sinceISO || new Date(Date.now() - 7 * 864e5).toISOString();
-  const lim = Math.min(Math.max(Number(limit) || 200, 1), 1e3);
-  try {
-    return db.prepare(`SELECT id, to_addr AS toAddr, subject, kind, draft_id AS draftId, text_hash AS textHash, text_preview AS textPreview, created_at AS createdAt
-      FROM email_sent_log WHERE created_at >= ? ORDER BY created_at DESC LIMIT ?`).all(since, lim);
-  } catch {
-    return [];
-  }
-}
-function getEmailSentSummary(sinceISO) {
-  const since = sinceISO || new Date(Date.now() - 7 * 864e5).toISOString();
-  const byKind = {};
-  let total = 0;
-  try {
-    for (const r of db.prepare(`SELECT kind, COUNT(*) c FROM email_sent_log WHERE created_at >= ? GROUP BY kind`).all(since)) {
-      byKind[r.kind || "unknown"] = r.c;
-      total += r.c;
-    }
-  } catch {
-  }
-  return { since, total, byKind };
-}
-var init_emaildrafts = __esm({
-  "server/emaildrafts.ts"() {
-    "use strict";
-    init_db();
-    init_sentlog_logic();
-    db.exec(`
-  CREATE TABLE IF NOT EXISTS email_drafts (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    account TEXT,
-    to_addr TEXT NOT NULL,
-    to_name TEXT,
-    subject TEXT,
-    draft_text TEXT,
-    in_reply_to TEXT,
-    proposed_event TEXT,            -- JSON oppure NULL
-    needs_human INTEGER DEFAULT 0,
-    incoming_id INTEGER,            -- id in incoming_emails
-    status TEXT DEFAULT 'pending',  -- pending | sent | rejected
-    created_at TEXT DEFAULT (datetime('now')),
-    sent_at TEXT
-  );
-  CREATE INDEX IF NOT EXISTS idx_email_drafts_status ON email_drafts(status);
-  CREATE TABLE IF NOT EXISTS email_sent_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    to_addr TEXT,
-    subject TEXT,
-    kind TEXT,                      -- 'appointment' | 'reply-approved'
-    draft_id INTEGER,
-    text_hash TEXT,
-    text_preview TEXT,
-    created_at TEXT DEFAULT (datetime('now'))
-  );
-  CREATE INDEX IF NOT EXISTS idx_email_sent_log_created ON email_sent_log(created_at);
-`);
-  }
-});
-
 // server/docvision.ts
 var docvision_exports = {};
 __export(docvision_exports, {
@@ -100617,14 +100617,14 @@ async function sendReply(acc, to, subject, body, inReplyTo) {
   });
 }
 async function notifyUrgentEmail(row, reason) {
-  const esc2 = (s) => String(s ?? "").replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" })[c]);
+  const esc3 = (s) => String(s ?? "").replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" })[c]);
   const subject = `\u{1F534} URGENTE \u2014 email cliente \u2014 ${row.from_name || row.from_addr}`;
   const html = `
     <h2 style="color:#b00020;margin:0 0 8px">Richiesta urgente arrivata via EMAIL</h2>
-    <p><b>Cliente:</b> ${esc2(row.from_name || row.from_addr)} (${esc2(row.from_addr)})</p>
-    <p><b>Oggetto:</b> ${esc2(row.subject)}</p>
-    ${reason ? `<p><b>Motivo segnalato dal bot:</b> ${esc2(reason)}</p>` : ""}
-    <p style="white-space:pre-wrap">${esc2((row.body || "").slice(0, 1e3))}</p>
+    <p><b>Cliente:</b> ${esc3(row.from_name || row.from_addr)} (${esc3(row.from_addr)})</p>
+    <p><b>Oggetto:</b> ${esc3(row.subject)}</p>
+    ${reason ? `<p><b>Motivo segnalato dal bot:</b> ${esc3(reason)}</p>` : ""}
+    <p style="white-space:pre-wrap">${esc3((row.body || "").slice(0, 1e3))}</p>
     <p>Nessuna risposta automatica \xE8 stata inviata: apri il Cruscotto (tab Email) o rispondi
     direttamente dalla tua casella di posta.</p>
   `;
@@ -106026,6 +106026,230 @@ init_db();
 init_appointments();
 init_chatbot();
 init_zapi();
+
+// server/make.ts
+var import_crypto = __toESM(require("crypto"), 1);
+init_db();
+init_chatbot();
+init_zapi();
+init_emaildrafts();
+try {
+  db_default.exec(`
+    CREATE TABLE IF NOT EXISTS make_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      direction TEXT NOT NULL,        -- 'inbound' | 'outbound'
+      event_type TEXT,                -- created|updated|canceled|confirmed|moved|lead...
+      external_id TEXT,               -- eventId Google o riferimento esterno
+      appointment_id INTEGER,         -- riga bot_appointments collegata (se nota)
+      status TEXT,                    -- ok | error | skipped | disabled | unauthorized
+      detail TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_make_events_created ON make_events(created_at);
+  `);
+} catch {
+}
+function logMake(e) {
+  try {
+    db_default.prepare(
+      `INSERT INTO make_events (direction, event_type, external_id, appointment_id, status, detail)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(e.direction, e.eventType ?? null, e.externalId ?? null, e.appointmentId ?? null, e.status, (e.detail ?? "").slice(0, 500));
+  } catch {
+  }
+}
+var esc = (s) => String(s ?? "").replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" })[c]);
+function isMakeConfigured() {
+  const hasSecret = !!process.env.MAKE_SHARED_SECRET;
+  const hasUrl = !!process.env.MAKE_WEBHOOK_URL;
+  return { inbound: hasSecret, outbound: hasSecret && hasUrl };
+}
+function secretMatches(provided) {
+  const secret = process.env.MAKE_SHARED_SECRET || "";
+  if (!secret || !provided) return false;
+  const a = Buffer.from(String(provided));
+  const b = Buffer.from(secret);
+  if (a.length !== b.length) return false;
+  try {
+    return import_crypto.default.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
+function extractSecret(req) {
+  const h = req.headers || {};
+  const bearer = String(h["authorization"] || "").replace(/^Bearer\s+/i, "");
+  const body = req.body || {};
+  return String(h["x-make-secret"] || bearer || body.secret || "");
+}
+var inboundSchema = external_exports.object({
+  changeType: external_exports.string().trim().max(32).optional(),
+  // created|updated|canceled|deleted
+  eventId: external_exports.string().trim().max(256).optional(),
+  calendarId: external_exports.string().trim().max(256).optional(),
+  status: external_exports.string().trim().max(40).optional(),
+  // Google: confirmed|tentative|cancelled
+  summary: external_exports.string().trim().max(500).optional(),
+  description: external_exports.string().trim().max(5e3).optional(),
+  start: external_exports.string().trim().max(64).optional(),
+  // ISO8601 o YYYY-MM-DD
+  end: external_exports.string().trim().max(64).optional(),
+  date: external_exports.string().trim().max(20).optional(),
+  // YYYY-MM-DD (comodità)
+  startTime: external_exports.string().trim().max(10).optional(),
+  // HH:MM
+  endTime: external_exports.string().trim().max(10).optional(),
+  phone: external_exports.string().trim().max(40).optional(),
+  email: external_exports.string().trim().max(160).optional(),
+  contactName: external_exports.string().trim().max(160).optional()
+}).passthrough();
+function toDateTime(p) {
+  const parse = (s2) => {
+    if (!s2) return void 0;
+    const m = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2})/.exec(s2);
+    if (m) return { d: m[1], t: m[2] };
+    const d = /^(\d{4}-\d{2}-\d{2})$/.exec(s2);
+    if (d) return { d: d[1], t: void 0 };
+    const parsed = new Date(s2);
+    if (!isNaN(parsed.getTime())) {
+      const d2 = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Rome" }).format(parsed);
+      const t2 = new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Rome", hour: "2-digit", minute: "2-digit", hour12: false }).format(parsed);
+      return { d: d2, t: t2 };
+    }
+    return void 0;
+  };
+  const s = parse(p.start);
+  const e = parse(p.end);
+  return { date: p.date || s?.d, start: p.startTime || s?.t, end: p.endTime || e?.t };
+}
+function isCancel(p) {
+  const ct = String(p.changeType || "").toLowerCase();
+  const st = String(p.status || "").toLowerCase();
+  return ct === "canceled" || ct === "cancelled" || ct === "deleted" || st === "cancelled";
+}
+function decideInboundAction(p, appt) {
+  const cancel = isCancel(p);
+  const { date, start, end } = toDateTime(p);
+  let action = "no_match";
+  if (cancel) {
+    if (appt && appt.status !== "annullato") action = "canceled_local";
+    else if (appt) action = "already_canceled";
+  } else if (appt && date && start && (appt.date !== date || appt.start !== start)) {
+    action = "moved_local";
+  } else if (appt) {
+    action = "in_sync";
+  }
+  return { cancel, date, start, end, action };
+}
+async function makeInbound(req, res) {
+  if (!isMakeConfigured().inbound) {
+    logMake({ direction: "inbound", status: "disabled", detail: "MAKE_SHARED_SECRET assente" });
+    return res.status(503).json({ ok: false, disabled: true, error: "Integrazione Make non configurata." });
+  }
+  if (!secretMatches(extractSecret(req))) {
+    logMake({ direction: "inbound", status: "unauthorized" });
+    return res.status(401).json({ ok: false, error: "Secret non valido." });
+  }
+  const parsed = inboundSchema.safeParse(req.body || {});
+  if (!parsed.success) {
+    logMake({ direction: "inbound", status: "error", detail: "payload non valido" });
+    return res.status(400).json({ ok: false, error: "Payload non valido." });
+  }
+  const p = parsed.data;
+  try {
+    let appt = null;
+    if (p.eventId) {
+      appt = db_default.prepare(`SELECT id, date, start, status FROM bot_appointments WHERE event_id = ? ORDER BY id DESC LIMIT 1`).get(p.eventId) || null;
+    }
+    const { cancel, date, start, end, action } = decideInboundAction(p, appt);
+    if (action === "canceled_local" && appt) {
+      db_default.prepare(`UPDATE bot_appointments SET status = 'annullato' WHERE id = ?`).run(appt.id);
+    } else if (action === "moved_local" && appt) {
+      db_default.prepare(`UPDATE bot_appointments SET date = ?, start = ?, end = COALESCE(?, end) WHERE id = ?`).run(date, start, end ?? null, appt.id);
+    }
+    let draftId = null;
+    if (p.email && (action === "canceled_local" || action === "moved_local")) {
+      const quando = date && start ? `${date} ore ${start}` : p.start || "la data concordata";
+      const subject = cancel ? "Variazione appuntamento \u2014 Studio Tributario Branca" : "Aggiornamento appuntamento \u2014 Studio Tributario Branca";
+      const body = cancel ? `Gentile ${p.contactName || "Cliente"},
+
+la contattiamo riguardo all'appuntamento presso lo Studio Tributario Branca: si \xE8 resa necessaria una variazione. La ricontatteremo per concordare una nuova data.
+
+Cordiali saluti
+Studio Tributario Branca` : `Gentile ${p.contactName || "Cliente"},
+
+le confermiamo l'aggiornamento del suo appuntamento presso lo Studio Tributario Branca: ${quando}.
+
+Cordiali saluti
+Studio Tributario Branca`;
+      try {
+        draftId = saveEmailDraft({
+          toAddr: p.email,
+          toName: p.contactName || null,
+          subject,
+          draftText: body,
+          needsHuman: false,
+          proposedEvent: { eventId: p.eventId, date, start, end, changeType: p.changeType }
+        });
+      } catch {
+      }
+    }
+    const notice = `\u{1F504} Make/Calendar: ${cancel ? "ANNULLO" : "aggiornamento"} evento
+${p.summary || p.contactName || p.eventId || "\u2014"}
+\u{1F4C5} ${date || "?"} ${start || ""}
+Azione: ${action}${draftId ? ` \xB7 bozza #${draftId} pronta` : ""}`;
+    sendTextMessage(getControlNumber(), notice).catch(() => {
+    });
+    if (action === "canceled_local" || action === "moved_local") {
+      const html = `<h3 style="color:#004225;margin:0 0 8px">Variazione appuntamento (via Make/Calendar)</h3>
+        <p><b>Evento:</b> ${esc(p.summary || p.contactName || p.eventId || "\u2014")}</p>
+        <p><b>Quando:</b> ${esc(date || "?")} ${esc(start || "")}</p>
+        <p><b>Azione:</b> ${esc(action)}</p>
+        ${draftId ? `<p>\u270D\uFE0F Bozza cortesia #${draftId} pronta (pending): va approvata dallo studio. Nessun invio automatico al cliente.</p>` : ""}`;
+      sendStudioAlertEmail(cancel ? "\u{1F504} Annullo appuntamento (Make/Calendar)" : "\u{1F504} Aggiornamento appuntamento (Make/Calendar)", html).catch(() => {
+      });
+    }
+    logMake({ direction: "inbound", eventType: cancel ? "canceled" : p.changeType || "updated", externalId: p.eventId ?? null, appointmentId: appt?.id ?? null, status: "ok", detail: action });
+    return res.json({ ok: true, matched: !!appt, appointmentId: appt?.id ?? null, action, draftId });
+  } catch (err) {
+    console.error("[make/inbound]", err?.message);
+    logMake({ direction: "inbound", status: "error", detail: err?.message });
+    return res.status(500).json({ ok: false, error: "Errore interno." });
+  }
+}
+async function notifyMake(payload) {
+  if (!isMakeConfigured().outbound) {
+    logMake({ direction: "outbound", eventType: payload.event, appointmentId: payload.appointmentId ?? null, status: "disabled" });
+    return;
+  }
+  try {
+    const resp = await fetch(process.env.MAKE_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-make-secret": process.env.MAKE_SHARED_SECRET },
+      body: JSON.stringify({ source: "wa-cruscotto", sentAt: (/* @__PURE__ */ new Date()).toISOString(), ...payload })
+    });
+    logMake({ direction: "outbound", eventType: payload.event, appointmentId: payload.appointmentId ?? null, status: resp.ok ? "ok" : "error", detail: resp.ok ? void 0 : `HTTP ${resp.status}` });
+  } catch (e) {
+    logMake({ direction: "outbound", eventType: payload.event, appointmentId: payload.appointmentId ?? null, status: "error", detail: e?.message });
+  }
+}
+function makeStatus(_req, res) {
+  const configured = isMakeConfigured();
+  let recent = [];
+  try {
+    recent = db_default.prepare(`SELECT direction, event_type AS eventType, status, appointment_id AS appointmentId, created_at AS createdAt FROM make_events ORDER BY id DESC LIMIT 15`).all();
+  } catch {
+  }
+  return res.json({
+    ok: true,
+    configured,
+    webhookConfigured: !!process.env.MAKE_WEBHOOK_URL,
+    inboundPath: "/api/integrations/make/inbound",
+    recent
+  });
+}
+
+// server/site.ts
 db_default.exec(`
   CREATE TABLE IF NOT EXISTS site_leads (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -106085,7 +106309,7 @@ function clientIp(req) {
   const xff = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
   return xff || req.socket?.remoteAddress || "unknown";
 }
-var esc = (s) => String(s ?? "").replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" })[c]);
+var esc2 = (s) => String(s ?? "").replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" })[c]);
 function onlyDigits(s) {
   return String(s || "").replace(/[^\d]/g, "");
 }
@@ -106119,15 +106343,17 @@ async function siteLead(req, res) {
     const d = p.data;
     if (d.website) return res.json({ ok: true });
     const id = recordLead({ kind: "contatto", name: d.name, email: d.email, phone: d.phone, subject: d.subject, message: d.message, ip });
+    notifyMake({ event: "site_lead", leadId: id, name: d.name, email: d.email, phone: d.phone, subject: d.subject }).catch(() => {
+    });
     const subject = `\u{1F7E2} Nuovo contatto dal sito \u2014 ${d.name}`;
     const html = `
       <h2 style="color:#004225;margin:0 0 8px">Nuovo contatto dal sito</h2>
-      <p><b>Nome:</b> ${esc(d.name)}</p>
-      <p><b>Email:</b> ${esc(d.email)}</p>
-      ${d.phone ? `<p><b>Telefono:</b> ${esc(d.phone)}</p>` : ""}
-      ${d.subject ? `<p><b>Oggetto:</b> ${esc(d.subject)}</p>` : ""}
+      <p><b>Nome:</b> ${esc2(d.name)}</p>
+      <p><b>Email:</b> ${esc2(d.email)}</p>
+      ${d.phone ? `<p><b>Telefono:</b> ${esc2(d.phone)}</p>` : ""}
+      ${d.subject ? `<p><b>Oggetto:</b> ${esc2(d.subject)}</p>` : ""}
       <p><b>Messaggio:</b></p>
-      <blockquote style="border-left:3px solid #c9a84c;margin:0;padding:4px 12px;color:#333">${esc(d.message).replace(/\n/g, "<br>")}</blockquote>
+      <blockquote style="border-left:3px solid #c9a84c;margin:0;padding:4px 12px;color:#333">${esc2(d.message).replace(/\n/g, "<br>")}</blockquote>
       <hr><p style="color:#888;font-size:12px">Lead #${id} \u2014 form contatti del sito. Nessuna risposta automatica inviata al cliente.</p>`;
     sendStudioAlertEmail(subject, html).catch(() => {
     });
@@ -106191,14 +106417,16 @@ async function siteBookingRequest(req, res) {
       meta: { date: d.date, start: d.start, end: d.end || null, apptId },
       ip
     });
+    notifyMake({ event: "booking_request", appointmentId: apptId, leadId, name: d.name, email: d.email, phone, date: d.date, start: d.start, end: d.end || null, reason }).catch(() => {
+    });
     const subject = `\u{1F5D3}\uFE0F Richiesta appuntamento dal sito \u2014 ${d.name} (${d.date} ${d.start})`;
     const html = `
       <h2 style="color:#004225;margin:0 0 8px">Richiesta appuntamento (DA CONFERMARE)</h2>
-      <p><b>Cliente:</b> ${esc(d.name)}</p>
-      <p><b>Email:</b> ${esc(d.email)}</p>
-      <p><b>Telefono:</b> ${esc(d.phone)}</p>
-      <p><b>Slot richiesto:</b> ${esc(d.date)} ore ${esc(d.start)}${d.end ? `\u2013${esc(d.end)}` : ""}</p>
-      ${d.reason ? `<p><b>Motivo:</b> ${esc(d.reason)}</p>` : ""}
+      <p><b>Cliente:</b> ${esc2(d.name)}</p>
+      <p><b>Email:</b> ${esc2(d.email)}</p>
+      <p><b>Telefono:</b> ${esc2(d.phone)}</p>
+      <p><b>Slot richiesto:</b> ${esc2(d.date)} ore ${esc2(d.start)}${d.end ? `\u2013${esc2(d.end)}` : ""}</p>
+      ${d.reason ? `<p><b>Motivo:</b> ${esc2(d.reason)}</p>` : ""}
       <p style="color:#b00020"><b>\u26A0\uFE0F Appuntamento in stato "da_confermare": va confermato dallo studio (Cruscotto / WhatsApp). Nessuna conferma automatica \xE8 stata inviata al cliente.</b></p>
       <hr><p style="color:#888;font-size:12px">Proposta #${apptId} \xB7 Lead #${leadId} \u2014 widget prenotazioni del sito.</p>`;
     sendStudioAlertEmail(subject, html).catch(() => {
@@ -107467,7 +107695,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.16.2", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.17.0", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.post("/site/lead", (req, res) => siteLead(req, res));
 router.get("/site/availability", (req, res) => siteAvailability(req, res));
@@ -107490,6 +107718,8 @@ router.delete("/site/leads/:id", (req, res) => {
     res.status(500).json({ ok: false, error: err.message });
   }
 });
+router.post("/integrations/make/inbound", (req, res) => makeInbound(req, res));
+router.get("/integrations/make/status", (req, res) => makeStatus(req, res));
 router.get("/selftest", (_req, res) => {
   res.json(getLastSelfCheck() || { note: "mai eseguito" });
 });
@@ -108764,6 +108994,8 @@ router.post("/bot/appointments/:id/confirm", async (req, res) => {
     if (!appt) return res.status(404).json({ error: "Appuntamento non trovato" });
     if (appt.status !== "da_confermare") return res.status(400).json({ error: "Appuntamento gi\xE0 gestito" });
     const r = await confirmAppointmentRow(appt, { notify: false });
+    notifyMake({ event: "appointment_confirmed", appointmentId: id, phone: appt.phone, contactName: appt.contact_name, date: appt.date, start: appt.start, end: appt.end, reason: appt.reason, calendarUpdated: r.calendarUpdated }).catch(() => {
+    });
     res.json({ success: true, calendarUpdated: r.calendarUpdated });
   } catch (err) {
     console.error("[Bot appointment confirm] Error:", err);
@@ -108776,6 +109008,8 @@ router.post("/bot/appointments/:id/cancel", async (req, res) => {
     const appt = getAppointmentById(id);
     if (!appt) return res.status(404).json({ error: "Appuntamento non trovato" });
     await cancelAppointmentRow(appt);
+    notifyMake({ event: "appointment_canceled", appointmentId: id, phone: appt.phone, contactName: appt.contact_name, date: appt.date, start: appt.start, reason: appt.reason }).catch(() => {
+    });
     res.json({ success: true });
   } catch (err) {
     console.error("[Bot appointment cancel] Error:", err);

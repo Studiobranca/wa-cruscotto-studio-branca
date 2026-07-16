@@ -17,6 +17,7 @@ import db from './db.js';
 import { getAvailability } from './appointments.js';
 import { recordAppointment, getControlNumber, sendStudioAlertEmail } from './chatbot.js';
 import { sendTextMessage } from './zapi.js';
+import { notifyMake } from './make.js';
 
 // ─── Persistenza lead dal sito ────────────────────────────────────────────────
 db.exec(`
@@ -122,6 +123,9 @@ export async function siteLead(req: Request, res: Response) {
 
     const id = recordLead({ kind: 'contatto', name: d.name, email: d.email, phone: d.phone, subject: d.subject, message: d.message, ip });
 
+    // Outbound Make (orchestrazioni extra). Fire-and-forget, non blocca, no Calendar.
+    notifyMake({ event: 'site_lead', leadId: id, name: d.name, email: d.email, phone: d.phone, subject: d.subject }).catch(() => {});
+
     // Alert allo studio via email (Brevo, canale affidabile). MAI risposta al cliente.
     const subject = `🟢 Nuovo contatto dal sito — ${d.name}`;
     const html = `
@@ -190,6 +194,9 @@ export async function siteBookingRequest(req: Request, res: Response) {
       subject: 'Richiesta appuntamento', message: reason,
       meta: { date: d.date, start: d.start, end: d.end || null, apptId }, ip,
     });
+
+    // Outbound Make: nuova richiesta appuntamento (PENDING). No Calendar, fire-and-forget.
+    notifyMake({ event: 'booking_request', appointmentId: apptId, leadId, name: d.name, email: d.email, phone, date: d.date, start: d.start, end: d.end || null, reason }).catch(() => {});
 
     const subject = `🗓️ Richiesta appuntamento dal sito — ${d.name} (${d.date} ${d.start})`;
     const html = `

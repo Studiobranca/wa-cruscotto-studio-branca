@@ -3,6 +3,7 @@ import db from './db.js';
 import { getAvailability, formatAvailabilityIT, isSlotBusy } from './appointments.js';
 import { dateCoherenceIssue } from './date_guard.js';
 import { siteLead, siteAvailability, siteBookingRequest, getSiteLeads, deleteSiteLead, cleanupTestLeads } from './site.js';
+import { makeInbound, makeStatus, notifyMake } from './make.js';
 import { sendTextMessage, syncContacts, zapiGet, getReceivedWebhook } from './zapi.js';
 import { addSSEClient, broadcastEvent, getClientCount } from './sse.js';
 import { startPolling, stopPolling, isPollingRunning } from './polling.js';
@@ -91,7 +92,7 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.16.2', built: new Date().toISOString() });
+  res.json({ version: '2.17.0', built: new Date().toISOString() });
 });
 
 // ─── Endpoint pubblici per il SITO (studiotributariobranca.eu) ───────────────
@@ -114,6 +115,13 @@ router.delete('/site/leads/:id', (req: Request, res: Response) => {
     res.json({ ok: true, deleted: removed, id });
   } catch (err: any) { res.status(500).json({ ok: false, error: err.message }); }
 });
+
+// ─── Integrazione Make.com (HUB automazioni) ─────────────────────────────────
+// INBOUND: eventi Calendar (created/updated/canceled) veicolati da Make → aggiorna
+// SOLO lo stato locale + PREPARA bozza (mai auto-invio al cliente; nessuna scrittura
+// su Calendar → no loop con la sync nativa). Attivo solo con MAKE_SHARED_SECRET.
+router.post('/integrations/make/inbound', (req: Request, res: Response) => makeInbound(req, res));
+router.get('/integrations/make/status', (req: Request, res: Response) => makeStatus(req, res));
 
 // ─── Autocheck (self-test + autocorrezione) ──────────────────────────────────
 router.get('/selftest', (_req: Request, res: Response) => {
@@ -1580,6 +1588,8 @@ router.post('/bot/appointments/:id/confirm', async (req: Request, res: Response)
     if (!appt) return res.status(404).json({ error: 'Appuntamento non trovato' });
     if (appt.status !== 'da_confermare') return res.status(400).json({ error: 'Appuntamento già gestito' });
     const r = await confirmAppointmentRow(appt, { notify: false });
+    // Outbound Make (orchestrazioni extra); NON riscrive sul Calendar. Fire-and-forget.
+    notifyMake({ event: 'appointment_confirmed', appointmentId: id, phone: appt.phone, contactName: appt.contact_name, date: appt.date, start: appt.start, end: appt.end, reason: appt.reason, calendarUpdated: r.calendarUpdated }).catch(() => {});
     res.json({ success: true, calendarUpdated: r.calendarUpdated });
   } catch (err: any) {
     console.error('[Bot appointment confirm] Error:', err);
@@ -1593,6 +1603,7 @@ router.post('/bot/appointments/:id/cancel', async (req: Request, res: Response) 
     const appt = getAppointmentById(id);
     if (!appt) return res.status(404).json({ error: 'Appuntamento non trovato' });
     await cancelAppointmentRow(appt);
+    notifyMake({ event: 'appointment_canceled', appointmentId: id, phone: appt.phone, contactName: appt.contact_name, date: appt.date, start: appt.start, reason: appt.reason }).catch(() => {});
     res.json({ success: true });
   } catch (err: any) {
     console.error('[Bot appointment cancel] Error:', err);
