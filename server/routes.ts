@@ -1,4 +1,6 @@
 import { Router, Request, Response } from 'express';
+import fs from 'fs';
+import path from 'path';
 import db from './db.js';
 import { getAvailability, formatAvailabilityIT, isSlotBusy } from './appointments.js';
 import { sendTextMessage, syncContacts, zapiGet, getReceivedWebhook } from './zapi.js';
@@ -82,9 +84,21 @@ try {
   console.error('[Repair] Errore riparazione timestamp:', e);
 }
 
-// ─── Version ─────────────────────────────────────────────────────────────────
+// ─── Version ────────────────────────────────────────────────────────────────
+// NOTA (fix bug drift versione): la versione veniva prima hardcodata a mano qui
+// e si disallineava silenziosamente da quella realmente deployata. Ora viene
+// letta da package.json, che è la SINGOLA fonte di verità — aggiornare SOLO lì.
+function getAppVersion(): string {
+  try {
+    const pkgRaw = fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf-8');
+    return JSON.parse(pkgRaw).version || '0.0.0';
+  } catch (e) {
+    console.error('[version] impossibile leggere package.json:', e);
+    return '0.0.0';
+  }
+}
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.11.4', built: new Date().toISOString() });
+  res.json({ version: getAppVersion(), built: new Date().toISOString() });
 });
 
 // ─── Autocheck (self-test + autocorrezione) ──────────────────────────────────

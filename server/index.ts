@@ -24,6 +24,15 @@ app.use((req, res, next) => {
 // API Routes
 app.use('/api', routes);
 
+// Error handler centralizzato (fix: prima gli errori finivano nella pagina
+// HTML di default di Express, rompendo il parsing JSON lato Cruscotto).
+// Deve stare DOPO le route API e PRIMA dello static/catch-all sotto.
+app.use('/api', (err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  console.error('[API error]', err);
+  if (res.headersSent) return;
+  res.status(500).json({ error: err?.message || 'Errore interno del server' });
+});
+
 // Serve static frontend in production
 if (process.env.NODE_ENV === 'production') {
   // In CJS bundle, __dirname is the dist/ folder
@@ -34,6 +43,16 @@ if (process.env.NODE_ENV === 'production') {
     res.sendFile(path.join(distPath, 'index.html'));
   });
 }
+
+// Rete di sicurezza a livello di processo: un errore non gestito in un punto
+// isolato non deve MAI far cadere l'intero bot WhatsApp (coerente con la
+// filosofia di isolamento gia' usata per il modulo email qui sotto).
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL-guard] uncaughtException (processo mantenuto attivo):', err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[FATAL-guard] unhandledRejection (processo mantenuto attivo):', reason);
+});
 
 // Start server
 app.listen(PORT, () => {

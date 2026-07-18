@@ -55,14 +55,19 @@ export function saveEmailDraft(e: EmailDraftInput): number {
     e.proposedEvent ? JSON.stringify(e.proposedEvent) : null, e.needsHuman ? 1 : 0, e.incomingId ?? null);
   return Number(info.lastInsertRowid);
 }
+function safeParseProposedEvent(raw: any): any | null {
+  if (!raw) return null;
+  try { return JSON.parse(raw); }
+  catch (e) { console.error('[emaildrafts] proposed_event JSON corrotto, ignorato:', e); return null; }
+}
 export function getEmailDrafts(status = 'pending'): any[] {
   const rows = db.prepare(`SELECT * FROM email_drafts WHERE status = ? ORDER BY created_at DESC`).all(status) as any[];
-  return rows.map((r) => ({ ...r, proposed_event: r.proposed_event ? JSON.parse(r.proposed_event) : null }));
+  return rows.map((r) => ({ ...r, proposed_event: safeParseProposedEvent(r.proposed_event) }));
 }
 export function getEmailDraft(id: number): any | null {
   const r = db.prepare(`SELECT * FROM email_drafts WHERE id = ?`).get(id) as any;
   if (!r) return null;
-  return { ...r, proposed_event: r.proposed_event ? JSON.parse(r.proposed_event) : null };
+  return { ...r, proposed_event: safeParseProposedEvent(r.proposed_event) };
 }
 export function markEmailDraftSent(id: number): void {
   db.prepare(`UPDATE email_drafts SET status = 'sent', sent_at = datetime('now') WHERE id = ?`).run(id);

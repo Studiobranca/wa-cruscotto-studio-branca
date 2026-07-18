@@ -1042,14 +1042,19 @@ export function saveDraft(d: {
   return Number(info.lastInsertRowid);
 }
 
+function safeParseProposedEvent(raw: any): any | null {
+  if (!raw) return null;
+  try { return JSON.parse(raw); }
+  catch (e) { console.error('[chatbot] proposed_event JSON corrotto, ignorato:', e); return null; }
+}
 export function getPendingDrafts(): any[] {
   const rows = db.prepare(`SELECT * FROM bot_drafts WHERE status = 'pending' ORDER BY created_at DESC`).all() as any[];
-  return rows.map((r) => ({ ...r, proposed_event: r.proposed_event ? JSON.parse(r.proposed_event) : null }));
+  return rows.map((r) => ({ ...r, proposed_event: safeParseProposedEvent(r.proposed_event) }));
 }
 export function getDraft(id: number): any | null {
   const r = db.prepare(`SELECT * FROM bot_drafts WHERE id = ?`).get(id) as any;
   if (!r) return null;
-  return { ...r, proposed_event: r.proposed_event ? JSON.parse(r.proposed_event) : null };
+  return { ...r, proposed_event: safeParseProposedEvent(r.proposed_event) };
 }
 export function markDraftSent(id: number): void {
   db.prepare(`UPDATE bot_drafts SET status = 'sent', sent_at = datetime('now') WHERE id = ?`).run(id);
