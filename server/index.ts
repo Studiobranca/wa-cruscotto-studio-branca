@@ -48,6 +48,17 @@ app.listen(PORT, () => {
   // Manutenzione: digest giornaliero + watchdog flusso messaggi
   startMaintenance();
 
+  // Notifiche d'agenda verso Mariano (numero di controllo): DIGEST 08:00 + REMINDER T-10.
+  // Scheduler interno dedicato (tick 60s) — ISOLATO: un suo errore non tocca il resto.
+  setTimeout(async () => {
+    try {
+      const an = await import('./agenda_notify.js');
+      an.startAgendaNotifier();
+    } catch (e: any) {
+      console.error('[AgendaNotify] scheduler non avviato (isolato, resto del bot intatto):', e.message);
+    }
+  }, 3000);
+
   // Posta in arrivo (IMAP, sola lettura) — ISOLATA: import dinamico in try/catch così
   // un eventuale problema del modulo email non può MAI tirare giù il bot WhatsApp.
   // Il poller parte solo se sono presenti le credenziali (EMAIL_*_PASS).

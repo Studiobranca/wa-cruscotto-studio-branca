@@ -101040,6 +101040,564 @@ var init_email = __esm({
   }
 });
 
+// server/agenda_source.ts
+async function getGoogleAccessToken3() {
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  const refreshToken = process.env.GOOGLE_REFRESH_TOKEN;
+  if (!clientId || !clientSecret || !refreshToken) return null;
+  try {
+    const resp = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        refresh_token: refreshToken,
+        grant_type: "refresh_token"
+      })
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    return data.access_token ?? null;
+  } catch {
+    return null;
+  }
+}
+function googleConfigured() {
+  return !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET && process.env.GOOGLE_REFRESH_TOKEN);
+}
+function romeToday() {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: TZ2 }).format(/* @__PURE__ */ new Date());
+}
+function romeOffset2(ds) {
+  const probe = /* @__PURE__ */ new Date(`${ds}T12:00:00Z`);
+  const rome = new Intl.DateTimeFormat("en-US", { timeZone: TZ2, hour: "numeric", hour12: false }).format(probe);
+  return parseInt(rome, 10) - 12 === 2 ? "+02:00" : "+01:00";
+}
+function firstUrl(...vals) {
+  for (const v of vals) {
+    if (!v) continue;
+    const m = String(v).match(URL_RE);
+    if (m) return m[1];
+  }
+  return null;
+}
+function eventLink(ev) {
+  const confUri = (ev?.conferenceData?.entryPoints || []).filter((e) => e?.uri && (e.entryPointType === "video" || String(e.uri).startsWith("http"))).map((e) => e.uri)[0];
+  return firstUrl(ev?.hangoutLink, confUri, ev?.location, ev?.description);
+}
+async function fetchTodayCalendarEvents(dateISO) {
+  const token = await getGoogleAccessToken3();
+  if (!token) return { ok: false, items: [], eventIds: /* @__PURE__ */ new Set(), error: "google-token-null" };
+  const calId = process.env.GOOGLE_CALENDAR_ID || "primary";
+  const off = romeOffset2(dateISO);
+  const timeMin = `${dateISO}T00:00:00${off}`;
+  const timeMax = `${dateISO}T23:59:59${off}`;
+  const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calId)}/events?singleEvents=true&orderBy=startTime&maxResults=50&timeMin=${encodeURIComponent(timeMin)}&timeMax=${encodeURIComponent(timeMax)}`;
+  try {
+    const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!resp.ok) return { ok: false, items: [], eventIds: /* @__PURE__ */ new Set(), error: `HTTP ${resp.status}` };
+    const data = await resp.json();
+    const evs = data.items || [];
+    const items = [];
+    const eventIds = /* @__PURE__ */ new Set();
+    for (const ev of evs) {
+      if (ev.status === "cancelled") continue;
+      if (ev.id) eventIds.add(ev.id);
+      const allDay = !!(ev.start?.date && !ev.start?.dateTime);
+      const startISO = ev.start?.dateTime || (ev.start?.date ? `${ev.start.date}T00:00:00${off}` : null);
+      const endISO = ev.end?.dateTime || (ev.end?.date ? `${ev.end.date}T00:00:00${off}` : null);
+      const link = eventLink(ev);
+      const location = ev.location && ev.location !== link ? String(ev.location) : null;
+      let note = ev.description ? String(ev.description) : null;
+      if (note && link && note.includes(link)) note = note.replace(link, "").trim() || null;
+      items.push({
+        id: `cal:${ev.id}`,
+        startISO,
+        endISO,
+        allDay,
+        title: ev.summary || "(senza titolo)",
+        counterparty: null,
+        location,
+        link: link || null,
+        note,
+        source: "google-calendar"
+      });
+    }
+    return { ok: true, items, eventIds };
+  } catch (e) {
+    return { ok: false, items: [], eventIds: /* @__PURE__ */ new Set(), error: e?.message || "fetch-error" };
+  }
+}
+function botAppointmentsToday(dateISO) {
+  let rows = [];
+  try {
+    rows = db_default.prepare(`
+      SELECT id, phone, contact_name, event_id, date, start, end, reason, status
+      FROM bot_appointments
+      WHERE date = ? AND status IN ('confermato','da_confermare')
+      ORDER BY start ASC
+    `).all(dateISO);
+  } catch {
+    rows = [];
+  }
+  const off = romeOffset2(dateISO);
+  const items = rows.map((a) => ({
+    id: `bot:${a.id}`,
+    startISO: a.start ? `${a.date}T${a.start}:00${off}` : null,
+    endISO: a.end ? `${a.date}T${a.end}:00${off}` : null,
+    allDay: !a.start,
+    title: a.reason ? String(a.reason) : "Appuntamento in studio",
+    counterparty: a.contact_name || a.phone || null,
+    location: null,
+    link: null,
+    note: a.status === "da_confermare" ? "da confermare" : null,
+    source: "bot_appointments"
+  }));
+  return { items, rows };
+}
+async function getTodayAgenda(dateISO) {
+  const date = dateISO || romeToday();
+  const gConf = googleConfigured();
+  const cal = gConf ? await fetchTodayCalendarEvents(date) : { ok: false, items: [], eventIds: /* @__PURE__ */ new Set(), error: "google-not-configured" };
+  const bot = botAppointmentsToday(date);
+  let items = [];
+  let source = "none";
+  if (cal.ok) {
+    const extraBot = bot.rows.map((a, i) => ({ a, item: bot.items[i] })).filter(({ a }) => !a.event_id || !cal.eventIds.has(a.event_id)).map(({ item }) => item);
+    items = [...cal.items, ...extraBot];
+    source = extraBot.length ? "merged" : "google-calendar";
+  } else {
+    items = bot.items;
+    source = bot.items.length ? "bot_appointments" : gConf ? "bot_appointments" : "none";
+  }
+  return {
+    dateISO: date,
+    items,
+    source,
+    googleConfigured: gConf,
+    googleOk: cal.ok,
+    googleError: cal.ok ? void 0 : cal.error,
+    counts: { calendar: cal.items.length, bot: bot.items.length, total: items.length }
+  };
+}
+var TZ2, URL_RE;
+var init_agenda_source = __esm({
+  "server/agenda_source.ts"() {
+    "use strict";
+    init_db();
+    TZ2 = "Europe/Rome";
+    URL_RE = /(https?:\/\/[^\s<>"')]+)/i;
+  }
+});
+
+// server/agenda_notify_logic.ts
+function wallTime(iso) {
+  if (!iso || iso.length < 16) return "";
+  return iso.slice(11, 16);
+}
+function timeRangeLabel(it) {
+  if (it.allDay || !it.startISO) return "tutto il giorno";
+  const s = wallTime(it.startISO);
+  const e = wallTime(it.endISO);
+  return e && e !== s ? `${s}\u2013${e}` : s;
+}
+function sortAgenda(items) {
+  return items.slice().sort((a, b) => {
+    if (a.allDay !== b.allDay) return a.allDay ? 1 : -1;
+    const sa = a.startISO || "", sb = b.startISO || "";
+    return sa < sb ? -1 : sa > sb ? 1 : 0;
+  });
+}
+function placeLine(it) {
+  if (it.link) return `\u{1F517} ${it.link}`;
+  if (it.location) return `\u{1F4CD} ${it.location}`;
+  return null;
+}
+function agendaItemBlock(it) {
+  const L = [`\u{1F558} *${timeRangeLabel(it)}* \u2014 ${it.title || "Appuntamento"}`];
+  if (it.counterparty) L.push(`   \u{1F464} ${it.counterparty}`);
+  const p = placeLine(it);
+  if (p) L.push(`   ${p}`);
+  if (it.note) L.push(`   \u{1F4DD} ${String(it.note).replace(/\s+/g, " ").trim().slice(0, 200)}`);
+  return L.join("\n");
+}
+function composeAgendaDigest(params) {
+  const items = sortAgenda(params.items);
+  const n = items.length;
+  const head = params.test ? "\u{1F9EA} *MESSAGGIO DI PROVA* (digest agenda)\n\n" : "";
+  const L = [`${head}\u{1F4C5} *Agenda di ${params.dateFullIT}*`];
+  if (n === 0) {
+    L.push("\nOggi nessun appuntamento in agenda.");
+    L.push("\n_(Notifica automatica: il sistema agenda \xE8 attivo.)_");
+    return { text: L.join("\n"), count: 0 };
+  }
+  L.push(`
+Oggi hai *${n}* appuntament${n === 1 ? "o" : "i"}:`);
+  for (const it of items) L.push(`
+${agendaItemBlock(it)}`);
+  return { text: L.join("\n"), count: n };
+}
+function composeReminder(it, leadMin = 10) {
+  const L = [`\u23F0 *Tra ${leadMin} minuti* \u2014 ${it.title || "Appuntamento"}`];
+  L.push(`\u{1F558} ${timeRangeLabel(it)}`);
+  if (it.counterparty) L.push(`\u{1F464} ${it.counterparty}`);
+  const p = placeLine(it);
+  if (p) L.push(p);
+  if (it.note) L.push(`\u{1F4DD} ${String(it.note).replace(/\s+/g, " ").trim().slice(0, 160)}`);
+  return L.join("\n");
+}
+function reminderDedupKey(it) {
+  return `rem:${it.id}@${it.startISO ?? "allday"}`;
+}
+function isReminderDue(it, nowMs, leadMin = 10) {
+  if (it.allDay || !it.startISO) return false;
+  const startMs = Date.parse(it.startISO);
+  if (isNaN(startMs)) return false;
+  return nowMs >= startMs - leadMin * 6e4 && nowMs < startMs;
+}
+function selectDueReminders(items, nowMs, leadMin, sentKeys) {
+  return items.filter((it) => isReminderDue(it, nowMs, leadMin) && !sentKeys.has(reminderDedupKey(it)));
+}
+function digestDecision(p) {
+  const isSendDay = p.weekendsEnabled || p.dow >= 1 && p.dow <= 5;
+  if (!isSendDay) return { due: false, status: "not-a-day" };
+  if (p.lastSentDate === p.todayDate) return { due: false, status: "sent-already" };
+  if (p.romeHour < p.targetHour) return { due: false, status: "waiting" };
+  if (p.romeHour < p.targetHour + p.catchupHours) return { due: true, status: "due" };
+  return { due: false, status: "missed" };
+}
+function dateFullITfromISO(iso) {
+  const [y, m, d] = iso.split("-").map((n) => parseInt(n, 10));
+  if (!y || !m || !d) return iso;
+  const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
+  return `${DOW_IT3[dow]} ${d} ${MON_IT[m - 1]} ${y}`;
+}
+var DOW_IT3, MON_IT;
+var init_agenda_notify_logic = __esm({
+  "server/agenda_notify_logic.ts"() {
+    "use strict";
+    DOW_IT3 = ["domenica", "luned\xEC", "marted\xEC", "mercoled\xEC", "gioved\xEC", "venerd\xEC", "sabato"];
+    MON_IT = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"];
+  }
+});
+
+// server/agenda_notify.ts
+var agenda_notify_exports = {};
+__export(agenda_notify_exports, {
+  agendaDigestEnabled: () => agendaDigestEnabled,
+  agendaNotifierTick: () => agendaNotifierTick,
+  agendaRemindersEnabled: () => agendaRemindersEnabled,
+  digestCatchupHours: () => digestCatchupHours,
+  digestHour: () => digestHour,
+  digestWeekends: () => digestWeekends,
+  getAgendaJobsHealth: () => getAgendaJobsHealth,
+  getAgendaTodayPreview: () => getAgendaTodayPreview,
+  reminderLeadMin: () => reminderLeadMin,
+  runAgendaDigest: () => runAgendaDigest,
+  runAgendaReminders: () => runAgendaReminders,
+  startAgendaNotifier: () => startAgendaNotifier
+});
+function getSetting3(key, def) {
+  try {
+    return db_default.prepare(`SELECT value FROM app_settings WHERE key = ?`).get(key)?.value ?? def;
+  } catch {
+    return def;
+  }
+}
+function setSetting3(key, value) {
+  try {
+    db_default.prepare(`INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(key, value);
+  } catch {
+  }
+}
+function agendaDigestEnabled() {
+  return getSetting3("agenda_digest", "1") === "1";
+}
+function agendaRemindersEnabled() {
+  return getSetting3("agenda_reminders", "1") === "1";
+}
+function digestHour() {
+  return clampInt(getSetting3("agenda_digest_hour", "8"), 0, 23, 8);
+}
+function digestCatchupHours() {
+  return clampInt(getSetting3("agenda_digest_catchup_h", "4"), 1, 12, 4);
+}
+function digestWeekends() {
+  return getSetting3("agenda_digest_weekends", "1") === "1";
+}
+function reminderLeadMin() {
+  return clampInt(getSetting3("agenda_reminder_lead_min", "10"), 1, 120, 10);
+}
+function clampInt(v, lo, hi, def) {
+  const n = parseInt(v, 10);
+  if (isNaN(n)) return def;
+  return Math.min(Math.max(n, lo), hi);
+}
+function romeNow2() {
+  const now = /* @__PURE__ */ new Date();
+  const iso = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Rome" }).format(now);
+  const hh = new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Rome", hour: "2-digit", minute: "2-digit", hour12: false }).format(now);
+  const [hour, minute] = hh.split(":").map((n) => parseInt(n, 10));
+  const wd = new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Rome", weekday: "short" }).format(now);
+  const dow = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(wd);
+  return { iso, hour, minute, dow };
+}
+function romeMidnightMs(iso) {
+  return Date.parse(`${iso}T00:00:00${romeOffset2(iso)}`);
+}
+function channelReady(nowMs) {
+  return nowMs >= chNextAttemptMs;
+}
+function channelOk() {
+  chFails = 0;
+  chNextAttemptMs = 0;
+}
+function channelFailed(nowMs) {
+  chFails++;
+  const delay = Math.min(6e4 * Math.pow(2, chFails - 1), 3e5);
+  chNextAttemptMs = nowMs + delay;
+  console.warn(`[AgendaNotify] Z-API invio fallito (#${chFails}); backoff ${Math.round(delay / 1e3)}s.`);
+}
+async function sendToControl(text) {
+  const nowMs = Date.now();
+  if (!channelReady(nowMs)) return { ok: false, reason: "backoff" };
+  const control = getControlNumber();
+  if (!control) return { ok: false, reason: "no-control-number" };
+  try {
+    const r = await sendTextMessage(control, text);
+    if (r && r.skipped) return { ok: false, reason: `skipped:${r.reason || "unknown"}` };
+    channelOk();
+    return { ok: true };
+  } catch (e) {
+    channelFailed(nowMs);
+    return { ok: false, reason: e?.message || "send-error" };
+  }
+}
+function recordNotify(kind, dedupKey, target, title, text) {
+  try {
+    const info = db_default.prepare(`
+      INSERT OR IGNORE INTO agenda_notify_log (kind, dedup_key, target, title, text_preview, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(kind, dedupKey, target, title.slice(0, 120), text.replace(/\s+/g, " ").trim().slice(0, 180), (/* @__PURE__ */ new Date()).toISOString());
+    return info.changes > 0;
+  } catch (e) {
+    console.error("[AgendaNotify] audit insert:", e?.message);
+    return true;
+  }
+}
+function sentReminderKeys() {
+  try {
+    const since = new Date(Date.now() - 2 * 864e5).toISOString();
+    const rows = db_default.prepare(`SELECT dedup_key FROM agenda_notify_log WHERE kind = 'reminder' AND created_at >= ?`).all(since);
+    return new Set(rows.map((r) => r.dedup_key));
+  } catch {
+    return /* @__PURE__ */ new Set();
+  }
+}
+async function runAgendaDigest(opts = {}) {
+  const { iso, hour, dow } = romeNow2();
+  setSetting3("agenda_digest_last_run_at", (/* @__PURE__ */ new Date()).toISOString());
+  if (!opts.force && !opts.test) {
+    if (!agendaDigestEnabled()) return { sent: false, reason: "disabled" };
+    const dec = digestDecision({
+      romeHour: hour,
+      dow,
+      targetHour: digestHour(),
+      catchupHours: digestCatchupHours(),
+      weekendsEnabled: digestWeekends(),
+      lastSentDate: getSetting3("agenda_digest_last_sent_date", ""),
+      todayDate: iso
+    });
+    if (!dec.due) return { sent: false, status: dec.status };
+    if (Date.now() - BOOT_MS < DIGEST_BOOT_GRACE_MS && hour >= digestHour()) {
+      return { sent: false, status: "boot-grace" };
+    }
+  }
+  const agenda = await getTodayAgenda(iso);
+  const { text, count: count2 } = composeAgendaDigest({ items: agenda.items, dateFullIT: dateFullITfromISO(iso), test: !!opts.test });
+  const r = await sendToControl(text);
+  if (!r.ok) {
+    setSetting3("agenda_digest_last_status", `send-failed:${r.reason}`);
+    return { sent: false, error: r.reason, count: count2, source: agenda.source };
+  }
+  if (opts.test) {
+    setSetting3("agenda_digest_last_sent_date", iso);
+    setSetting3("agenda_digest_last_status", "sent-test");
+    recordNotify("digest-test", `digest-test:${iso}:${Date.now()}`, getControlNumber(), `agenda ${iso} (test)`, text);
+  } else {
+    setSetting3("agenda_digest_last_sent_date", iso);
+    setSetting3("agenda_digest_last_status", "sent");
+    recordNotify("digest", `digest:${iso}`, getControlNumber(), `agenda ${iso}`, text);
+  }
+  console.log(`[AgendaNotify] Digest ${iso} inviato a Mariano (${count2} appuntamenti, fonte ${agenda.source}${opts.test ? ", TEST" : ""}).`);
+  return { sent: true, count: count2, source: agenda.source, googleOk: agenda.googleOk, test: !!opts.test };
+}
+async function runAgendaReminders(opts = {}) {
+  setSetting3("agenda_reminders_last_run_at", (/* @__PURE__ */ new Date()).toISOString());
+  if (!opts.force && !agendaRemindersEnabled()) return { sent: 0, reason: "disabled" };
+  const nowMs = Date.now();
+  const iso = romeToday();
+  const agenda = await getTodayAgenda(iso);
+  const lead = reminderLeadMin();
+  const already = sentReminderKeys();
+  const due = selectDueReminders(agenda.items, nowMs, lead, already);
+  let sent = 0;
+  for (const it of due) {
+    const key = reminderDedupKey(it);
+    const text = composeReminder(it, lead);
+    const r = await sendToControl(text);
+    if (r.ok) {
+      recordNotify("reminder", key, getControlNumber(), it.title, text);
+      sent++;
+      console.log(`[AgendaNotify] Reminder T-${lead} inviato: ${it.title} (${key}).`);
+    } else {
+      console.warn(`[AgendaNotify] Reminder non inviato (${r.reason}) \u2192 ritento al prossimo tick: ${key}`);
+      break;
+    }
+  }
+  return { sent, due: due.length, source: agenda.source };
+}
+async function agendaNotifierTick() {
+  setSetting3("agenda_tick_last_at", (/* @__PURE__ */ new Date()).toISOString());
+  try {
+    await runAgendaDigest();
+  } catch (e) {
+    console.error("[AgendaNotify] digest tick:", e?.message);
+  }
+  try {
+    await runAgendaReminders();
+  } catch (e) {
+    console.error("[AgendaNotify] reminder tick:", e?.message);
+  }
+}
+function startAgendaNotifier() {
+  setInterval(() => {
+    agendaNotifierTick().catch(() => {
+    });
+  }, 60 * 1e3);
+  setTimeout(() => {
+    agendaNotifierTick().catch(() => {
+    });
+  }, 20 * 1e3);
+  console.log(`[AgendaNotify] Scheduler avviato (digest ${digestHour()}:00 Rome ogni giorno${digestWeekends() ? " incl. weekend" : " feriali"} + reminder T-${reminderLeadMin()}, tick 60s).`);
+}
+function remindersSentToday(iso) {
+  try {
+    const since = new Date(romeMidnightMs(iso)).toISOString();
+    return db_default.prepare(`SELECT COUNT(*) c FROM agenda_notify_log WHERE kind = 'reminder' AND created_at >= ?`).get(since)?.c || 0;
+  } catch {
+    return 0;
+  }
+}
+function getAgendaJobsHealth() {
+  const { iso, hour, dow } = romeNow2();
+  const tickAt = getSetting3("agenda_tick_last_at", "");
+  const tickMs = tickAt ? Date.parse(tickAt) : NaN;
+  const tickAgeSec = isNaN(tickMs) ? null : Math.round((Date.now() - tickMs) / 1e3);
+  const loopAlive = tickAgeSec != null && tickAgeSec < 180;
+  const lastSent = getSetting3("agenda_digest_last_sent_date", "") || null;
+  const enabled = agendaDigestEnabled();
+  const dec = digestDecision({
+    romeHour: hour,
+    dow,
+    targetHour: digestHour(),
+    catchupHours: digestCatchupHours(),
+    weekendsEnabled: digestWeekends(),
+    lastSentDate: lastSent,
+    todayDate: iso
+  });
+  let dStatus = "ok";
+  let dDetail = "";
+  if (!loopAlive) {
+    dStatus = "error";
+    dDetail = `scheduler FERMO (ultimo tick: ${tickAt || "mai"})`;
+  } else if (!enabled) {
+    dStatus = "warn";
+    dDetail = "disattivato (agenda_digest=0)";
+  } else if (dec.status === "sent-already") {
+    dStatus = "ok";
+    dDetail = `inviato oggi (${lastSent})`;
+  } else if (dec.status === "waiting") {
+    dStatus = "ok";
+    dDetail = `in attesa delle ${digestHour()}:00`;
+  } else if (dec.status === "not-a-day") {
+    dStatus = "ok";
+    dDetail = "oggi non previsto (weekend OFF)";
+  } else if (dec.status === "due") {
+    dStatus = "ok";
+    dDetail = "in coda (invio entro ~1 min)";
+  } else {
+    dStatus = "warn";
+    dDetail = "finestra mattutina persa (probabile downtime)";
+  }
+  const rEnabled = agendaRemindersEnabled();
+  let rStatus = "ok";
+  let rDetail = "";
+  if (!loopAlive) {
+    rStatus = "error";
+    rDetail = `scheduler FERMO (ultimo tick: ${tickAt || "mai"})`;
+  } else if (!rEnabled) {
+    rStatus = "warn";
+    rDetail = "disattivato (agenda_reminders=0)";
+  } else {
+    rStatus = "ok";
+    rDetail = `loop attivo (tick ${tickAgeSec}s fa), reminder inviati oggi: ${remindersSentToday(iso)}`;
+  }
+  const digest = { name: "agendaDigest", status: dStatus, detail: dDetail, lastSentDate: lastSent, targetHour: digestHour(), weekends: digestWeekends(), lastRunAt: getSetting3("agenda_digest_last_run_at", "") || null, lastStatus: getSetting3("agenda_digest_last_status", "") || null };
+  const reminders = { name: "agendaReminder", status: rStatus, detail: rDetail, lastTickAt: tickAt || null, tickAgeSec, leadMin: reminderLeadMin(), sentToday: remindersSentToday(iso) };
+  return {
+    items: [{ name: "agendaDigest", status: dStatus, detail: dDetail }, { name: "agendaReminder", status: rStatus, detail: rDetail }],
+    digest,
+    reminders
+  };
+}
+async function getAgendaTodayPreview() {
+  const iso = romeToday();
+  const agenda = await getTodayAgenda(iso);
+  const { text, count: count2 } = composeAgendaDigest({ items: agenda.items, dateFullIT: dateFullITfromISO(iso), test: false });
+  return {
+    date: iso,
+    source: agenda.source,
+    googleConfigured: agenda.googleConfigured,
+    googleOk: agenda.googleOk,
+    googleError: agenda.googleError,
+    counts: agenda.counts,
+    count: count2,
+    items: agenda.items,
+    preview: text
+  };
+}
+var chFails, chNextAttemptMs, BOOT_MS, DIGEST_BOOT_GRACE_MS;
+var init_agenda_notify = __esm({
+  "server/agenda_notify.ts"() {
+    "use strict";
+    init_db();
+    init_zapi();
+    init_chatbot();
+    init_agenda_source();
+    init_agenda_notify_logic();
+    db_default.exec(`
+  CREATE TABLE IF NOT EXISTS agenda_notify_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,            -- 'digest' | 'digest-test' | 'reminder'
+    dedup_key TEXT NOT NULL,
+    target TEXT,
+    title TEXT,
+    text_preview TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_agenda_notify_dedup ON agenda_notify_log(kind, dedup_key);
+  CREATE INDEX IF NOT EXISTS idx_agenda_notify_created ON agenda_notify_log(created_at);
+`);
+    chFails = 0;
+    chNextAttemptMs = 0;
+    BOOT_MS = Date.now();
+    DIGEST_BOOT_GRACE_MS = 12e4;
+  }
+});
+
 // server/pec_logic.ts
 function classifyPec(sender, subject, body) {
   const s = String(sender || "").toLowerCase();
@@ -101348,13 +101906,13 @@ function pecEnabled() {
   const c = pecConfig();
   return !!(c.user && c.pass);
 }
-function setSetting3(k, v) {
+function setSetting4(k, v) {
   try {
     db_default.prepare(`INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(k, v);
   } catch {
   }
 }
-function getSetting3(k) {
+function getSetting4(k) {
   try {
     return db_default.prepare(`SELECT value FROM app_settings WHERE key = ?`).get(k)?.value ?? null;
   } catch {
@@ -101694,7 +102252,7 @@ async function pollPec(force = false) {
     }
     await client.logout().catch(() => {
     });
-    setSetting3("pec_last_poll", (/* @__PURE__ */ new Date()).toISOString());
+    setSetting4("pec_last_poll", (/* @__PURE__ */ new Date()).toISOString());
     try {
       await runPecProcessing();
     } catch (e) {
@@ -101708,14 +102266,14 @@ async function pollPec(force = false) {
     } catch {
     }
     console.error("[PEC] poll fallito:", e?.message);
-    setSetting3("pec_last_error", `${(/* @__PURE__ */ new Date()).toISOString()} ${e?.message}`);
+    setSetting4("pec_last_error", `${(/* @__PURE__ */ new Date()).toISOString()} ${e?.message}`);
     return { enabled: true, processed, created, error: e?.message };
   }
 }
 async function backscanPec(months = 2) {
   const m = Math.max(2, Math.floor(Number(months) || 2));
   if (!pecEnabled()) {
-    setSetting3("pec_backscan_last", JSON.stringify({ ts: (/* @__PURE__ */ new Date()).toISOString(), ok: false, reason: "PEC non configurata" }));
+    setSetting4("pec_backscan_last", JSON.stringify({ ts: (/* @__PURE__ */ new Date()).toISOString(), ok: false, reason: "PEC non configurata" }));
     return { ok: false, reason: "PEC non configurata" };
   }
   const since = /* @__PURE__ */ new Date();
@@ -101753,7 +102311,7 @@ async function backscanPec(months = 2) {
     const notifichePronte = db_default.prepare(`SELECT COUNT(*) n FROM pec_notifiche WHERE status = 'pronta'`).get()?.n || 0;
     const sentenzeVinte = db_default.prepare(`SELECT COUNT(*) n FROM pec_events WHERE outcome IN ('favorevole','parziale')`).get()?.n || 0;
     const summary = { ts: (/* @__PURE__ */ new Date()).toISOString(), ok: true, months: m, since: sinceISO, scanned, created, notifichePronte, sentenzeVinte };
-    setSetting3("pec_backscan_last", JSON.stringify(summary));
+    setSetting4("pec_backscan_last", JSON.stringify(summary));
     return { ok: true, months: m, since: sinceISO, scanned, created, notifichePronte, sentenzeVinte };
   } catch (e) {
     try {
@@ -101762,12 +102320,12 @@ async function backscanPec(months = 2) {
     } catch {
     }
     console.error("[PEC] backscan fallito:", e?.message);
-    setSetting3("pec_backscan_last", JSON.stringify({ ts: (/* @__PURE__ */ new Date()).toISOString(), ok: false, reason: "errore", error: e?.message }));
+    setSetting4("pec_backscan_last", JSON.stringify({ ts: (/* @__PURE__ */ new Date()).toISOString(), ok: false, reason: "errore", error: e?.message }));
     return { ok: false, reason: "errore", months: m, since: sinceISO, scanned, created, error: e?.message };
   }
 }
 function getBackscanStatus() {
-  const raw = getSetting3("pec_backscan_last");
+  const raw = getSetting4("pec_backscan_last");
   return { enabled: pecEnabled(), lastBackscan: raw ? JSON.parse(raw) : null };
 }
 function getNotificheCounts() {
@@ -101811,8 +102369,8 @@ function getPecStatus() {
     port: c.port,
     user: c.user,
     // niente password: mai esposta
-    lastPoll: getSetting3("pec_last_poll"),
-    lastError: getSetting3("pec_last_error"),
+    lastPoll: getSetting4("pec_last_poll"),
+    lastError: getSetting4("pec_last_error"),
     counts
   };
 }
@@ -107181,17 +107739,17 @@ var PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://wa-cruscotto-v2-pr
 var WEBHOOK_URL = `${PUBLIC_BASE_URL}/api/webhook/message`;
 var STALE_MINUTES = 180;
 var REPAIR_COOLDOWN_MIN = 360;
-function getSetting4(key) {
+function getSetting5(key) {
   try {
     return db_default.prepare(`SELECT value FROM app_settings WHERE key = ?`).get(key)?.value ?? null;
   } catch {
     return null;
   }
 }
-function setSetting4(key, value) {
+function setSetting5(key, value) {
   db_default.prepare(`INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(key, value);
 }
-function romeNow2() {
+function romeNow3() {
   const now = /* @__PURE__ */ new Date();
   const iso = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Rome" }).format(now);
   const hour = parseInt(new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Rome", hour: "2-digit", hour12: false }).format(now), 10);
@@ -107200,7 +107758,7 @@ function romeNow2() {
   return { iso, hour, dow };
 }
 function isBusinessHours() {
-  const { hour, dow } = romeNow2();
+  const { hour, dow } = romeNow3();
   if (dow === 0 || dow === 6) return false;
   return hour >= 9 && hour < 13 || hour >= 15 && hour < 19;
 }
@@ -107239,17 +107797,17 @@ ${lines.join("\n").slice(0, 7500)}` : "Nessuna comunicazione WhatsApp registrata
   return { title, description, total, contacts };
 }
 async function runDailyDigest(dateISO) {
-  const date = dateISO || romeNow2().iso;
+  const date = dateISO || romeNow3().iso;
   const { title, description, total } = buildDigest(date);
   if (total === 0) {
-    setSetting4(`digest_done_${date}`, "1");
+    setSetting5(`digest_done_${date}`, "1");
     return { ok: true, date, total: 0, skipped: true };
   }
-  const prevId = getSetting4(`digest_event_${date}`);
+  const prevId = getSetting5(`digest_event_${date}`);
   const r = await upsertAllDayEvent({ title, description, date, eventId: prevId });
   if (r.success && r.eventId) {
-    setSetting4(`digest_event_${date}`, r.eventId);
-    setSetting4(`digest_done_${date}`, "1");
+    setSetting5(`digest_event_${date}`, r.eventId);
+    setSetting5(`digest_done_${date}`, "1");
     return { ok: true, date, total, eventId: r.eventId };
   }
   return { ok: false, date, total, error: r.error };
@@ -107273,13 +107831,13 @@ function getFlowHealth() {
 async function repairWebhook() {
   const previous = await getReceivedWebhook();
   const ok = await setReceivedWebhook(WEBHOOK_URL);
-  setSetting4("last_webhook_repair", (/* @__PURE__ */ new Date()).toISOString());
+  setSetting5("last_webhook_repair", (/* @__PURE__ */ new Date()).toISOString());
   broadcastEvent("flow_repair", { ok, webhook: WEBHOOK_URL, at: (/* @__PURE__ */ new Date()).toISOString() });
   console.log(`[Watchdog] Riparazione webhook: ${ok ? "OK" : "FALLITA"} \u2192 ${WEBHOOK_URL} (precedente: ${previous})`);
   return { ok, previous, set: WEBHOOK_URL };
 }
 function inRepairCooldown() {
-  const last = getSetting4("last_webhook_repair");
+  const last = getSetting5("last_webhook_repair");
   return !!(last && (Date.now() - Date.parse(last)) / 6e4 < REPAIR_COOLDOWN_MIN);
 }
 async function watchdogTick() {
@@ -107318,8 +107876,8 @@ async function runSelfCheck() {
   } catch (e) {
     items.push({ name: "webhook", status: "error", detail: e.message });
   }
-  if (getSetting4("bot_auto_send") === "1" && process.env.BOT_ALLOW_AUTOSEND !== "1") {
-    setSetting4("bot_auto_send", "0");
+  if (getSetting5("bot_auto_send") === "1" && process.env.BOT_ALLOW_AUTOSEND !== "1") {
+    setSetting5("bot_auto_send", "0");
     items.push({ name: "autoSend", status: "fixed", detail: "era ON senza BOT_ALLOW_AUTOSEND \u2192 forzato OFF" });
   } else items.push({ name: "autoSend", status: "ok", detail: isAutoSendEnabled() ? "ON (env autorizzata)" : "OFF" });
   try {
@@ -107342,9 +107900,15 @@ async function runSelfCheck() {
   } catch (e) {
     items.push({ name: "email", status: "warn", detail: `modulo non valutabile: ${e.message}` });
   }
+  try {
+    const an = await Promise.resolve().then(() => (init_agenda_notify(), agenda_notify_exports));
+    for (const it of an.getAgendaJobsHealth().items) items.push({ name: it.name, status: it.status, detail: it.detail });
+  } catch (e) {
+    items.push({ name: "agendaJobs", status: "error", detail: `modulo non valutabile: ${e.message}` });
+  }
   const at = (/* @__PURE__ */ new Date()).toISOString();
   const issues = items.filter((i) => i.status !== "ok").length;
-  setSetting4("selfcheck_last", JSON.stringify({ at, items, issues }));
+  setSetting5("selfcheck_last", JSON.stringify({ at, items, issues }));
   console.log(`[SelfCheck] ${at} \u2014 ${issues} anomalie/correzioni: ${items.map((i) => `${i.name}:${i.status}`).join(" ")}`);
   const notable = items.filter((i) => i.status !== "ok");
   if (notable.length) {
@@ -107365,7 +107929,7 @@ async function runSelfCheck() {
 }
 function getLastSelfCheck() {
   try {
-    return JSON.parse(getSetting4("selfcheck_last") || "null");
+    return JSON.parse(getSetting5("selfcheck_last") || "null");
   } catch {
     return null;
   }
@@ -107378,13 +107942,13 @@ async function runMonitoring(force = false) {
     status = null;
   }
   const { healthy, reason } = evaluateZapiHealth(status);
-  const lastState = getSetting4("monitor_zapi_state") || void 0;
-  const lastAtRaw = getSetting4("monitor_zapi_alert_at");
+  const lastState = getSetting5("monitor_zapi_state") || void 0;
+  const lastAtRaw = getSetting5("monitor_zapi_alert_at");
   const lastAlertMs = lastAtRaw ? Date.parse(lastAtRaw) : null;
   const { action, newState } = decideMonitorAlert(healthy, lastState || void 0, lastAlertMs != null && !isNaN(lastAlertMs) ? lastAlertMs : null, Date.now());
-  setSetting4("monitor_zapi_state", newState);
+  setSetting5("monitor_zapi_state", newState);
   if (action === "alert-down") {
-    setSetting4("monitor_zapi_alert_at", (/* @__PURE__ */ new Date()).toISOString());
+    setSetting5("monitor_zapi_alert_at", (/* @__PURE__ */ new Date()).toISOString());
     const html = `<h2 style="color:#b00020">\u26A0\uFE0F Sessione WhatsApp (Z-API) NON attiva</h2>
       <p>${reason}</p>
       <p>Il bot potrebbe non ricevere/inviare messaggi WhatsApp. <b>RUNBOOK</b>: riconnetti la
@@ -107406,8 +107970,8 @@ async function runMonitoring(force = false) {
 }
 function getMonitorStatus() {
   return {
-    zapiState: getSetting4("monitor_zapi_state") || "unknown",
-    lastZapiAlertAt: getSetting4("monitor_zapi_alert_at"),
+    zapiState: getSetting5("monitor_zapi_state") || "unknown",
+    lastZapiAlertAt: getSetting5("monitor_zapi_alert_at"),
     flow: getFlowHealth(),
     lastSelfCheck: getLastSelfCheck()
   };
@@ -107423,13 +107987,13 @@ function startMaintenance() {
   }, 5e3);
   const tick = async () => {
     try {
-      const { iso, hour } = romeNow2();
-      if (hour >= 20 && getSetting4(`digest_done_${iso}`) !== "1") {
+      const { iso, hour } = romeNow3();
+      if (hour >= 20 && getSetting5(`digest_done_${iso}`) !== "1") {
         const r = await runDailyDigest(iso);
         console.log(`[Digest] ${iso}: ${r.ok ? `evento aggiornato (${r.total} msg)` : `errore: ${r.error}`}`);
       }
-      if (hour >= 3 && hour < 6 && getSetting4(`selfcheck_done_${iso}`) !== "1") {
-        setSetting4(`selfcheck_done_${iso}`, "1");
+      if (hour >= 3 && hour < 6 && getSetting5(`selfcheck_done_${iso}`) !== "1") {
+        setSetting5(`selfcheck_done_${iso}`, "1");
         await runSelfCheck();
       }
       await watchdogTick();
@@ -107455,6 +108019,7 @@ function startMaintenance() {
 }
 
 // server/routes.ts
+init_agenda_notify();
 init_deadlines();
 
 // server/summary.ts
@@ -107695,7 +108260,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.17.0", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.18.0", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.post("/site/lead", (req, res) => siteLead(req, res));
 router.get("/site/availability", (req, res) => siteAvailability(req, res));
@@ -107721,7 +108286,19 @@ router.delete("/site/leads/:id", (req, res) => {
 router.post("/integrations/make/inbound", (req, res) => makeInbound(req, res));
 router.get("/integrations/make/status", (req, res) => makeStatus(req, res));
 router.get("/selftest", (_req, res) => {
-  res.json(getLastSelfCheck() || { note: "mai eseguito" });
+  const base = getLastSelfCheck() || { note: "mai eseguito", items: [] };
+  let agenda = null;
+  try {
+    const h = getAgendaJobsHealth();
+    agenda = h;
+    const items = Array.isArray(base.items) ? base.items.slice() : [];
+    const live = h.items;
+    const merged = items.filter((i) => !live.some((l) => l.name === i.name)).concat(live);
+    base.items = merged;
+    base.issues = merged.filter((i) => i.status !== "ok").length;
+  } catch {
+  }
+  res.json({ ...base, agendaJobs: agenda });
 });
 router.post("/selftest", async (_req, res) => {
   try {
@@ -108803,7 +109380,7 @@ router.get("/conversations/:phone/requests", (req, res) => {
 router.get("/integrations/status", (_req, res) => {
   try {
     const stats = getIntegrationStats();
-    const googleConfigured = !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_REFRESH_TOKEN);
+    const googleConfigured2 = !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_REFRESH_TOKEN);
     const notionConfigured = !!process.env.NOTION_API_KEY;
     const calEnabled = db_default.prepare(`SELECT value FROM app_settings WHERE key = 'integration_calendar'`).get()?.value === "1";
     const notionEnabled = db_default.prepare(`SELECT value FROM app_settings WHERE key = 'integration_notion'`).get()?.value === "1";
@@ -108812,8 +109389,8 @@ router.get("/integrations/status", (_req, res) => {
     const pendingCount = qStats.find((r) => r.status === "pending")?.count || 0;
     res.json({
       integrations_enabled: intEnabled,
-      google_contacts: { configured: googleConfigured, enabled: intEnabled },
-      google_calendar: { configured: googleConfigured, enabled: calEnabled },
+      google_contacts: { configured: googleConfigured2, enabled: intEnabled },
+      google_calendar: { configured: googleConfigured2, enabled: calEnabled },
       notion: { configured: notionConfigured, enabled: notionEnabled },
       queue_pending: pendingCount,
       stats
@@ -109049,7 +109626,10 @@ router.post("/bot/jobs/:job/run", async (req, res) => {
     if (job === "cleanup") return res.json(await runAppointmentCleanup(true));
     if (job === "briefing") return res.json(await runMorningBriefing(true));
     if (job === "deadlines") return res.json(await runDeadlineReminders(true));
-    res.status(400).json({ error: `Job sconosciuto: ${job} (validi: reminders, waitlist, sla, aging, cleanup, briefing, deadlines)` });
+    if (job === "agenda-digest") return res.json(await runAgendaDigest({ force: true }));
+    if (job === "agenda-digest-test") return res.json(await runAgendaDigest({ test: true }));
+    if (job === "agenda-reminders") return res.json(await runAgendaReminders({ force: true }));
+    res.status(400).json({ error: `Job sconosciuto: ${job} (validi: reminders, waitlist, sla, aging, cleanup, briefing, deadlines, agenda-digest, agenda-digest-test, agenda-reminders)` });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -109388,7 +109968,14 @@ router.post("/bot/backfill-digest", async (req, res) => {
   res.json({ daysScanned: days + 1, eventsWritten: written.length, days: written });
 });
 router.get("/bot/flow-health", (_req, res) => {
-  res.json(getFlowHealth());
+  res.json({ ...getFlowHealth(), agendaJobs: getAgendaJobsHealth() });
+});
+router.get("/bot/agenda/today", async (_req, res) => {
+  try {
+    res.json(await getAgendaTodayPreview());
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 router.get("/bot/zapi-info", async (_req, res) => {
   const out = { controlNumber: getControlNumber() };
@@ -109467,6 +110054,14 @@ app.listen(PORT, () => {
     startPolling(3e4);
   }, 2e3);
   startMaintenance();
+  setTimeout(async () => {
+    try {
+      const an = await Promise.resolve().then(() => (init_agenda_notify(), agenda_notify_exports));
+      an.startAgendaNotifier();
+    } catch (e) {
+      console.error("[AgendaNotify] scheduler non avviato (isolato, resto del bot intatto):", e.message);
+    }
+  }, 3e3);
   setTimeout(async () => {
     try {
       const mail = await Promise.resolve().then(() => (init_email(), email_exports));

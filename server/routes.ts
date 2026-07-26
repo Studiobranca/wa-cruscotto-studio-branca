@@ -53,6 +53,7 @@ import {
 } from './chatbot.js';
 import { runDailyDigest, getFlowHealth, repairWebhook, runSelfCheck, getLastSelfCheck, getMonitorStatus, runMonitoring } from './maintenance.js';
 import { runReminders, runWaitlistRecall, runSlaCheck, getRemindersStatus, runDraftAging, getAgingView, runAppointmentCleanup, getBriefingData, runMorningBriefing, runDeadlineReminders } from './reminders.js';
+import { runAgendaDigest, runAgendaReminders, getAgendaJobsHealth, getAgendaTodayPreview } from './agenda_notify.js';
 import { createDeadline, listDeadlines, completeDeadline, deleteDeadline, getImminentDeadlines } from './deadlines.js';
 import { composeBriefing } from './briefing_logic.js';
 import { summarizeConversation } from './summary.js';
@@ -92,7 +93,7 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.17.0', built: new Date().toISOString() });
+  res.json({ version: '2.18.0', built: new Date().toISOString() });
 });
 
 // ─── Endpoint pubblici per il SITO (studiotributariobranca.eu) ───────────────
@@ -125,7 +126,22 @@ router.get('/integrations/make/status', (req: Request, res: Response) => makeSta
 
 // ─── Autocheck (self-test + autocorrezione) ──────────────────────────────────
 router.get('/selftest', (_req: Request, res: Response) => {
-  res.json(getLastSelfCheck() || { note: 'mai eseguito' });
+  // Base: ultimo autocheck notturno (invarianti). In più, salute LIVE dei due job
+  // d'agenda (digest 08:00 / reminder T-10), così post-deploy si vedono subito come 'ok'
+  // e, se il loro scheduler muore, EMERGONO come 'error' senza attendere la notte.
+  const base = getLastSelfCheck() || { note: 'mai eseguito', items: [] };
+  let agenda: any = null;
+  try {
+    const h = getAgendaJobsHealth();
+    agenda = h;
+    const items = Array.isArray(base.items) ? base.items.slice() : [];
+    // Sostituisci eventuali voci stantie con quelle LIVE.
+    const live = h.items;
+    const merged = items.filter((i: any) => !live.some((l) => l.name === i.name)).concat(live);
+    base.items = merged;
+    base.issues = merged.filter((i: any) => i.status !== 'ok').length;
+  } catch { /* best-effort */ }
+  res.json({ ...base, agendaJobs: agenda });
 });
 router.post('/selftest', async (_req: Request, res: Response) => {
   try { res.json(await runSelfCheck()); }
@@ -1642,7 +1658,11 @@ router.post('/bot/jobs/:job/run', async (req: Request, res: Response) => {
     if (job === 'cleanup') return res.json(await runAppointmentCleanup(true));
     if (job === 'briefing') return res.json(await runMorningBriefing(true));
     if (job === 'deadlines') return res.json(await runDeadlineReminders(true));
-    res.status(400).json({ error: `Job sconosciuto: ${job} (validi: reminders, waitlist, sla, aging, cleanup, briefing, deadlines)` });
+    // Notifiche d'agenda verso Mariano (digest 08:00 + reminder T-10).
+    if (job === 'agenda-digest') return res.json(await runAgendaDigest({ force: true }));
+    if (job === 'agenda-digest-test') return res.json(await runAgendaDigest({ test: true }));
+    if (job === 'agenda-reminders') return res.json(await runAgendaReminders({ force: true }));
+    res.status(400).json({ error: `Job sconosciuto: ${job} (validi: reminders, waitlist, sla, aging, cleanup, briefing, deadlines, agenda-digest, agenda-digest-test, agenda-reminders)` });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1948,7 +1968,17 @@ router.post('/bot/backfill-digest', async (req: Request, res: Response) => {
 });
 
 router.get('/bot/flow-health', (_req: Request, res: Response) => {
-  res.json(getFlowHealth());
+  // Salute del flusso messaggi + salute dei DUE job d'agenda (digest 08:00 / reminder T-10):
+  // se lo scheduler dedicato muore, tickAgeSec cresce e lo stato passa a 'error' (anti "verde ma morto").
+  res.json({ ...getFlowHealth(), agendaJobs: getAgendaJobsHealth() });
+});
+
+// ─── AGENDA DI OGGI: anteprima (sola lettura, NESSUN invio) ──────────────────
+// Mostra la fonte REALE usata (Google Calendar diretto e/o bot_appointments), se
+// popolata, e il testo del digest che verrebbe inviato alle 08:00.
+router.get('/bot/agenda/today', async (_req: Request, res: Response) => {
+  try { res.json(await getAgendaTodayPreview()); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
 // Diagnostica: numero WhatsApp collegato + webhook configurato (per capire se i

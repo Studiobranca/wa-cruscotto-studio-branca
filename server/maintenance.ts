@@ -216,6 +216,13 @@ export async function runSelfCheck(): Promise<{ at: string; items: CheckItem[]; 
     else items.push({ name: 'email', status: 'ok', detail: `${st.configured.length} caselle, ultimo poll ${st.lastPoll?.ok ? 'OK' : 'n/d'}` });
   } catch (e: any) { items.push({ name: 'email', status: 'warn', detail: `modulo non valutabile: ${e.message}` }); }
 
+  // 7) Notifiche d'agenda verso Mariano: salute dei due job (digest 08:00 + reminder T-10).
+  //    Se lo scheduler dedicato è fermo, qui compare 'error' (anti "verde ma morto").
+  try {
+    const an = await import('./agenda_notify.js');
+    for (const it of an.getAgendaJobsHealth().items) items.push({ name: it.name, status: it.status, detail: it.detail });
+  } catch (e: any) { items.push({ name: 'agendaJobs', status: 'error', detail: `modulo non valutabile: ${e.message}` }); }
+
   const at = new Date().toISOString();
   const issues = items.filter((i) => i.status !== 'ok').length;
   setSetting('selfcheck_last', JSON.stringify({ at, items, issues }));
