@@ -42,7 +42,7 @@ app.listen(PORT, () => {
   
   // Start polling after server is ready
   setTimeout(() => {
-    startPolling(30000);
+    startPolling(Number(process.env.POLL_INTERVAL_MS) || 30000);
   }, 2000);
 
   // Manutenzione: digest giornaliero + watchdog flusso messaggi

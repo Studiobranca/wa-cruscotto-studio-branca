@@ -93,7 +93,7 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.18.0', built: new Date().toISOString() });
+  res.json({ version: '2.18.2', built: new Date().toISOString() });
 });
 
 // ─── Endpoint pubblici per il SITO (studiotributariobranca.eu) ───────────────
@@ -791,7 +791,12 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
     // segnaposto "[Immagine]" e rispondeva in modo generico. Ora analizza la foto (tipo di
     // documento, mittente/ente, riferimenti visibili) così la risposta può essere pertinente
     // a quanto ricevuto. Isolato: se l'analisi fallisce, resta il segnaposto testuale.
-    if (isImage && imageUrl && !fromMe) {
+    // GUARDIA carico (rev. 27/07/2026): NON analizzare le immagini dei GRUPPI.
+    // I gruppi sono sola lettura (il bot non risponde mai): un flood di immagini di
+    // gruppo faceva partire un download + una chiamata AI per OGNI immagine, saturando
+    // il processo durante il blackout di rete. L'analisi serve solo per rispondere ai
+    // CLIENTI, quindi si limita alle chat non di gruppo.
+    if (isImage && imageUrl && !fromMe && !isGroup && !isLegacyGroup) {
       try {
         const { analyzeImageUrl } = await import('./docvision.js');
         const desc = await analyzeImageUrl(imageUrl);

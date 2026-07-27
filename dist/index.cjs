@@ -24324,11 +24324,19 @@ __export(zapi_exports, {
   zapiPost: () => zapiPost,
   zapiPut: () => zapiPut
 });
+function zapiSignal() {
+  try {
+    return AbortSignal.timeout(ZAPI_TIMEOUT_MS);
+  } catch {
+    return void 0;
+  }
+}
 async function zapiGet(endpoint) {
   const url = `${ZAPI_BASE}${endpoint}`;
   const response = await fetch(url, {
     method: "GET",
-    headers: zapiHeaders
+    headers: zapiHeaders,
+    signal: zapiSignal()
   });
   if (!response.ok) {
     const text = await response.text();
@@ -24341,7 +24349,8 @@ async function zapiPost(endpoint, body) {
   const response = await fetch(url, {
     method: "POST",
     headers: zapiHeaders,
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
+    signal: zapiSignal()
   });
   if (!response.ok) {
     const text = await response.text();
@@ -24354,7 +24363,8 @@ async function zapiPut(endpoint, body) {
   const response = await fetch(url, {
     method: "PUT",
     headers: zapiHeaders,
-    body: JSON.stringify(body)
+    body: JSON.stringify(body),
+    signal: zapiSignal()
   });
   if (!response.ok) {
     const text = await response.text();
@@ -24464,7 +24474,7 @@ async function syncContacts() {
   console.log(`[ZAPI] Synced ${totalSynced} contacts`);
   return totalSynced;
 }
-var ZAPI_INSTANCE, ZAPI_TOKEN, ZAPI_CLIENT_TOKEN, ZAPI_BASE, zapiHeaders, _devicePhone, _devicePhoneAt, DEVICE_PHONE_TTL_MS;
+var ZAPI_INSTANCE, ZAPI_TOKEN, ZAPI_CLIENT_TOKEN, ZAPI_BASE, zapiHeaders, ZAPI_TIMEOUT_MS, _devicePhone, _devicePhoneAt, DEVICE_PHONE_TTL_MS;
 var init_zapi = __esm({
   "server/zapi.ts"() {
     "use strict";
@@ -24476,6 +24486,7 @@ var init_zapi = __esm({
       "Content-Type": "application/json",
       "client-token": ZAPI_CLIENT_TOKEN
     };
+    ZAPI_TIMEOUT_MS = Number(process.env.ZAPI_TIMEOUT_MS) || 6e3;
     _devicePhone = null;
     _devicePhoneAt = 0;
     DEVICE_PHONE_TTL_MS = 60 * 60 * 1e3;
@@ -108260,7 +108271,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.18.0", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.18.2", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.post("/site/lead", (req, res) => siteLead(req, res));
 router.get("/site/availability", (req, res) => siteAvailability(req, res));
@@ -108899,7 +108910,7 @@ router.post("/webhook/message", async (req, res) => {
     if (isImage) content = caption ? `[Immagine: ${caption}]` : "[Immagine]";
     else if (isAudio) content = "[Messaggio vocale \u{1F3A4}]";
     else content = text || "";
-    if (isImage && imageUrl && !fromMe) {
+    if (isImage && imageUrl && !fromMe && !isGroup && !isLegacyGroup) {
       try {
         const { analyzeImageUrl: analyzeImageUrl2 } = await Promise.resolve().then(() => (init_docvision(), docvision_exports));
         const desc = await analyzeImageUrl2(imageUrl);
@@ -110051,7 +110062,7 @@ app.listen(PORT, () => {
   console.log(`[Server] WA Cruscotto running on port ${PORT}`);
   console.log(`[Server] Environment: ${process.env.NODE_ENV || "development"}`);
   setTimeout(() => {
-    startPolling(3e4);
+    startPolling(Number(process.env.POLL_INTERVAL_MS) || 3e4);
   }, 2e3);
   startMaintenance();
   setTimeout(async () => {
