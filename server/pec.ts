@@ -370,6 +370,9 @@ export async function pollPec(force = false): Promise<{ enabled: boolean; proces
   if (!pecEnabled()) return { enabled: false, processed: 0, created: 0, error: 'PEC non configurata (mancano PEC_USER/PEC_PASS)' };
   const c = pecConfig();
   const client = new ImapFlow({ host: c.host, port: c.port, secure: true, auth: { user: c.user, pass: c.pass }, logger: false });
+  // v2.18.3: handler 'error' obbligatorio — un evento 'error' emesso da ImapFlow senza listener
+  // abbatte l'intero processo (uncaughtException). Vedi incidente 27-28/07.
+  client.on('error', (e: any) => console.error('[PEC] IMAP error:', e?.message || e));
   let processed = 0, created = 0;
   try {
     await client.connect();
@@ -410,6 +413,9 @@ export async function backscanPec(months = 2): Promise<{ ok: boolean; reason?: s
   const sinceISO = since.toISOString().slice(0, 10);
   const c = pecConfig();
   const client = new ImapFlow({ host: c.host, port: c.port, secure: true, auth: { user: c.user, pass: c.pass }, logger: false });
+  // v2.18.3: handler 'error' obbligatorio — un evento 'error' emesso da ImapFlow senza listener
+  // abbatte l'intero processo (uncaughtException). Vedi incidente 27-28/07.
+  client.on('error', (e: any) => console.error('[PEC] IMAP error:', e?.message || e));
   let scanned = 0, created = 0;
   try {
     await client.connect();

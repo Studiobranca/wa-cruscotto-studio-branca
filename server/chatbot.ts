@@ -803,7 +803,7 @@ async function runTool(name: string, input: any, out: DraftResult, phone: string
   if (name === 'get_availability') {
     out.appointmentFlow = true;
     const days = Math.min(Math.max(parseInt(input?.days, 10) || 14, 1), 30);
-    const { slots, calendarChecked } = await getAvailability(days);
+    const { slots, calendarChecked, reopening } = await getAvailability(days);
     if (!slots.length) {
       return `${calendarChecked ? '' : '(agenda non verificata su Calendar) '}NESSUNA disponibilità nei prossimi ${days} giorni (agenda piena o chiusura dello studio). NON proporre MAI date o orari a mano. Proponi al cliente la LISTA D'ATTESA: se accetta di essere ricontattato quando si libereranno nuove date, chiama add_to_waitlist con il motivo dell'appuntamento; verrà ricontattato in automatico su questo stesso canale. Nel frattempo può inviare la documentazione su questa chat o via email.`;
     }
@@ -812,7 +812,12 @@ async function runTool(name: string, input: any, out: DraftResult, phone: string
     // Elenco macchina-leggibile con DATA ESATTA (YYYY-MM-DD): il modello DEVE
     // copiare questi valori in propose_booking, mai inventare la data/anno.
     const iso = slots.slice(0, 12).map((s) => `${s.date} ${s.start}`).join('; ');
-    return `${calendarChecked ? '' : '(agenda non verificata su Calendar) '}Prossime disponibilità (da mostrare al cliente):\n${txt}\n\nSlot con data esatta da usare in propose_booking (date=YYYY-MM-DD, start=HH:MM): ${iso}`;
+    // Chiusura estiva: getAvailability ha guardato OLTRE la chiusura e queste sono le
+    // PRIME date utili alla riapertura → proponile normalmente, NON la lista d'attesa.
+    const reopenNote = reopening
+      ? 'Lo studio è in CHIUSURA estiva: queste sono le PRIME date utili alla RIAPERTURA. Proponile normalmente al cliente restando nel flusso appuntamento (ricorda comunque la chiusura come da istruzioni), NON offrire la lista d\'attesa. '
+      : '';
+    return `${calendarChecked ? '' : '(agenda non verificata su Calendar) '}${reopenNote}Prossime disponibilità (da mostrare al cliente):\n${txt}\n\nSlot con data esatta da usare in propose_booking (date=YYYY-MM-DD, start=HH:MM): ${iso}`;
   }
   if (name === 'check_walkin_now') {
     out.appointmentFlow = true;

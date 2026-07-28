@@ -223,6 +223,16 @@ export async function runSelfCheck(): Promise<{ at: string; items: CheckItem[]; 
     for (const it of an.getAgendaJobsHealth().items) items.push({ name: it.name, status: it.status, detail: it.detail });
   } catch (e: any) { items.push({ name: 'agendaJobs', status: 'error', detail: `modulo non valutabile: ${e.message}` }); }
 
+  // 8) Appuntamenti: la disponibilità DEVE proporre date anche durante la CHIUSURA ESTIVA
+  //    (getAvailability guarda oltre la chiusura → prime date di riapertura). Anti-regressione
+  //    del fix 28/07 (prima: finestra ≤30gg tutta chiusa → 0 slot → lista d'attesa impropria).
+  try {
+    const ap = await import('./appointments.js');
+    const av = await ap.getAvailability(30);
+    if (av.slots.length) items.push({ name: 'appuntamenti', status: 'ok', detail: `${av.slots.length} slot${av.reopening ? ' (prime date di RIAPERTURA, oltre chiusura estiva)' : ''}, primo ${av.slots[0].date} ${av.slots[0].start}` });
+    else items.push({ name: 'appuntamenti', status: 'warn', detail: 'nessuno slot entro il cap: verificare chiusura/agenda' });
+  } catch (e: any) { items.push({ name: 'appuntamenti', status: 'error', detail: `modulo non valutabile: ${e.message}` }); }
+
   const at = new Date().toISOString();
   const issues = items.filter((i) => i.status !== 'ok').length;
   setSetting('selfcheck_last', JSON.stringify({ at, items, issues }));

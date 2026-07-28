@@ -401,6 +401,11 @@ async function pollAccount(acc: MailAccount): Promise<number> {
     host: acc.host, port: acc.port, secure: true,
     auth: { user: acc.user, pass: acc.pass }, logger: false,
   });
+  // INCIDENTE 27-28/07 (v2.18.3): ImapFlow emette un 'error' event asincrono (es. durante
+  // close()/perdita connessione: "Failed to receive greeting" → NoConnection) FUORI dalla
+  // catena await. Senza un listener, Node lancia uncaughtException e abbatte l'INTERO processo
+  // (webhook WhatsApp incluso → 502). Un handler 'error' rende l'evento innocuo.
+  client.on('error', (e: any) => console.error(`[Email] IMAP error ${acc.name}:`, e?.message || e));
   let stored = 0;
   await client.connect();
   try {

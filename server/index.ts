@@ -5,6 +5,22 @@ import routes from './routes.js';
 import { startPolling } from './polling.js';
 import { startMaintenance } from './maintenance.js';
 
+// ═══ GUARD GLOBALE (incidente 27-28/07, v2.18.3) ════════════════════════════
+// Il processo è rimasto OFFLINE ~24h perché un 'error' event non gestito di un client
+// IMAP (ImapFlow, casella tiscali non raggiungibile) ha causato uncaughtException e
+// abbattuto l'INTERO server HTTP — webhook WhatsApp compreso → 502 x-railway-fallback.
+// Priorità assoluta: il webhook/health NON deve mai morire per un errore di un poller
+// secondario. Logghiamo in modo rumoroso ma NON terminiamo il processo.
+let lastUncaught: { at: string; msg: string } | null = null;
+process.on('uncaughtException', (err: any) => {
+  lastUncaught = { at: new Date().toISOString(), msg: err?.message || String(err) };
+  console.error('[GUARD] uncaughtException (processo MANTENUTO vivo):', err?.stack || err);
+});
+process.on('unhandledRejection', (reason: any) => {
+  console.error('[GUARD] unhandledRejection:', reason?.stack || reason?.message || reason);
+});
+export function getLastUncaught() { return lastUncaught; }
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 
