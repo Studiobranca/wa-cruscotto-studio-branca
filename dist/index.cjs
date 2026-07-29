@@ -24025,6 +24025,16 @@ var init_db = __esm({
 });
 
 // server/appointments.ts
+var appointments_exports = {};
+__export(appointments_exports, {
+  formatAvailabilityIT: () => formatAvailabilityIT,
+  formatDateFullIT: () => formatDateFullIT,
+  formatDateIT: () => formatDateIT,
+  getAvailability: () => getAvailability,
+  getNowStatus: () => getNowStatus,
+  isSlotBusy: () => isSlotBusy,
+  weekdayIT: () => weekdayIT
+});
 function openWindow(ds, dow) {
   if (ds >= ESTIVO_UNICO_DA && ds <= ESTIVO_UNICO_A) return { start: 9, last: 14 };
   if (ds >= CHIUSURA_DA && ds <= CHIUSURA_A) return null;
@@ -24088,15 +24098,35 @@ function romeOffset(ds) {
   const rome = new Intl.DateTimeFormat("en-US", { timeZone: TZ, hour: "numeric", hour12: false }).format(probe);
   return parseInt(rome) - 12 === 2 ? "+02:00" : "+01:00";
 }
-async function getAvailability(days = 14) {
-  const today = /* @__PURE__ */ new Date();
+async function getAvailability(days = 14, fromDate) {
+  const today = fromDate ?? /* @__PURE__ */ new Date();
+  const dsOf = (i) => {
+    const d = new Date(today.getFullYear(), today.getMonth(), today.getDate() + i);
+    return { ds: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`, dow: d.getDay() };
+  };
   const all = [];
   for (let i = 1; i <= days; i++) {
-    const d = new Date(today.getFullYear(), today.getMonth(), today.getDate() + i);
-    const ds = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-    all.push(...daySlots(ds, d.getDay()));
+    const { ds, dow } = dsOf(i);
+    all.push(...daySlots(ds, dow));
   }
-  if (!all.length) return { slots: [], calendarChecked: false };
+  let reopening = false;
+  if (!all.length) {
+    let openDays = 0;
+    let lastDate = "";
+    for (let i = days + 1; i <= MAX_LOOKAHEAD; i++) {
+      const { ds, dow } = dsOf(i);
+      const s = daySlots(ds, dow);
+      if (!s.length) continue;
+      if (ds !== lastDate) {
+        if (openDays >= 4) break;
+        openDays++;
+        lastDate = ds;
+      }
+      all.push(...s);
+      reopening = true;
+    }
+  }
+  if (!all.length) return { slots: [], calendarChecked: false, reopening };
   let busy = [];
   let calendarChecked = false;
   const token = await getGoogleAccessToken();
@@ -24129,7 +24159,7 @@ async function getAvailability(days = 14) {
     const en = Date.parse(`${s.date}T${s.end}:00${off}`);
     return !busy.some((b) => b.start < en && b.end > st);
   });
-  return { slots: free, calendarChecked };
+  return { slots: free, calendarChecked, reopening };
 }
 async function isSlotBusy(date, start, end) {
   const token = await getGoogleAccessToken();
@@ -24236,7 +24266,7 @@ async function getNowStatus() {
   }
   return { isOpenNow, freeNow, appointmentsRemainingToday, nextSlot, calendarChecked };
 }
-var TZ, ESTIVO_UNICO_DA, ESTIVO_UNICO_A, CHIUSURA_DA, CHIUSURA_A, DOW_IT, MONTH_IT;
+var TZ, ESTIVO_UNICO_DA, ESTIVO_UNICO_A, CHIUSURA_DA, CHIUSURA_A, MAX_LOOKAHEAD, DOW_IT, MONTH_IT;
 var init_appointments = __esm({
   "server/appointments.ts"() {
     "use strict";
@@ -24245,6 +24275,7 @@ var init_appointments = __esm({
     ESTIVO_UNICO_A = "2026-07-25";
     CHIUSURA_DA = "2026-07-26";
     CHIUSURA_A = "2026-08-31";
+    MAX_LOOKAHEAD = 120;
     DOW_IT = ["domenica", "luned\xEC", "marted\xEC", "mercoled\xEC", "gioved\xEC", "venerd\xEC", "sabato"];
     MONTH_IT = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"];
   }
@@ -24947,6 +24978,114 @@ var init_integrations = __esm({
   }
 });
 
+// server/caldav.ts
+function appleEnabled() {
+  return process.env.APPLE_CALENDAR_ENABLED === "1" && !!process.env.EMAIL_ICLOUD_PASS;
+}
+function authHeader() {
+  const user = process.env.EMAIL_ICLOUD_USER || "studiobranca@icloud.com";
+  const pass = process.env.EMAIL_ICLOUD_PASS || "";
+  return "Basic " + Buffer.from(`${user}:${pass}`).toString("base64");
+}
+async function propfind(url, body, depth = "1") {
+  const r = await fetch(url, { method: "PROPFIND", headers: { Authorization: authHeader(), "Content-Type": "application/xml; charset=utf-8", Depth: depth }, body });
+  return r.text();
+}
+async function resolveCollection() {
+  if (process.env.APPLE_CALENDAR_URL) return process.env.APPLE_CALENDAR_URL;
+  if (cachedCollection) return cachedCollection;
+  try {
+    let xml = await propfind(HOST + "/", `<?xml version="1.0"?><d:propfind xmlns:d="DAV:"><d:prop><d:current-user-principal/></d:prop></d:propfind>`, "0");
+    const principal = (xml.match(/current-user-principal[^>]*>[\s\S]*?<href[^>]*>([^<]+)</i) || [])[1];
+    if (!principal) return null;
+    xml = await propfind(HOST + principal, `<?xml version="1.0"?><d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><c:calendar-home-set/></d:prop></d:propfind>`, "0");
+    const home = (xml.match(/calendar-home-set[^>]*>[\s\S]*?<href[^>]*>([^<]+)</i) || [])[1];
+    if (!home) return null;
+    const homeUrl = home.startsWith("http") ? home : HOST + home;
+    xml = await propfind(homeUrl, `<?xml version="1.0"?><d:propfind xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><d:displayname/><d:resourcetype/><c:supported-calendar-component-set/></d:prop></d:propfind>`, "1");
+    const want = (process.env.APPLE_CALENDAR_NAME || "Home").toLowerCase();
+    let fallback = null;
+    for (const m of xml.matchAll(/<response[^>]*>([\s\S]*?)<\/response>/gi)) {
+      const b = m[1];
+      const href = (b.match(/<href[^>]*>([^<]+)</i) || [])[1];
+      const name = ((b.match(/<displayname[^>]*>([^<]*)</i) || [])[1] || "").trim();
+      const isCal = /<calendar[\s\/>]/i.test(b) && /VEVENT/i.test(b);
+      if (!href || !isCal) continue;
+      if (!fallback) fallback = href;
+      if (name.toLowerCase() === want) {
+        cachedCollection = href;
+        return href;
+      }
+    }
+    cachedCollection = fallback;
+    return fallback;
+  } catch {
+    return null;
+  }
+}
+function icsEscape(s) {
+  return String(s || "").replace(/\\/g, "\\\\").replace(/;/g, "\\;").replace(/,/g, "\\,").replace(/\n/g, "\\n");
+}
+function dtLocal(dateIso, hhmm) {
+  return `${dateIso.replace(/-/g, "")}T${(hhmm || "09:00").replace(":", "")}00`;
+}
+async function mirrorToApple(ev) {
+  if (!appleEnabled()) return false;
+  try {
+    const col = await resolveCollection();
+    if (!col) return false;
+    const end = ev.end || (() => {
+      const [h, m] = ev.start.split(":").map(Number);
+      const d = new Date(2e3, 0, 1, h, m + 30);
+      return `${d.getHours().toString().padStart(2, "0")}:${d.getMinutes().toString().padStart(2, "0")}`;
+    })();
+    const now = (/* @__PURE__ */ new Date()).toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+    const ics = [
+      "BEGIN:VCALENDAR",
+      "VERSION:2.0",
+      "PRODID:-//cruscotto//ponte//IT",
+      "CALSCALE:GREGORIAN",
+      "BEGIN:VEVENT",
+      `UID:${ev.uid}`,
+      `DTSTAMP:${now}`,
+      `DTSTART;TZID=Europe/Rome:${dtLocal(ev.date, ev.start)}`,
+      `DTEND;TZID=Europe/Rome:${dtLocal(ev.date, end)}`,
+      `SUMMARY:${icsEscape(ev.summary)}`,
+      ev.description ? `DESCRIPTION:${icsEscape(ev.description)}` : "",
+      ev.location ? `LOCATION:${icsEscape(ev.location)}` : "",
+      "END:VEVENT",
+      "END:VCALENDAR"
+    ].filter(Boolean).join("\r\n");
+    const url = HOST + col + encodeURIComponent(ev.uid) + ".ics";
+    const r = await fetch(url, { method: "PUT", headers: { Authorization: authHeader(), "Content-Type": "text/calendar; charset=utf-8" }, body: ics });
+    return r.status >= 200 && r.status < 300;
+  } catch (e) {
+    console.error("[CalDAV] mirror fallito:", e.message);
+    return false;
+  }
+}
+async function deleteFromApple(uid) {
+  if (!appleEnabled()) return false;
+  try {
+    const col = await resolveCollection();
+    if (!col) return false;
+    const url = HOST + col + encodeURIComponent(uid) + ".ics";
+    const r = await fetch(url, { method: "DELETE", headers: { Authorization: authHeader() } });
+    return r.status >= 200 && r.status < 300;
+  } catch (e) {
+    console.error("[CalDAV] delete fallito:", e.message);
+    return false;
+  }
+}
+var HOST, cachedCollection;
+var init_caldav = __esm({
+  "server/caldav.ts"() {
+    "use strict";
+    HOST = "https://caldav.icloud.com";
+    cachedCollection = null;
+  }
+});
+
 // server/sse.ts
 function addSSEClient(res) {
   const id = Date.now().toString() + Math.random().toString(36).substr(2, 9);
@@ -25390,6 +25529,22 @@ Confermato il ${(/* @__PURE__ */ new Date()).toLocaleString("it-IT", { timeZone:
     calOk = r.success;
   }
   markAppointmentConfirmed(appt.id);
+  if (appleEnabled()) {
+    try {
+      await mirrorToApple({
+        uid: appt.event_id || `cruscotto-appt-${appt.id}`,
+        summary: `\u2705 ${appt.reason || "Appuntamento"} \u2014 ${appt.contact_name || appt.phone}`,
+        description: `Appuntamento confermato.
+Cliente: ${appt.contact_name || ""} (${appt.phone})
+Motivo: ${appt.reason || "-"}`,
+        date: appt.date,
+        start: appt.start,
+        end: appt.end || void 0
+      });
+    } catch (e) {
+      console.error("[CalDAV] mirror conferma:", e.message);
+    }
+  }
   if (opts.notify) {
     const esito = calOk ? "Agenda aggiornata (evento confermato)." : appt.event_id ? "\u26A0\uFE0F Non sono riuscito ad aggiornare l'evento in agenda: aggiornalo a mano." : "\u26A0\uFE0F Aggiorna l'agenda a mano (evento non tracciato).";
     try {
@@ -25415,6 +25570,13 @@ async function cancelAppointmentRow(appt) {
     });
   }
   db_default.prepare(`UPDATE bot_appointments SET status = 'annullato' WHERE id = ?`).run(appt.id);
+  if (appleEnabled()) {
+    try {
+      await deleteFromApple(appt.event_id || `cruscotto-appt-${appt.id}`);
+    } catch (e) {
+      console.error("[CalDAV] mirror disdetta:", e.message);
+    }
+  }
 }
 async function expireAppointmentRow(appt) {
   if (appt.event_id) {
@@ -25430,6 +25592,13 @@ async function expireAppointmentRow(appt) {
     }
   }
   db_default.prepare(`UPDATE bot_appointments SET status = 'scaduto' WHERE id = ?`).run(appt.id);
+  if (appleEnabled()) {
+    try {
+      await deleteFromApple(appt.event_id || `cruscotto-appt-${appt.id}`);
+    } catch (e) {
+      console.error("[CalDAV] mirror scadenza:", e.message);
+    }
+  }
 }
 function getAllAppointments() {
   return db_default.prepare(`SELECT * FROM bot_appointments ORDER BY date DESC, start DESC`).all();
@@ -25586,17 +25755,18 @@ async function runTool(name, input, out, phone) {
   if (name === "get_availability") {
     out.appointmentFlow = true;
     const days = Math.min(Math.max(parseInt(input?.days, 10) || 14, 1), 30);
-    const { slots, calendarChecked } = await getAvailability(days);
+    const { slots, calendarChecked, reopening } = await getAvailability(days);
     if (!slots.length) {
       return `${calendarChecked ? "" : "(agenda non verificata su Calendar) "}NESSUNA disponibilit\xE0 nei prossimi ${days} giorni (agenda piena o chiusura dello studio). NON proporre MAI date o orari a mano. Proponi al cliente la LISTA D'ATTESA: se accetta di essere ricontattato quando si libereranno nuove date, chiama add_to_waitlist con il motivo dell'appuntamento; verr\xE0 ricontattato in automatico su questo stesso canale. Nel frattempo pu\xF2 inviare la documentazione su questa chat o via email.`;
     }
     const txt = formatAvailabilityIT(slots);
     out.offeredSlots = slots.map((s) => `${s.date} ${s.start}`);
-    const iso = slots.slice(0, 12).map((s) => `${s.date} ${s.start}`).join("; ");
-    return `${calendarChecked ? "" : "(agenda non verificata su Calendar) "}Prossime disponibilit\xE0 (da mostrare al cliente):
+    const iso2 = slots.slice(0, 12).map((s) => `${s.date} ${s.start}`).join("; ");
+    const reopenNote = reopening ? "Lo studio \xE8 in CHIUSURA estiva: queste sono le PRIME date utili alla RIAPERTURA. Proponile normalmente al cliente restando nel flusso appuntamento (ricorda comunque la chiusura come da istruzioni), NON offrire la lista d'attesa. " : "";
+    return `${calendarChecked ? "" : "(agenda non verificata su Calendar) "}${reopenNote}Prossime disponibilit\xE0 (da mostrare al cliente):
 ${txt}
 
-Slot con data esatta da usare in propose_booking (date=YYYY-MM-DD, start=HH:MM): ${iso}`;
+Slot con data esatta da usare in propose_booking (date=YYYY-MM-DD, start=HH:MM): ${iso2}`;
   }
   if (name === "check_walkin_now") {
     out.appointmentFlow = true;
@@ -25895,7 +26065,7 @@ Motivo: ${ev.reason}${docBlock}
     startDate: `${ev.date}T${ev.start}:00`,
     endDate: `${ev.date}T${ev.end}:00`
   });
-  recordAppointment({
+  const apptId = recordAppointment({
     phone: key,
     contactName,
     eventId: calendar?.eventId ?? null,
@@ -25904,6 +26074,20 @@ Motivo: ${ev.reason}${docBlock}
     end: ev.end,
     reason: ev.reason
   });
+  if (appleEnabled()) {
+    try {
+      await mirrorToApple({
+        uid: calendar?.eventId || `cruscotto-appt-${apptId}`,
+        summary: `[DA CONFERMARE] ${ev.reason} \u2014 ${contactName || key}`,
+        description: `Proposta dall'${src}. Cliente: ${contactName || ""} (${key})`,
+        date: ev.date,
+        start: ev.start,
+        end: ev.end
+      });
+    } catch (e) {
+      console.error("[CalDAV] mirror proposta:", e.message);
+    }
+  }
   if (docNotes.length) markDocNotesAttached(key);
   return calendar;
 }
@@ -26002,6 +26186,7 @@ var init_chatbot = __esm({
     init_agenda_logic();
     init_zapi();
     init_integrations();
+    init_caldav();
     init_sse();
     init_contacts();
     init_sanitize();
@@ -26504,8 +26689,8 @@ function selectImminentDeadlines(rows, todayISO, withinDays = 7) {
   const limit = addDaysISO(todayISO, withinDays);
   return rows.filter((r) => r.status === "aperto" && !!r.due_date && r.due_date <= limit).map((r) => ({ ...r, overdue: r.due_date < todayISO })).sort((a, b) => a.due_date.localeCompare(b.due_date));
 }
-function addDaysISO(iso, days) {
-  const [y, m, d] = iso.split("-").map((n) => parseInt(n, 10));
+function addDaysISO(iso2, days) {
+  const [y, m, d] = iso2.split("-").map((n) => parseInt(n, 10));
   const t = Date.UTC(y, m - 1, d) + days * 864e5;
   const dt = new Date(t);
   return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, "0")}-${String(dt.getUTCDate()).padStart(2, "0")}`;
@@ -100799,6 +100984,7 @@ async function pollAccount(acc) {
     auth: { user: acc.user, pass: acc.pass },
     logger: false
   });
+  client.on("error", (e) => console.error(`[Email] IMAP error ${acc.name}:`, e?.message || e));
   let stored = 0;
   await client.connect();
   try {
@@ -101204,9 +101390,9 @@ var init_agenda_source = __esm({
 });
 
 // server/agenda_notify_logic.ts
-function wallTime(iso) {
-  if (!iso || iso.length < 16) return "";
-  return iso.slice(11, 16);
+function wallTime(iso2) {
+  if (!iso2 || iso2.length < 16) return "";
+  return iso2.slice(11, 16);
 }
 function timeRangeLabel(it) {
   if (it.allDay || !it.startISO) return "tutto il giorno";
@@ -101279,9 +101465,9 @@ function digestDecision(p) {
   if (p.romeHour < p.targetHour + p.catchupHours) return { due: true, status: "due" };
   return { due: false, status: "missed" };
 }
-function dateFullITfromISO(iso) {
-  const [y, m, d] = iso.split("-").map((n) => parseInt(n, 10));
-  if (!y || !m || !d) return iso;
+function dateFullITfromISO(iso2) {
+  const [y, m, d] = iso2.split("-").map((n) => parseInt(n, 10));
+  if (!y || !m || !d) return iso2;
   const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
   return `${DOW_IT3[dow]} ${d} ${MON_IT[m - 1]} ${y}`;
 }
@@ -101348,15 +101534,15 @@ function clampInt(v, lo, hi, def) {
 }
 function romeNow2() {
   const now = /* @__PURE__ */ new Date();
-  const iso = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Rome" }).format(now);
+  const iso2 = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Rome" }).format(now);
   const hh = new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Rome", hour: "2-digit", minute: "2-digit", hour12: false }).format(now);
   const [hour, minute] = hh.split(":").map((n) => parseInt(n, 10));
   const wd = new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Rome", weekday: "short" }).format(now);
   const dow = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(wd);
-  return { iso, hour, minute, dow };
+  return { iso: iso2, hour, minute, dow };
 }
-function romeMidnightMs(iso) {
-  return Date.parse(`${iso}T00:00:00${romeOffset2(iso)}`);
+function romeMidnightMs(iso2) {
+  return Date.parse(`${iso2}T00:00:00${romeOffset2(iso2)}`);
 }
 function channelReady(nowMs) {
   return nowMs >= chNextAttemptMs;
@@ -101408,7 +101594,7 @@ function sentReminderKeys() {
   }
 }
 async function runAgendaDigest(opts = {}) {
-  const { iso, hour, dow } = romeNow2();
+  const { iso: iso2, hour, dow } = romeNow2();
   setSetting3("agenda_digest_last_run_at", (/* @__PURE__ */ new Date()).toISOString());
   if (!opts.force && !opts.test) {
     if (!agendaDigestEnabled()) return { sent: false, reason: "disabled" };
@@ -101419,38 +101605,38 @@ async function runAgendaDigest(opts = {}) {
       catchupHours: digestCatchupHours(),
       weekendsEnabled: digestWeekends(),
       lastSentDate: getSetting3("agenda_digest_last_sent_date", ""),
-      todayDate: iso
+      todayDate: iso2
     });
     if (!dec.due) return { sent: false, status: dec.status };
     if (Date.now() - BOOT_MS < DIGEST_BOOT_GRACE_MS && hour >= digestHour()) {
       return { sent: false, status: "boot-grace" };
     }
   }
-  const agenda = await getTodayAgenda(iso);
-  const { text, count: count2 } = composeAgendaDigest({ items: agenda.items, dateFullIT: dateFullITfromISO(iso), test: !!opts.test });
+  const agenda = await getTodayAgenda(iso2);
+  const { text, count: count2 } = composeAgendaDigest({ items: agenda.items, dateFullIT: dateFullITfromISO(iso2), test: !!opts.test });
   const r = await sendToControl(text);
   if (!r.ok) {
     setSetting3("agenda_digest_last_status", `send-failed:${r.reason}`);
     return { sent: false, error: r.reason, count: count2, source: agenda.source };
   }
   if (opts.test) {
-    setSetting3("agenda_digest_last_sent_date", iso);
+    setSetting3("agenda_digest_last_sent_date", iso2);
     setSetting3("agenda_digest_last_status", "sent-test");
-    recordNotify("digest-test", `digest-test:${iso}:${Date.now()}`, getControlNumber(), `agenda ${iso} (test)`, text);
+    recordNotify("digest-test", `digest-test:${iso2}:${Date.now()}`, getControlNumber(), `agenda ${iso2} (test)`, text);
   } else {
-    setSetting3("agenda_digest_last_sent_date", iso);
+    setSetting3("agenda_digest_last_sent_date", iso2);
     setSetting3("agenda_digest_last_status", "sent");
-    recordNotify("digest", `digest:${iso}`, getControlNumber(), `agenda ${iso}`, text);
+    recordNotify("digest", `digest:${iso2}`, getControlNumber(), `agenda ${iso2}`, text);
   }
-  console.log(`[AgendaNotify] Digest ${iso} inviato a Mariano (${count2} appuntamenti, fonte ${agenda.source}${opts.test ? ", TEST" : ""}).`);
+  console.log(`[AgendaNotify] Digest ${iso2} inviato a Mariano (${count2} appuntamenti, fonte ${agenda.source}${opts.test ? ", TEST" : ""}).`);
   return { sent: true, count: count2, source: agenda.source, googleOk: agenda.googleOk, test: !!opts.test };
 }
 async function runAgendaReminders(opts = {}) {
   setSetting3("agenda_reminders_last_run_at", (/* @__PURE__ */ new Date()).toISOString());
   if (!opts.force && !agendaRemindersEnabled()) return { sent: 0, reason: "disabled" };
   const nowMs = Date.now();
-  const iso = romeToday();
-  const agenda = await getTodayAgenda(iso);
+  const iso2 = romeToday();
+  const agenda = await getTodayAgenda(iso2);
   const lead = reminderLeadMin();
   const already = sentReminderKeys();
   const due = selectDueReminders(agenda.items, nowMs, lead, already);
@@ -101494,16 +101680,16 @@ function startAgendaNotifier() {
   }, 20 * 1e3);
   console.log(`[AgendaNotify] Scheduler avviato (digest ${digestHour()}:00 Rome ogni giorno${digestWeekends() ? " incl. weekend" : " feriali"} + reminder T-${reminderLeadMin()}, tick 60s).`);
 }
-function remindersSentToday(iso) {
+function remindersSentToday(iso2) {
   try {
-    const since = new Date(romeMidnightMs(iso)).toISOString();
+    const since = new Date(romeMidnightMs(iso2)).toISOString();
     return db_default.prepare(`SELECT COUNT(*) c FROM agenda_notify_log WHERE kind = 'reminder' AND created_at >= ?`).get(since)?.c || 0;
   } catch {
     return 0;
   }
 }
 function getAgendaJobsHealth() {
-  const { iso, hour, dow } = romeNow2();
+  const { iso: iso2, hour, dow } = romeNow2();
   const tickAt = getSetting3("agenda_tick_last_at", "");
   const tickMs = tickAt ? Date.parse(tickAt) : NaN;
   const tickAgeSec = isNaN(tickMs) ? null : Math.round((Date.now() - tickMs) / 1e3);
@@ -101517,7 +101703,7 @@ function getAgendaJobsHealth() {
     catchupHours: digestCatchupHours(),
     weekendsEnabled: digestWeekends(),
     lastSentDate: lastSent,
-    todayDate: iso
+    todayDate: iso2
   });
   let dStatus = "ok";
   let dDetail = "";
@@ -101554,10 +101740,10 @@ function getAgendaJobsHealth() {
     rDetail = "disattivato (agenda_reminders=0)";
   } else {
     rStatus = "ok";
-    rDetail = `loop attivo (tick ${tickAgeSec}s fa), reminder inviati oggi: ${remindersSentToday(iso)}`;
+    rDetail = `loop attivo (tick ${tickAgeSec}s fa), reminder inviati oggi: ${remindersSentToday(iso2)}`;
   }
   const digest = { name: "agendaDigest", status: dStatus, detail: dDetail, lastSentDate: lastSent, targetHour: digestHour(), weekends: digestWeekends(), lastRunAt: getSetting3("agenda_digest_last_run_at", "") || null, lastStatus: getSetting3("agenda_digest_last_status", "") || null };
-  const reminders = { name: "agendaReminder", status: rStatus, detail: rDetail, lastTickAt: tickAt || null, tickAgeSec, leadMin: reminderLeadMin(), sentToday: remindersSentToday(iso) };
+  const reminders = { name: "agendaReminder", status: rStatus, detail: rDetail, lastTickAt: tickAt || null, tickAgeSec, leadMin: reminderLeadMin(), sentToday: remindersSentToday(iso2) };
   return {
     items: [{ name: "agendaDigest", status: dStatus, detail: dDetail }, { name: "agendaReminder", status: rStatus, detail: rDetail }],
     digest,
@@ -101565,11 +101751,11 @@ function getAgendaJobsHealth() {
   };
 }
 async function getAgendaTodayPreview() {
-  const iso = romeToday();
-  const agenda = await getTodayAgenda(iso);
-  const { text, count: count2 } = composeAgendaDigest({ items: agenda.items, dateFullIT: dateFullITfromISO(iso), test: false });
+  const iso2 = romeToday();
+  const agenda = await getTodayAgenda(iso2);
+  const { text, count: count2 } = composeAgendaDigest({ items: agenda.items, dateFullIT: dateFullITfromISO(iso2), test: false });
   return {
-    date: iso,
+    date: iso2,
     source: agenda.source,
     googleConfigured: agenda.googleConfigured,
     googleOk: agenda.googleOk,
@@ -101730,10 +101916,10 @@ function selectCounterpartyPec(text, ownUser, senderAddr) {
     return true;
   });
 }
-function formatDateIT2(iso) {
-  if (!iso) return "";
-  const m = String(iso).match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  return m ? `${m[3]}/${m[2]}/${m[1]}` : String(iso);
+function formatDateIT2(iso2) {
+  if (!iso2) return "";
+  const m = String(iso2).match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  return m ? `${m[3]}/${m[2]}/${m[1]}` : String(iso2);
 }
 function composeNotificaText(input) {
   const nAnno = (input.sentenceRef || "\u2026/\u2026").replace(/^n\.?\s*/i, "");
@@ -101753,8 +101939,8 @@ var init_pec_logic = __esm({
 });
 
 // server/pec_terms.ts
-function isoToUTC(iso) {
-  const [y, m, d] = iso.split("-").map(Number);
+function isoToUTC(iso2) {
+  const [y, m, d] = iso2.split("-").map(Number);
   return Date.UTC(y, m - 1, d);
 }
 function pad(n) {
@@ -101829,8 +102015,8 @@ function computeRecoveryDeadline(baseDateISO, days = 60, importo) {
     uncertain: true
   };
 }
-function addMonths(iso, months) {
-  const [y, m, d] = iso.split("-").map(Number);
+function addMonths(iso2, months) {
+  const [y, m, d] = iso2.split("-").map(Number);
   let nm = m - 1 + months;
   const ny = y + Math.floor(nm / 12);
   nm = (nm % 12 + 12) % 12;
@@ -102240,6 +102426,7 @@ async function pollPec(force = false) {
   if (!pecEnabled()) return { enabled: false, processed: 0, created: 0, error: "PEC non configurata (mancano PEC_USER/PEC_PASS)" };
   const c = pecConfig();
   const client = new import_imapflow2.ImapFlow({ host: c.host, port: c.port, secure: true, auth: { user: c.user, pass: c.pass }, logger: false });
+  client.on("error", (e) => console.error("[PEC] IMAP error:", e?.message || e));
   let processed = 0, created = 0;
   try {
     await client.connect();
@@ -102293,6 +102480,7 @@ async function backscanPec(months = 2) {
   const sinceISO = since.toISOString().slice(0, 10);
   const c = pecConfig();
   const client = new import_imapflow2.ImapFlow({ host: c.host, port: c.port, secure: true, auth: { user: c.user, pass: c.pass }, logger: false });
+  client.on("error", (e) => console.error("[PEC] IMAP error:", e?.message || e));
   let scanned = 0, created = 0;
   try {
     await client.connect();
@@ -102536,7 +102724,8 @@ var init_transcription = __esm({
 // server/index.ts
 var server_exports = {};
 __export(server_exports, {
-  default: () => server_default
+  default: () => server_default,
+  getLastUncaught: () => getLastUncaught
 });
 module.exports = __toCommonJS(server_exports);
 var import_express2 = __toESM(require_express2(), 1);
@@ -107206,8 +107395,8 @@ function inSlaWindow(hour) {
 }
 function sqliteToMs(s) {
   if (!s) return NaN;
-  const iso = s.includes("T") ? s : `${s.replace(" ", "T")}Z`;
-  return Date.parse(iso);
+  const iso2 = s.includes("T") ? s : `${s.replace(" ", "T")}Z`;
+  return Date.parse(iso2);
 }
 function isTooFresh(createdAt, nowMs) {
   const t = sqliteToMs(createdAt);
@@ -107279,8 +107468,8 @@ function slaAlertText(drafts, emails, sogliaOre) {
 // server/aging_logic.ts
 function parseTs(s) {
   if (!s) return NaN;
-  const iso = s.includes("T") ? s : s.replace(" ", "T") + (s.length <= 19 ? "Z" : "");
-  const t = Date.parse(iso);
+  const iso2 = s.includes("T") ? s : s.replace(" ", "T") + (s.length <= 19 ? "Z" : "");
+  const t = Date.parse(iso2);
   return isNaN(t) ? Date.parse(s) : t;
 }
 function ageHours(created_at, nowMs) {
@@ -107416,16 +107605,16 @@ async function runReminders(force = false) {
 }
 async function runWaitlistRecall(force = false) {
   if (!waitlistRecallEnabled()) return { notified: 0 };
-  const { iso, hour } = romeNow();
+  const { iso: iso2, hour } = romeNow();
   if (!force) {
     if (!inRecallWindow(hour)) return { notified: 0 };
-    if (getSetting2(`waitlist_recall_done_${iso}`, "") === "1") return { notified: 0 };
+    if (getSetting2(`waitlist_recall_done_${iso2}`, "") === "1") return { notified: 0 };
   }
   const pending = getWaitlist("in_attesa");
   if (!pending.length) return { notified: 0 };
   const { slots } = await getAvailability(14);
   if (!slots.length) return { notified: 0 };
-  setSetting2(`waitlist_recall_done_${iso}`, "1");
+  setSetting2(`waitlist_recall_done_${iso2}`, "1");
   const avail = formatAvailabilityIT(slots);
   let notified = 0;
   for (const w of pending.slice(0, 10)) {
@@ -107520,17 +107709,17 @@ function overdueProposedAppointments(todayISO) {
 }
 async function runDraftAging(force = false) {
   if (!draftAgingEnabled()) return { alerted: 0 };
-  const { iso, hour } = romeNow();
+  const { iso: iso2, hour } = romeNow();
   if (!force) {
     if (hour < 8 || hour > 21) return { alerted: 0 };
-    if (getSetting2(`draft_aging_done_${iso}`, "") === "1") return { alerted: 0 };
+    if (getSetting2(`draft_aging_done_${iso2}`, "") === "1") return { alerted: 0 };
   }
   const opts = agingOpts();
   const drafts = db_default.prepare(`SELECT id, phone, contact_name, needs_human, created_at FROM bot_drafts WHERE status = 'pending'`).all();
   const sel = selectAgingDrafts(drafts, Date.now(), opts);
-  const overdue = overdueProposedAppointments(iso);
+  const overdue = overdueProposedAppointments(iso2);
   if (!sel.count && !overdue.length) {
-    if (!force) setSetting2(`draft_aging_done_${iso}`, "1");
+    if (!force) setSetting2(`draft_aging_done_${iso2}`, "1");
     return { alerted: 0 };
   }
   const text = agingDigestText(sel, overdue, opts);
@@ -107540,39 +107729,39 @@ async function runDraftAging(force = false) {
     console.error("[Reminders] alert aging fallito:", e.message);
     return { alerted: 0 };
   }
-  if (!force) setSetting2(`draft_aging_done_${iso}`, "1");
+  if (!force) setSetting2(`draft_aging_done_${iso2}`, "1");
   console.log(`[Reminders] Aging bozze: ${sel.urgent.length} urgenti + ${sel.normal.length} normali + ${overdue.length} appuntamenti da confermare scaduti.`);
   return { alerted: sel.count + overdue.length };
 }
 function getAgingView() {
   const opts = agingOpts();
-  const { iso } = romeNow();
+  const { iso: iso2 } = romeNow();
   const drafts = db_default.prepare(`SELECT id, phone, contact_name, needs_human, created_at FROM bot_drafts WHERE status = 'pending'`).all();
   const sel = selectAgingDrafts(drafts, Date.now(), opts);
-  return { opts, ...sel, overdueAppointments: overdueProposedAppointments(iso), totalPending: drafts.length };
+  return { opts, ...sel, overdueAppointments: overdueProposedAppointments(iso2), totalPending: drafts.length };
 }
 function briefingEnabled() {
   return getSetting2("bot_briefing", "1") === "1";
 }
 var DOW_ITB = ["domenica", "luned\xEC", "marted\xEC", "mercoled\xEC", "gioved\xEC", "venerd\xEC", "sabato"];
 var MON_ITB = ["gennaio", "febbraio", "marzo", "aprile", "maggio", "giugno", "luglio", "agosto", "settembre", "ottobre", "novembre", "dicembre"];
-function dateITfromISO(iso) {
-  const [y, m, d] = iso.split("-").map((n) => parseInt(n, 10));
+function dateITfromISO(iso2) {
+  const [y, m, d] = iso2.split("-").map((n) => parseInt(n, 10));
   const dow = new Date(Date.UTC(y, m - 1, d)).getUTCDay();
   return `${DOW_ITB[dow]} ${d} ${MON_ITB[m - 1]}`;
 }
 function getBriefingData() {
-  const { iso } = romeNow();
+  const { iso: iso2 } = romeNow();
   const appts = getAllAppointments();
   const sel = selectAgingDrafts(
     db_default.prepare(`SELECT id, phone, contact_name, needs_human, created_at FROM bot_drafts WHERE status = 'pending'`).all(),
     Date.now(),
     agingOpts()
   );
-  const today = appts.filter((a) => a.date === iso && ["da_confermare", "confermato"].includes(a.status)).sort((a, b) => String(a.start).localeCompare(String(b.start))).map((a) => ({ start: a.start, who: a.contact_name || a.phone, reason: a.reason, status: a.status }));
+  const today = appts.filter((a) => a.date === iso2 && ["da_confermare", "confermato"].includes(a.status)).sort((a, b) => String(a.start).localeCompare(String(b.start))).map((a) => ({ start: a.start, who: a.contact_name || a.phone, reason: a.reason, status: a.status }));
   const pendingOutcome = selectPendingOutcome(
     appts.map((a) => ({ id: a.id, date: a.date, status: a.status, outcome: a.outcome })),
-    iso
+    iso2
   );
   const pendWho = pendingOutcome.map((p) => {
     const full = appts.find((a) => a.id === p.id);
@@ -107586,7 +107775,7 @@ function getBriefingData() {
   } catch {
   }
   return {
-    dateIT: dateITfromISO(iso),
+    dateIT: dateITfromISO(iso2),
     urgentDrafts: sel.urgent.map((u) => ({ id: u.id, who: u.who, ageH: u.ageH })),
     todayAppointments: today,
     pendingOutcome: pendWho,
@@ -107595,14 +107784,14 @@ function getBriefingData() {
 }
 async function runMorningBriefing(force = false) {
   if (!briefingEnabled()) return { sent: false, empty: true };
-  const { iso, hour } = romeNow();
+  const { iso: iso2, hour } = romeNow();
   if (!force) {
     if (hour < 7 || hour >= 9) return { sent: false, empty: false };
-    if (getSetting2(`briefing_done_${iso}`, "") === "1") return { sent: false, empty: false };
+    if (getSetting2(`briefing_done_${iso2}`, "") === "1") return { sent: false, empty: false };
   }
   const { text, empty } = composeBriefing(getBriefingData());
   if (!force && empty) {
-    setSetting2(`briefing_done_${iso}`, "1");
+    setSetting2(`briefing_done_${iso2}`, "1");
     return { sent: false, empty: true };
   }
   try {
@@ -107611,7 +107800,7 @@ async function runMorningBriefing(force = false) {
     console.error("[Reminders] briefing fallito:", e.message);
     return { sent: false, empty };
   }
-  if (!force) setSetting2(`briefing_done_${iso}`, "1");
+  if (!force) setSetting2(`briefing_done_${iso2}`, "1");
   console.log("[Reminders] Briefing del mattino inviato al numero di controllo.");
   return { sent: true, empty };
 }
@@ -107652,15 +107841,15 @@ function deadlineWindowDays() {
 }
 async function runDeadlineReminders(force = false) {
   if (!deadlineRemindersEnabled()) return { alerted: 0 };
-  const { iso, hour } = romeNow();
+  const { iso: iso2, hour } = romeNow();
   if (!force) {
     if (hour < 8 || hour >= 20) return { alerted: 0 };
-    if (getSetting2(`deadlines_done_${iso}`, "") === "1") return { alerted: 0 };
+    if (getSetting2(`deadlines_done_${iso2}`, "") === "1") return { alerted: 0 };
   }
-  const list = getImminentDeadlines(iso, deadlineWindowDays());
+  const list = getImminentDeadlines(iso2, deadlineWindowDays());
   const { text, empty } = composeDeadlineDigest(list);
   if (empty) {
-    if (!force) setSetting2(`deadlines_done_${iso}`, "1");
+    if (!force) setSetting2(`deadlines_done_${iso2}`, "1");
     return { alerted: 0 };
   }
   try {
@@ -107669,7 +107858,7 @@ async function runDeadlineReminders(force = false) {
     console.error("[Reminders] scadenze fallito:", e.message);
     return { alerted: 0 };
   }
-  if (!force) setSetting2(`deadlines_done_${iso}`, "1");
+  if (!force) setSetting2(`deadlines_done_${iso2}`, "1");
   console.log(`[Reminders] Scadenzario: ${list.length} adempiment${list.length === 1 ? "o" : "i"} imminent${list.length === 1 ? "e" : "i"}/scadut${list.length === 1 ? "o" : "i"}.`);
   return { alerted: list.length };
 }
@@ -107762,11 +107951,11 @@ function setSetting5(key, value) {
 }
 function romeNow3() {
   const now = /* @__PURE__ */ new Date();
-  const iso = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Rome" }).format(now);
+  const iso2 = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Rome" }).format(now);
   const hour = parseInt(new Intl.DateTimeFormat("en-GB", { timeZone: "Europe/Rome", hour: "2-digit", hour12: false }).format(now), 10);
   const wd = new Intl.DateTimeFormat("en-US", { timeZone: "Europe/Rome", weekday: "short" }).format(now);
   const dow = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(wd);
-  return { iso, hour, dow };
+  return { iso: iso2, hour, dow };
 }
 function isBusinessHours() {
   const { hour, dow } = romeNow3();
@@ -107917,6 +108106,14 @@ async function runSelfCheck() {
   } catch (e) {
     items.push({ name: "agendaJobs", status: "error", detail: `modulo non valutabile: ${e.message}` });
   }
+  try {
+    const ap = await Promise.resolve().then(() => (init_appointments(), appointments_exports));
+    const av = await ap.getAvailability(30);
+    if (av.slots.length) items.push({ name: "appuntamenti", status: "ok", detail: `${av.slots.length} slot${av.reopening ? " (prime date di RIAPERTURA, oltre chiusura estiva)" : ""}, primo ${av.slots[0].date} ${av.slots[0].start}` });
+    else items.push({ name: "appuntamenti", status: "warn", detail: "nessuno slot entro il cap: verificare chiusura/agenda" });
+  } catch (e) {
+    items.push({ name: "appuntamenti", status: "error", detail: `modulo non valutabile: ${e.message}` });
+  }
   const at = (/* @__PURE__ */ new Date()).toISOString();
   const issues = items.filter((i) => i.status !== "ok").length;
   setSetting5("selfcheck_last", JSON.stringify({ at, items, issues }));
@@ -107998,13 +108195,13 @@ function startMaintenance() {
   }, 5e3);
   const tick = async () => {
     try {
-      const { iso, hour } = romeNow3();
-      if (hour >= 20 && getSetting5(`digest_done_${iso}`) !== "1") {
-        const r = await runDailyDigest(iso);
-        console.log(`[Digest] ${iso}: ${r.ok ? `evento aggiornato (${r.total} msg)` : `errore: ${r.error}`}`);
+      const { iso: iso2, hour } = romeNow3();
+      if (hour >= 20 && getSetting5(`digest_done_${iso2}`) !== "1") {
+        const r = await runDailyDigest(iso2);
+        console.log(`[Digest] ${iso2}: ${r.ok ? `evento aggiornato (${r.total} msg)` : `errore: ${r.error}`}`);
       }
-      if (hour >= 3 && hour < 6 && getSetting5(`selfcheck_done_${iso}`) !== "1") {
-        setSetting5(`selfcheck_done_${iso}`, "1");
+      if (hour >= 3 && hour < 6 && getSetting5(`selfcheck_done_${iso2}`) !== "1") {
+        setSetting5(`selfcheck_done_${iso2}`, "1");
         await runSelfCheck();
       }
       await watchdogTick();
@@ -108168,6 +108365,305 @@ function getSentLogSummary(sinceISO) {
 init_emaildrafts();
 init_email();
 init_chatbot();
+
+// server/appointment_bridge.ts
+init_db();
+
+// server/appt_nlp.ts
+var MONTHS = {
+  gennaio: 1,
+  febbraio: 2,
+  marzo: 3,
+  aprile: 4,
+  maggio: 5,
+  giugno: 6,
+  luglio: 7,
+  agosto: 8,
+  settembre: 9,
+  ottobre: 10,
+  novembre: 11,
+  dicembre: 12,
+  gen: 1,
+  feb: 2,
+  mar: 3,
+  apr: 4,
+  mag: 5,
+  giu: 6,
+  lug: 7,
+  ago: 8,
+  set: 9,
+  sett: 9,
+  ott: 10,
+  nov: 11,
+  dic: 12
+};
+var WEEKDAYS = {
+  // 0=domenica … 6=sabato (come getDay)
+  domenica: 0,
+  lunedi: 1,
+  "luned\xEC": 1,
+  martedi: 2,
+  "marted\xEC": 2,
+  mercoledi: 3,
+  "mercoled\xEC": 3,
+  giovedi: 4,
+  "gioved\xEC": 4,
+  venerdi: 5,
+  "venerd\xEC": 5,
+  sabato: 6
+};
+function norm2(s) {
+  return (s || "").toLowerCase().replace(/[’`]/g, "'").trim();
+}
+function detectApptIntent(text) {
+  const t = norm2(text);
+  if (!t) return null;
+  if (/\b(annull|disd|cancell|niente appuntament|non se ne fa|salta l'appunt|salti?amo l'appunt)/.test(t)) return "cancel";
+  if (/\b(conferm|va bene|va benissimo|d'accordo|daccordo|ci vediamo|ci sentiamo|perfetto|procediamo|fissi?amo|fissa(lo)?|blocca(lo)?|prenot|metti in agenda|segna(lo)? in agenda|ci sto|ok(ay)?\b|okey|👍|✅)/.test(t)) return "confirm";
+  return null;
+}
+function iso(y, m, d) {
+  return `${y.toString().padStart(4, "0")}-${m.toString().padStart(2, "0")}-${d.toString().padStart(2, "0")}`;
+}
+function extractDateTimeIT(text, now) {
+  const t = norm2(text).replace(/\ball['e ]?/g, "alle ");
+  const out = {};
+  const y0 = now.getFullYear(), m0 = now.getMonth() + 1, d0 = now.getDate();
+  if (/mezzogiorno/.test(t)) out.time = "12:00";
+  else if (/mezzanotte/.test(t)) out.time = "00:00";
+  else {
+    const tm = t.match(/(?:\balle\b|\bore\b|\bh\b|\ba\b)\s*(\d{1,2})(?:[:.,](\d{2}))?/) || t.match(/\b(\d{1,2})[:.](\d{2})\b/);
+    if (tm) {
+      let hh = parseInt(tm[1], 10);
+      const mm = tm[2] ? parseInt(tm[2], 10) : 0;
+      if (hh <= 23 && mm <= 59) {
+        const pm = /pomeriggio|sera|del pome|di sera/.test(t);
+        const am = /mattin|di matt/.test(t);
+        if (pm && hh >= 1 && hh <= 7) hh += 12;
+        else if (!pm && !am && hh >= 1 && hh <= 7) {
+          hh += 12;
+          out.ambiguousTime = true;
+        }
+        out.time = `${hh.toString().padStart(2, "0")}:${mm.toString().padStart(2, "0")}`;
+      }
+    }
+  }
+  const setDate = (y, m, d) => {
+    out.date = iso(y, m, d);
+  };
+  if (/\boggi\b/.test(t)) setDate(y0, m0, d0);
+  else if (/dopodomani/.test(t)) {
+    const dd = new Date(now);
+    dd.setDate(dd.getDate() + 2);
+    setDate(dd.getFullYear(), dd.getMonth() + 1, dd.getDate());
+  } else if (/\bdomani\b/.test(t)) {
+    const dd = new Date(now);
+    dd.setDate(dd.getDate() + 1);
+    setDate(dd.getFullYear(), dd.getMonth() + 1, dd.getDate());
+  }
+  if (!out.date) {
+    const dm = t.match(/\b(\d{1,2})(?:\s*(?:°|º))?\s*(?:di\s+)?(gennaio|febbraio|marzo|aprile|maggio|giugno|luglio|agosto|settembre|ottobre|novembre|dicembre|gen|feb|mar|apr|mag|giu|lug|ago|sett?|ott|nov|dic)\b(?:\s+(\d{4}))?/);
+    if (dm) {
+      const d = parseInt(dm[1], 10);
+      const m = MONTHS[dm[2]];
+      let y = dm[3] ? parseInt(dm[3], 10) : y0;
+      if (!dm[3] && (m < m0 || m === m0 && d < d0)) y = y0 + 1;
+      if (d >= 1 && d <= 31 && m >= 1 && m <= 12) setDate(y, m, d);
+    }
+  }
+  if (!out.date) {
+    const dn = t.match(/\b(\d{1,2})[\/\-.](\d{1,2})(?:[\/\-.](\d{2,4}))?\b/);
+    if (dn) {
+      const d = parseInt(dn[1], 10), m = parseInt(dn[2], 10);
+      let y = dn[3] ? parseInt(dn[3], 10) : y0;
+      if (y < 100) y += 2e3;
+      if (!dn[3] && (m < m0 || m === m0 && d < d0)) y = y0 + 1;
+      if (d >= 1 && d <= 31 && m >= 1 && m <= 12) setDate(y, m, d);
+    }
+  }
+  if (!out.date) {
+    const wd = t.match(/\b(domenica|luned[iì]|marted[iì]|mercoled[iì]|gioved[iì]|venerd[iì]|sabato)(\s+prossim[oa])?/);
+    if (wd) {
+      const target = WEEKDAYS[wd[1]];
+      const forceNext = !!wd[2];
+      const dd = new Date(now);
+      let delta = (target - dd.getDay() + 7) % 7;
+      if (forceNext) delta += 7;
+      dd.setDate(dd.getDate() + delta);
+      setDate(dd.getFullYear(), dd.getMonth() + 1, dd.getDate());
+    }
+  }
+  return out;
+}
+
+// server/appointment_bridge.ts
+init_integrations();
+init_caldav();
+init_chatbot();
+init_zapi();
+function getSetting6(key, def) {
+  try {
+    const r = db.prepare(`SELECT value FROM app_settings WHERE key = ?`).get(key);
+    return r?.value ?? def;
+  } catch {
+    return def;
+  }
+}
+function setSetting6(key, value) {
+  try {
+    db.prepare(`INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`).run(key, value);
+  } catch {
+  }
+}
+function isConfirmFromRepliesEnabled() {
+  return getSetting6("bot_confirm_from_replies", "1") === "1";
+}
+function getBridgeHealth() {
+  const ok = (() => {
+    try {
+      return JSON.parse(getSetting6("bridge_last_ok", ""));
+    } catch {
+      return null;
+    }
+  })();
+  const err = (() => {
+    try {
+      return JSON.parse(getSetting6("bridge_last_err", ""));
+    } catch {
+      return null;
+    }
+  })();
+  return { enabled: isConfirmFromRepliesEnabled(), appleMirror: appleEnabled(), lastOk: ok, lastError: err };
+}
+function recordOk(detail) {
+  setSetting6("bridge_last_ok", JSON.stringify({ at: (/* @__PURE__ */ new Date()).toISOString(), ...detail }));
+}
+function recordErr(detail) {
+  setSetting6("bridge_last_err", JSON.stringify({ at: (/* @__PURE__ */ new Date()).toISOString(), ...detail }));
+}
+function endTime2(start) {
+  const [h, m] = start.split(":").map((x) => parseInt(x, 10));
+  return `${String((h + 1) % 24).padStart(2, "0")}:${String(m || 0).padStart(2, "0")}`;
+}
+function nowRome() {
+  const s = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Rome", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(/* @__PURE__ */ new Date());
+  const g = (t) => Number(s.find((p) => p.type === t)?.value);
+  return new Date(g("year"), g("month") - 1, g("day"), g("hour"), g("minute"), 0);
+}
+function contactNameOf(phone) {
+  try {
+    const c = db.prepare(`SELECT contact_name FROM conversations WHERE phone = ?`).get(phone);
+    return c?.contact_name || phone;
+  } catch {
+    return phone;
+  }
+}
+async function notifyControl(msg) {
+  try {
+    await sendTextMessage(getControlNumber(), msg);
+  } catch (e) {
+    console.error("[Ponte] notifica controllo:", e.message);
+  }
+}
+function apptUid(appt) {
+  return appt.event_id || `cruscotto-appt-${appt.id}`;
+}
+async function handleControlAppointmentReply(clientPhone, text) {
+  if (!isConfirmFromRepliesEnabled()) return null;
+  const intent = detectApptIntent(text);
+  if (!intent) return null;
+  const cname = contactNameOf(clientPhone);
+  const pending = getPendingAppointment(clientPhone);
+  const actives = getActiveFutureAppointments(clientPhone);
+  const dt = extractDateTimeIT(text, nowRome());
+  try {
+    if (intent === "cancel") {
+      if (!actives.length) return null;
+      for (const a of actives) {
+        try {
+          await cancelAppointmentRow(a);
+          if (appleEnabled()) await deleteFromApple(apptUid(a));
+        } catch (e) {
+          console.error("[Ponte] disdetta:", e.message);
+        }
+      }
+      const f = actives[0];
+      recordOk({ action: "cancel", phone: clientPhone, date: f.date, start: f.start });
+      return `\u274C Disdetta registrata in agenda per ${cname}:
+\u{1F4C5} ${f.date} ore ${f.start} \u2014 ${f.reason || "Appuntamento"}${appleEnabled() ? " (Google + Apple)" : ""}.`;
+    }
+    const hasDate = !!dt.date;
+    const target = pending || actives[0] || null;
+    if (target) {
+      const newDate = dt.date || target.date;
+      const newStart = dt.time || target.start;
+      const newEnd = endTime2(newStart);
+      const moved = newDate !== target.date || newStart !== target.start;
+      const title = `\u2705 ${target.reason || "Appuntamento"} \u2014 ${cname}`;
+      const desc = `Appuntamento CONFERMATO dallo studio.
+Cliente: ${cname} (${clientPhone})
+Motivo: ${target.reason || "-"}
+Confermato il ${(/* @__PURE__ */ new Date()).toLocaleString("it-IT", { timeZone: "Europe/Rome" })}.`;
+      let calOk = false;
+      if (target.event_id) {
+        const r = await updateCalendarEvent({ eventId: target.event_id, title, description: desc, colorId: "10", startDate: `${newDate}T${newStart}:00`, endDate: `${newDate}T${newEnd}:00` });
+        calOk = r.success;
+      } else {
+        const r = await createCalendarEvent({ title, description: desc, startDate: `${newDate}T${newStart}:00`, endDate: `${newDate}T${newEnd}:00` });
+        if (r.success && r.eventId) {
+          try {
+            db.prepare(`UPDATE bot_appointments SET event_id = ? WHERE id = ?`).run(r.eventId, target.id);
+            target.event_id = r.eventId;
+          } catch {
+          }
+        }
+        calOk = r.success;
+      }
+      try {
+        db.prepare(`UPDATE bot_appointments SET date = ?, start = ?, end = ?, status = 'confermato', confirmed_at = datetime('now') WHERE id = ?`).run(newDate, newStart, newEnd, target.id);
+      } catch {
+      }
+      let appleOk = false;
+      if (appleEnabled()) appleOk = await mirrorToApple({ uid: apptUid(target), summary: title, description: desc, date: newDate, start: newStart, end: newEnd });
+      recordOk({ action: moved ? "confirm+move" : "confirm", phone: clientPhone, date: newDate, start: newStart, calOk, appleOk });
+      const esito = calOk ? "Agenda Google aggiornata (confermato)" : "\u26A0\uFE0F NON sono riuscito ad aggiornare Google: controlla a mano";
+      const ap = appleEnabled() ? appleOk ? " + Apple ok" : " + \u26A0\uFE0F Apple fallito" : "";
+      return `\u2705 ${cname} \u2014 appuntamento ${moved ? "SPOSTATO e " : ""}CONFERMATO:
+\u{1F4C5} ${newDate} ore ${newStart} \u2014 ${target.reason || "Appuntamento"}
+${esito}${ap}.`;
+    }
+    if (hasDate && dt.time) {
+      const reason = "Appuntamento";
+      const newEnd = endTime2(dt.time);
+      const title = `\u2705 ${reason} \u2014 ${cname}`;
+      const desc = `Appuntamento CONFERMATO dallo studio (da risposta WhatsApp).
+Cliente: ${cname} (${clientPhone})
+Creato il ${(/* @__PURE__ */ new Date()).toLocaleString("it-IT", { timeZone: "Europe/Rome" })}.`;
+      const r = await createCalendarEvent({ title, description: desc, startDate: `${dt.date}T${dt.time}:00`, endDate: `${dt.date}T${newEnd}:00` });
+      const id = recordAppointment({ phone: clientPhone, contactName: cname, eventId: r.eventId ?? null, date: dt.date, start: dt.time, end: newEnd, reason });
+      markAppointmentConfirmed(id);
+      let appleOk = false;
+      if (appleEnabled()) appleOk = await mirrorToApple({ uid: r.eventId || `cruscotto-appt-${id}`, summary: title, description: desc, date: dt.date, start: dt.time, end: newEnd });
+      recordOk({ action: "create-confirmed", phone: clientPhone, date: dt.date, start: dt.time, calOk: r.success, appleOk });
+      const ap = appleEnabled() ? appleOk ? " + Apple ok" : " + \u26A0\uFE0F Apple fallito" : "";
+      return `\u2705 ${cname} \u2014 nuovo appuntamento CONFERMATO in agenda:
+\u{1F4C5} ${dt.date} ore ${dt.time} \u2014 ${reason}
+${r.success ? "Google ok" : "\u26A0\uFE0F Google fallito"}${ap}.`;
+    }
+    if (hasDate && !dt.time) {
+      recordErr({ action: "ambiguo-ora", phone: clientPhone, date: dt.date, text: text.slice(0, 120) });
+      return `\u26A0\uFE0F ${cname}: ho letto una conferma per il ${dt.date} ma SENZA orario e non c'\xE8 una proposta in sospeso. Non ho creato nulla per non sbagliare l'ora: rispondi indicando l'ora (es. "alle 15") e la segno.`;
+    }
+    return null;
+  } catch (e) {
+    recordErr({ action: "exception", phone: clientPhone, error: e.message });
+    console.error("[Ponte] errore:", e.message);
+    await notifyControl(`\u26A0\uFE0F Ponte agenda: errore nel processare la conferma per ${cname}: ${e.message}. Controlla l'appuntamento a mano.`);
+    return null;
+  }
+}
+
+// server/routes.ts
 init_agenda_logic();
 
 // server/practices.ts
@@ -108271,7 +108767,7 @@ try {
   console.error("[Repair] Errore riparazione timestamp:", e);
 }
 router.get("/version", (_req, res) => {
-  res.json({ version: "2.18.2", built: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ version: "2.19.0", built: (/* @__PURE__ */ new Date()).toISOString() });
 });
 router.post("/site/lead", (req, res) => siteLead(req, res));
 router.get("/site/availability", (req, res) => siteAvailability(req, res));
@@ -108305,11 +108801,21 @@ router.get("/selftest", (_req, res) => {
     const items = Array.isArray(base.items) ? base.items.slice() : [];
     const live = h.items;
     const merged = items.filter((i) => !live.some((l) => l.name === i.name)).concat(live);
-    base.items = merged;
-    base.issues = merged.filter((i) => i.status !== "ok").length;
+    try {
+      const bh = getBridgeHealth();
+      const errAt = bh.lastError?.at || "";
+      const okAt = bh.lastOk?.at || "";
+      const bad = !!errAt && errAt > okAt && bh.lastError?.action !== "ambiguo-ora";
+      const detail = !bh.enabled ? "disattivato" : bad ? `ultimo errore: ${bh.lastError?.action || "?"}` : (bh.lastOk ? `ultimo: ${bh.lastOk.action} ${bh.lastOk.date || ""}` : "nessuna conferma ancora") + (bh.appleMirror ? " [Apple ON]" : "");
+      const bridgeItem = { name: "calendarBridge", status: bad ? "error" : "ok", detail };
+      base.items = merged.filter((i) => i.name !== "calendarBridge").concat([bridgeItem]);
+    } catch {
+      base.items = merged;
+    }
+    base.issues = base.items.filter((i) => i.status !== "ok").length;
   } catch {
   }
-  res.json({ ...base, agendaJobs: agenda });
+  res.json({ ...base, agendaJobs: agenda, calendarBridge: getBridgeHealth() });
 });
 router.post("/selftest", async (_req, res) => {
   try {
@@ -109138,10 +109644,16 @@ Da confermare.`,
     if (!isGroup && content && content.trim().length > 2) {
       const fromControl = fromMe || phone === getControlNumber();
       if (fromControl) {
+        const replyText = content.replace(/^🎤\s*/, "");
         setImmediate(async () => {
           try {
-            const reply = await handleControlCommand(content);
-            if (reply) await sendTextMessage(getControlNumber(), reply);
+            const reply = await handleControlCommand(replyText);
+            if (reply) {
+              await sendTextMessage(getControlNumber(), reply);
+              return;
+            }
+            const bridge = await handleControlAppointmentReply(phone, replyText);
+            if (bridge) await sendTextMessage(getControlNumber(), bridge);
           } catch (e) {
             console.error("[Chatbot] Comando controllo:", e.message);
           }
@@ -109968,18 +110480,18 @@ router.post("/bot/backfill-digest", async (req, res) => {
   for (let i = 0; i <= days; i++) {
     const d = new Date(today);
     d.setDate(today.getDate() - i);
-    const iso = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Rome" }).format(d);
+    const iso2 = new Intl.DateTimeFormat("en-CA", { timeZone: "Europe/Rome" }).format(d);
     try {
-      const r = await runDailyDigest(iso);
-      if (r.ok && r.total > 0) written.push({ date: iso, total: r.total });
+      const r = await runDailyDigest(iso2);
+      if (r.ok && r.total > 0) written.push({ date: iso2, total: r.total });
     } catch (e) {
-      written.push({ date: iso, error: e.message });
+      written.push({ date: iso2, error: e.message });
     }
   }
   res.json({ daysScanned: days + 1, eventsWritten: written.length, days: written });
 });
 router.get("/bot/flow-health", (_req, res) => {
-  res.json({ ...getFlowHealth(), agendaJobs: getAgendaJobsHealth() });
+  res.json({ ...getFlowHealth(), agendaJobs: getAgendaJobsHealth(), calendarBridge: getBridgeHealth() });
 });
 router.get("/bot/agenda/today", async (_req, res) => {
   try {
@@ -110038,6 +110550,17 @@ router.post("/bot/repair-webhook", async (_req, res) => {
 var routes_default = router;
 
 // server/index.ts
+var lastUncaught = null;
+process.on("uncaughtException", (err) => {
+  lastUncaught = { at: (/* @__PURE__ */ new Date()).toISOString(), msg: err?.message || String(err) };
+  console.error("[GUARD] uncaughtException (processo MANTENUTO vivo):", err?.stack || err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[GUARD] unhandledRejection:", reason?.stack || reason?.message || reason);
+});
+function getLastUncaught() {
+  return lastUncaught;
+}
 var app = (0, import_express2.default)();
 var PORT = process.env.PORT || 5e3;
 app.use(import_express2.default.json({ limit: "10mb" }));
@@ -110083,6 +110606,10 @@ app.listen(PORT, () => {
   }, 5e3);
 });
 var server_default = app;
+// Annotate the CommonJS export names for ESM import in node:
+0 && (module.exports = {
+  getLastUncaught
+});
 /*! Bundled license information:
 
 depd/index.js:

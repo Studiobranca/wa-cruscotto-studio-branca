@@ -15,6 +15,7 @@ import { getAvailability, formatAvailabilityIT, isSlotBusy, getNowStatus, format
 import { shouldBlockSlot } from './agenda_logic.js';
 import { sendTextMessage } from './zapi.js';
 import { createCalendarEvent, updateCalendarEvent, appendEventDescription } from './integrations.js';
+import { mirrorToApple, deleteFromApple, appleEnabled } from './caldav.js';
 import { broadcastEvent } from './sse.js';
 import { resolveIdentities, isVipContact } from './contacts.js';
 import { sanitizeClientText, type SanitizeResult } from './sanitize.js';
@@ -228,6 +229,16 @@ export async function confirmAppointmentRow(appt: any, opts: { notify?: boolean 
     calOk = r.success;
   }
   markAppointmentConfirmed(appt.id);
+  if (appleEnabled()) {
+    try {
+      await mirrorToApple({
+        uid: appt.event_id || `cruscotto-appt-${appt.id}`,
+        summary: `✅ ${appt.reason || 'Appuntamento'} — ${appt.contact_name || appt.phone}`,
+        description: `Appuntamento confermato.\nCliente: ${appt.contact_name || ''} (${appt.phone})\nMotivo: ${appt.reason || '-'}`,
+        date: appt.date, start: appt.start, end: appt.end || undefined,
+      });
+    } catch (e: any) { console.error('[CalDAV] mirror conferma:', e.message); }
+  }
   if (opts.notify) {
     const esito = calOk
       ? 'Agenda aggiornata (evento confermato).'
@@ -253,6 +264,7 @@ export async function cancelAppointmentRow(appt: any): Promise<void> {
     });
   }
   db.prepare(`UPDATE bot_appointments SET status = 'annullato' WHERE id = ?`).run(appt.id);
+  if (appleEnabled()) { try { await deleteFromApple(appt.event_id || `cruscotto-appt-${appt.id}`); } catch (e: any) { console.error('[CalDAV] mirror disdetta:', e.message); } }
 }
 
 /** Fa SCADERE una proposta [DA CONFERMARE] mai confermata: aggiorna l'evento Calendar a
@@ -269,6 +281,7 @@ export async function expireAppointmentRow(appt: any): Promise<void> {
     } catch (e: any) { console.error('[Chatbot] scadenza evento Calendar:', e.message); }
   }
   db.prepare(`UPDATE bot_appointments SET status = 'scaduto' WHERE id = ?`).run(appt.id);
+  if (appleEnabled()) { try { await deleteFromApple(appt.event_id || `cruscotto-appt-${appt.id}`); } catch (e: any) { console.error('[CalDAV] mirror scadenza:', e.message); } }
 }
 
 /** Righe appuntamento (per job/endpoint agenda). */
@@ -1158,10 +1171,20 @@ export async function materializeProposedEvent(
     startDate: `${ev.date}T${ev.start}:00`,
     endDate: `${ev.date}T${ev.end}:00`,
   });
-  recordAppointment({
+  const apptId = recordAppointment({
     phone: key, contactName, eventId: calendar?.eventId ?? null,
     date: ev.date, start: ev.start, end: ev.end, reason: ev.reason,
   });
+  if (appleEnabled()) {
+    try {
+      await mirrorToApple({
+        uid: calendar?.eventId || `cruscotto-appt-${apptId}`,
+        summary: `[DA CONFERMARE] ${ev.reason} — ${contactName || key}`,
+        description: `Proposta dall'${src}. Cliente: ${contactName || ''} (${key})`,
+        date: ev.date, start: ev.start, end: ev.end,
+      });
+    } catch (e: any) { console.error('[CalDAV] mirror proposta:', e.message); }
+  }
   if (docNotes.length) markDocNotesAttached(key);
   return calendar;
 }

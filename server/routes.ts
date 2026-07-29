@@ -62,6 +62,7 @@ import { recordBotSend, getSentLog, getSentLogSummary } from './sentlog.js';
 import { getEmailDrafts, getEmailSentLog, getEmailSentSummary, saveEmailDraft } from './emaildrafts.js';
 import { approveEmailDraft, rejectEmailDraft } from './email.js';
 import { getAllAppointments, setAppointmentOutcome, getAppointmentRow } from './chatbot.js';
+import { handleControlAppointmentReply, getBridgeHealth } from './appointment_bridge.js';
 import { selectPendingOutcome, isValidOutcome } from './agenda_logic.js';
 import { createChecklist, getChecklist, getChecklistGrouped, markDocReceived, buildDocRequestText } from './practices.js';
 import { smsStatus } from './sms.js';
@@ -93,7 +94,7 @@ try {
 
 // ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: '2.18.2', built: new Date().toISOString() });
+  res.json({ version: '2.19.0', built: new Date().toISOString() });
 });
 
 // ─── Endpoint pubblici per il SITO (studiotributariobranca.eu) ───────────────
@@ -138,10 +139,20 @@ router.get('/selftest', (_req: Request, res: Response) => {
     // Sostituisci eventuali voci stantie con quelle LIVE.
     const live = h.items;
     const merged = items.filter((i: any) => !live.some((l) => l.name === i.name)).concat(live);
-    base.items = merged;
-    base.issues = merged.filter((i: any) => i.status !== 'ok').length;
+    // Item LIVE del PONTE conferma→agenda: 'error' se l'ultimo errore è più recente
+    // dell'ultimo esito ok (così un guasto di scrittura Calendar emerge nel selftest).
+    try {
+      const bh = getBridgeHealth();
+      const errAt = bh.lastError?.at || '';
+      const okAt = bh.lastOk?.at || '';
+      const bad = !!errAt && errAt > okAt && bh.lastError?.action !== 'ambiguo-ora';
+      const detail = !bh.enabled ? 'disattivato' : bad ? `ultimo errore: ${bh.lastError?.action || '?'}` : (bh.lastOk ? `ultimo: ${bh.lastOk.action} ${bh.lastOk.date || ''}` : 'nessuna conferma ancora') + (bh.appleMirror ? ' [Apple ON]' : '');
+      const bridgeItem = { name: 'calendarBridge', status: bad ? 'error' : 'ok', detail };
+      base.items = merged.filter((i: any) => i.name !== 'calendarBridge').concat([bridgeItem]);
+    } catch { base.items = merged; }
+    base.issues = base.items.filter((i: any) => i.status !== 'ok').length;
   } catch { /* best-effort */ }
-  res.json({ ...base, agendaJobs: agenda });
+  res.json({ ...base, agendaJobs: agenda, calendarBridge: getBridgeHealth() });
 });
 router.post('/selftest', async (_req: Request, res: Response) => {
   try { res.json(await runSelfCheck()); }
@@ -1055,10 +1066,18 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
     if (!isGroup && content && content.trim().length > 2) {
       const fromControl = fromMe || phone === getControlNumber();
       if (fromControl) {
+        // Il testo del vocale è GIÀ trascritto in `content` (🎤 …) a questo punto,
+        // quindi anche le conferme a voce di Mariano vengono lette. Prima i comandi
+        // RIGIDI (OK/NO <id>); se non lo è, il PONTE conferma→agenda legge la
+        // risposta in linguaggio naturale (conferma/spostamento/disdetta) e
+        // aggiorna Google (+ Apple se abilitato). Non invia mai nulla al cliente.
+        const replyText = content.replace(/^🎤\s*/, '');
         setImmediate(async () => {
           try {
-            const reply = await handleControlCommand(content);
-            if (reply) await sendTextMessage(getControlNumber(), reply);
+            const reply = await handleControlCommand(replyText);
+            if (reply) { await sendTextMessage(getControlNumber(), reply); return; }
+            const bridge = await handleControlAppointmentReply(phone, replyText);
+            if (bridge) await sendTextMessage(getControlNumber(), bridge);
           } catch (e: any) { console.error('[Chatbot] Comando controllo:', e.message); }
         });
       }
@@ -1975,7 +1994,7 @@ router.post('/bot/backfill-digest', async (req: Request, res: Response) => {
 router.get('/bot/flow-health', (_req: Request, res: Response) => {
   // Salute del flusso messaggi + salute dei DUE job d'agenda (digest 08:00 / reminder T-10):
   // se lo scheduler dedicato muore, tickAgeSec cresce e lo stato passa a 'error' (anti "verde ma morto").
-  res.json({ ...getFlowHealth(), agendaJobs: getAgendaJobsHealth() });
+  res.json({ ...getFlowHealth(), agendaJobs: getAgendaJobsHealth(), calendarBridge: getBridgeHealth() });
 });
 
 // ─── AGENDA DI OGGI: anteprima (sola lettura, NESSUN invio) ──────────────────
