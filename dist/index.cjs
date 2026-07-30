@@ -107236,7 +107236,9 @@ function startPolling(intervalMs = 3e4) {
     return;
   }
   console.log(`[Polling] Starting with interval ${intervalMs}ms`);
-  runPollingCycle();
+  const primoRitardoMs = Number(process.env.POLL_FIRST_DELAY_MS) || 9e4;
+  setTimeout(runPollingCycle, primoRitardoMs);
+  console.log(`[Polling] primo ciclo differito di ${primoRitardoMs}ms (health check prima di tutto)`);
   pollingInterval = setInterval(runPollingCycle, intervalMs);
 }
 function stopPolling() {
@@ -108570,6 +108572,7 @@ function apptUid(appt) {
 }
 async function handleControlAppointmentReply(clientPhone, text) {
   if (!isConfirmFromRepliesEnabled()) return null;
+  if (String(clientPhone).replace(/\D/g, "") === getControlNumber()) return null;
   const intent = detectApptIntent(text);
   if (!intent) return null;
   const cname = contactNameOf(clientPhone);
@@ -109384,10 +109387,31 @@ router.delete("/conversations/:phone", (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+var WEBHOOK_VERBOSE = process.env.WEBHOOK_VERBOSE === "1";
+var _webhookCount = 0;
 router.post("/webhook/message", async (req, res) => {
   try {
     const body = req.body;
-    console.log("[Webhook] Received:", JSON.stringify(body).substring(0, 200));
+    _webhookCount++;
+    try {
+      const _drain = db_default.prepare(`SELECT value FROM app_settings WHERE key = 'webhook_drain'`).get()?.value;
+      if (_drain === "1") return res.json({ drained: true });
+    } catch {
+    }
+    if (WEBHOOK_VERBOSE) {
+      console.log("[Webhook] Received:", JSON.stringify(body).substring(0, 200));
+    } else if (_webhookCount % 100 === 0) {
+      console.log(`[Webhook] ricevuti ${_webhookCount} messaggi (log di dettaglio: WEBHOOK_VERBOSE=1)`);
+    }
+    {
+      const _t0 = String(body.type || "").toLowerCase();
+      const _ph0 = String(body.phone || body.sender || "");
+      const _isStatus = body.isStatusReply === true || _t0 === "deliverycallback" || _t0 === "readcallback" || _t0 === "messagestatuscallback" || _t0 === "statuscallback";
+      const _isNews = body.isNewsletter === true || _ph0.includes("@newsletter");
+      if (_isStatus || _isNews) {
+        return res.json({ ignored: true, reason: _isNews ? "newsletter" : "status", shed: true });
+      }
+    }
     const phone = body.phone || body.sender || "";
     const senderName = body.senderName || body.pushName || "";
     const text = body.text?.message || body.body || body.text || "";
@@ -109403,7 +109427,9 @@ router.post("/webhook/message", async (req, res) => {
     const imageUrl = body.image?.imageUrl || body.image?.url || body.image?.mediaUrl || body.imageUrl || null;
     const isImage = msgType === "image" || msgType === "imagemessage" || !!imageUrl;
     const caption = body.image?.caption || body.caption || "";
-    console.log(`[Webhook] type=${msgType} isAudio=${isAudio} isImage=${isImage} audioUrl=${audioUrl?.substring(0, 60)} imageUrl=${imageUrl?.substring(0, 60)} body.keys=${Object.keys(body).join(",")}`);
+    if (WEBHOOK_VERBOSE) {
+      console.log(`[Webhook] type=${msgType} isAudio=${isAudio} isImage=${isImage} audioUrl=${audioUrl?.substring(0, 60)} imageUrl=${imageUrl?.substring(0, 60)} body.keys=${Object.keys(body).join(",")}`);
+    }
     if (phone && phone.includes("@newsletter")) {
       return res.json({ ignored: true, reason: "newsletter" });
     }

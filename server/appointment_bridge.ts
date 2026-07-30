@@ -67,6 +67,10 @@ function apptUid(appt: any): string { return appt.event_id || `cruscotto-appt-${
  */
 export async function handleControlAppointmentReply(clientPhone: string, text: string): Promise<string | null> {
   if (!isConfirmFromRepliesEnabled()) return null;
+  // Guardia: NON agire quando la "conversazione" è col numero di controllo stesso
+  // (messaggi/note di Mariano verso il proprio numero, o echi di servizio): non è un
+  // cliente, non ci sono appuntamenti da confermare lì. Evita conferme spurie.
+  if (String(clientPhone).replace(/\D/g, '') === getControlNumber()) return null;
   const intent = detectApptIntent(text);
   if (!intent) return null;
 

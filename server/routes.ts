@@ -750,10 +750,54 @@ router.delete('/conversations/:phone', (req: Request, res: Response) => {
 
 // ─── Webhook ──────────────────────────────────────────────────────────────────
 
+// INCIDENTE 29/07/2026 — ogni webhook produceva 2 righe di log corpose. Con un
+// picco di traffico si supera il limite Railway di 500 log/sec per replica
+// ("Messages dropped: 2054"): il processo resta impantanato nel logging, non
+// risponde piu' a /api/health e Railway restituisce 502. Il watchdog fa
+// `railway redeploy` (stesso codice) → riparte → risatura: loop, servizio giu'
+// ~50 minuti. Il logging di dettaglio dei webhook e' quindi OPT-IN.
+const WEBHOOK_VERBOSE = process.env.WEBHOOK_VERBOSE === '1';
+let _webhookCount = 0;
+
 router.post('/webhook/message', async (req: Request, res: Response) => {
   try {
     const body = req.body;
-    console.log('[Webhook] Received:', JSON.stringify(body).substring(0, 200));
+    _webhookCount++;
+    // ─── DRAIN switch (DB-flag `webhook_drain`, togglabile SENZA redeploy) ────
+    // Se attivo: 200 immediato e stop, PRIMA di ogni lavoro. Serve a DRENARE un
+    // backlog Z-API (es. dopo un downtime) senza saturare l'event loop: Z-API
+    // riceve 200 e smette di ri-consegnare, il loop resta libero e /api/health
+    // risponde. Una sola SELECT su app_settings (tabella piccola, chiave) → costo
+    // trascurabile. Default OFF; si riaccende il processing normale mettendolo a 0.
+    try {
+      const _drain = (db.prepare(`SELECT value FROM app_settings WHERE key = 'webhook_drain'`).get() as any)?.value;
+      if (_drain === '1') return res.json({ drained: true });
+    } catch { /* se la tabella non è pronta, prosegui normalmente */ }
+    if (WEBHOOK_VERBOSE) {
+      console.log('[Webhook] Received:', JSON.stringify(body).substring(0, 200));
+    } else if (_webhookCount % 100 === 0) {
+      // battito: conferma che i webhook arrivano, senza inondare i log
+      console.log(`[Webhook] ricevuti ${_webhookCount} messaggi (log di dettaglio: WEBHOOK_VERBOSE=1)`);
+    }
+
+    // ─── SHED anti-flood (hardening 29/07/2026) ───────────────────────────────
+    // Scarta SUBITO — prima di qualsiasi lavoro pesante/DB — i webhook a basso
+    // valore: NEWSLETTER e RICEVUTE DI STATO (delivery/read/status). In un flood
+    // (es. backlog Z-API riversato dopo un downtime) questi dominano il volume e,
+    // processati in sincrono con better-sqlite3, bloccano l'event loop → /api/health
+    // non risponde → Railway riavvia → loop. Sono messaggi che NON vanno né loggati
+    // né gestiti: rispondi 200 e ritorna, così il loop resta libero per l'healthcheck
+    // e per i messaggi VERI dei clienti. (Non tocca i 'receivedcallback' reali.)
+    {
+      const _t0 = String(body.type || '').toLowerCase();
+      const _ph0 = String(body.phone || body.sender || '');
+      const _isStatus = body.isStatusReply === true || _t0 === 'deliverycallback'
+        || _t0 === 'readcallback' || _t0 === 'messagestatuscallback' || _t0 === 'statuscallback';
+      const _isNews = body.isNewsletter === true || _ph0.includes('@newsletter');
+      if (_isStatus || _isNews) {
+        return res.json({ ignored: true, reason: _isNews ? 'newsletter' : 'status', shed: true });
+      }
+    }
 
     // Extract fields
     const phone = body.phone || body.sender || '';
@@ -778,7 +822,9 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
     const imageUrl = body.image?.imageUrl || body.image?.url || body.image?.mediaUrl || body.imageUrl || null;
     const isImage = msgType === 'image' || msgType === 'imagemessage' || !!imageUrl;
     const caption = body.image?.caption || body.caption || '';
-    console.log(`[Webhook] type=${msgType} isAudio=${isAudio} isImage=${isImage} audioUrl=${audioUrl?.substring(0,60)} imageUrl=${imageUrl?.substring(0,60)} body.keys=${Object.keys(body).join(',')}`);
+    if (WEBHOOK_VERBOSE) {
+      console.log(`[Webhook] type=${msgType} isAudio=${isAudio} isImage=${isImage} audioUrl=${audioUrl?.substring(0,60)} imageUrl=${imageUrl?.substring(0,60)} body.keys=${Object.keys(body).join(',')}`);
+    }
 
     // Ignora solo newsletter
     if (phone && phone.includes('@newsletter')) {
