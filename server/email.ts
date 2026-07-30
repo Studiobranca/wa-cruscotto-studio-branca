@@ -30,6 +30,7 @@ import { generateReplyCore, materializeProposedEvent, getControlNumber, sendStud
 import { sendTextMessage } from './zapi.js';
 import * as contacts from './contacts.js';
 import { decideWorkAutoSend } from './autosend.js';
+import { dateCoherenceIssue } from './date_guard.js';
 import { saveEmailDraft, recordEmailSend, getEmailDraft, markEmailDraftSent, markEmailDraftRejected } from './emaildrafts.js';
 
 db.exec(`
@@ -303,6 +304,16 @@ async function maybeAutoReply(acc: MailAccount, row: {
   }
   if (san.changed) { res.draftText = san.clean; }
 
+  // GUARDIA COERENZA DATA/TESTO (incidente 13/07): data nel testo incoerente con
+  // l'appuntamento registrato/confermato → bozza, mai auto-invio col giorno sbagliato.
+  for (const evd of [res.proposedEvent?.date, res.confirmedEvent?.date]) {
+    const issue = evd ? dateCoherenceIssue(res.draftText, evd) : null;
+    if (issue) {
+      console.warn(`[DateGuard] Email ${fromAddr}: ${issue} → bozza.`);
+      return draftIt(true, true, 'Guardia date: giorno/data nel testo incoerente con l\'appuntamento registrato.');
+    }
+  }
+
   // DECISIONE: in autonomia SOLO il flusso appuntamenti; ogni altra risposta (merito,
   // conferme documenti non-appuntamento) → BOZZA. Fail-safe verso la bozza.
   const decision = decideWorkAutoSend({
@@ -390,6 +401,11 @@ async function pollAccount(acc: MailAccount): Promise<number> {
     host: acc.host, port: acc.port, secure: true,
     auth: { user: acc.user, pass: acc.pass }, logger: false,
   });
+  // INCIDENTE 27-28/07 (v2.18.3): ImapFlow emette un 'error' event asincrono (es. durante
+  // close()/perdita connessione: "Failed to receive greeting" → NoConnection) FUORI dalla
+  // catena await. Senza un listener, Node lancia uncaughtException e abbatte l'INTERO processo
+  // (webhook WhatsApp incluso → 502). Un handler 'error' rende l'evento innocuo.
+  client.on('error', (e: any) => console.error(`[Email] IMAP error ${acc.name}:`, e?.message || e));
   let stored = 0;
   await client.connect();
   try {

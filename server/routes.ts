@@ -1,8 +1,9 @@
 import { Router, Request, Response } from 'express';
-import fs from 'fs';
-import path from 'path';
 import db from './db.js';
 import { getAvailability, formatAvailabilityIT, isSlotBusy } from './appointments.js';
+import { dateCoherenceIssue } from './date_guard.js';
+import { siteLead, siteAvailability, siteBookingRequest, getSiteLeads, deleteSiteLead, cleanupTestLeads } from './site.js';
+import { makeInbound, makeStatus, notifyMake } from './make.js';
 import { sendTextMessage, syncContacts, zapiGet, getReceivedWebhook } from './zapi.js';
 import { addSSEClient, broadcastEvent, getClientCount } from './sse.js';
 import { startPolling, stopPolling, isPollingRunning } from './polling.js';
@@ -52,6 +53,7 @@ import {
 } from './chatbot.js';
 import { runDailyDigest, getFlowHealth, repairWebhook, runSelfCheck, getLastSelfCheck, getMonitorStatus, runMonitoring } from './maintenance.js';
 import { runReminders, runWaitlistRecall, runSlaCheck, getRemindersStatus, runDraftAging, getAgingView, runAppointmentCleanup, getBriefingData, runMorningBriefing, runDeadlineReminders } from './reminders.js';
+import { runAgendaDigest, runAgendaReminders, getAgendaJobsHealth, getAgendaTodayPreview } from './agenda_notify.js';
 import { createDeadline, listDeadlines, completeDeadline, deleteDeadline, getImminentDeadlines } from './deadlines.js';
 import { composeBriefing } from './briefing_logic.js';
 import { summarizeConversation } from './summary.js';
@@ -60,9 +62,15 @@ import { recordBotSend, getSentLog, getSentLogSummary } from './sentlog.js';
 import { getEmailDrafts, getEmailSentLog, getEmailSentSummary, saveEmailDraft } from './emaildrafts.js';
 import { approveEmailDraft, rejectEmailDraft } from './email.js';
 import { getAllAppointments, setAppointmentOutcome, getAppointmentRow } from './chatbot.js';
+import { handleControlAppointmentReply, getBridgeHealth } from './appointment_bridge.js';
 import { selectPendingOutcome, isValidOutcome } from './agenda_logic.js';
 import { createChecklist, getChecklist, getChecklistGrouped, markDocReceived, buildDocRequestText } from './practices.js';
 import { smsStatus } from './sms.js';
+import { getPecEvents, getPecStatus, pollPec, getNotifiche, sendNotifica, pecAutosendNotifica,
+  backscanPec, getBackscanStatus, getNotificheCounts, approveAllNotifiche } from './pec.js';
+import { classifyPec, extractDates, extractHearingDate, extractRG, extractHearingLink, classifyOutcome, extractLiquidatedAmount,
+  hasSentenceNotification, extractSentenceRef, extractOrgano, extractSentenceDate, selectCounterpartyPec, formatDateIT, composeNotificaText } from './pec_logic.js';
+import { computeDeadlinesFromEvent, computeRecoveryDeadline, computeAppealDeadline } from './pec_terms.js';
 
 const router = Router();
 
@@ -84,26 +92,67 @@ try {
   console.error('[Repair] Errore riparazione timestamp:', e);
 }
 
-// ─── Version ────────────────────────────────────────────────────────────────
-// NOTA (fix bug drift versione): la versione veniva prima hardcodata a mano qui
-// e si disallineava silenziosamente da quella realmente deployata. Ora viene
-// letta da package.json, che è la SINGOLA fonte di verità — aggiornare SOLO lì.
-function getAppVersion(): string {
-  try {
-    const pkgRaw = fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf-8');
-    return JSON.parse(pkgRaw).version || '0.0.0';
-  } catch (e) {
-    console.error('[version] impossibile leggere package.json:', e);
-    return '0.0.0';
-  }
-}
+// ─── Version ─────────────────────────────────────────────────────────────────
 router.get('/version', (_req: Request, res: Response) => {
-  res.json({ version: getAppVersion(), built: new Date().toISOString() });
+  res.json({ version: '2.19.0', built: new Date().toISOString() });
 });
+
+// ─── Endpoint pubblici per il SITO (studiotributariobranca.eu) ───────────────
+// Conformi all'invariante: lead → alert allo studio (mai risposta al cliente);
+// booking → appuntamento PENDING "da_confermare" (mai auto-confermato).
+router.post('/site/lead', (req: Request, res: Response) => siteLead(req, res));
+router.get('/site/availability', (req: Request, res: Response) => siteAvailability(req, res));
+router.post('/site/booking-request', (req: Request, res: Response) => siteBookingRequest(req, res));
+router.get('/site/leads', (req: Request, res: Response) => {
+  try { res.json({ ok: true, leads: getSiteLeads(req.query.status ? String(req.query.status) : undefined) }); }
+  catch (err: any) { res.status(500).json({ ok: false, error: err.message }); }
+});
+// Elimina un singolo lead del sito per id (usato dal Cruscotto per pulizia/gestione).
+router.delete('/site/leads/:id', (req: Request, res: Response) => {
+  try {
+    const id = parseInt(String(req.params.id), 10);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ ok: false, error: 'id non valido' });
+    const removed = deleteSiteLead(id);
+    if (!removed) return res.status(404).json({ ok: false, error: 'lead non trovato' });
+    res.json({ ok: true, deleted: removed, id });
+  } catch (err: any) { res.status(500).json({ ok: false, error: err.message }); }
+});
+
+// ─── Integrazione Make.com (HUB automazioni) ─────────────────────────────────
+// INBOUND: eventi Calendar (created/updated/canceled) veicolati da Make → aggiorna
+// SOLO lo stato locale + PREPARA bozza (mai auto-invio al cliente; nessuna scrittura
+// su Calendar → no loop con la sync nativa). Attivo solo con MAKE_SHARED_SECRET.
+router.post('/integrations/make/inbound', (req: Request, res: Response) => makeInbound(req, res));
+router.get('/integrations/make/status', (req: Request, res: Response) => makeStatus(req, res));
 
 // ─── Autocheck (self-test + autocorrezione) ──────────────────────────────────
 router.get('/selftest', (_req: Request, res: Response) => {
-  res.json(getLastSelfCheck() || { note: 'mai eseguito' });
+  // Base: ultimo autocheck notturno (invarianti). In più, salute LIVE dei due job
+  // d'agenda (digest 08:00 / reminder T-10), così post-deploy si vedono subito come 'ok'
+  // e, se il loro scheduler muore, EMERGONO come 'error' senza attendere la notte.
+  const base = getLastSelfCheck() || { note: 'mai eseguito', items: [] };
+  let agenda: any = null;
+  try {
+    const h = getAgendaJobsHealth();
+    agenda = h;
+    const items = Array.isArray(base.items) ? base.items.slice() : [];
+    // Sostituisci eventuali voci stantie con quelle LIVE.
+    const live = h.items;
+    const merged = items.filter((i: any) => !live.some((l) => l.name === i.name)).concat(live);
+    // Item LIVE del PONTE conferma→agenda: 'error' se l'ultimo errore è più recente
+    // dell'ultimo esito ok (così un guasto di scrittura Calendar emerge nel selftest).
+    try {
+      const bh = getBridgeHealth();
+      const errAt = bh.lastError?.at || '';
+      const okAt = bh.lastOk?.at || '';
+      const bad = !!errAt && errAt > okAt && bh.lastError?.action !== 'ambiguo-ora';
+      const detail = !bh.enabled ? 'disattivato' : bad ? `ultimo errore: ${bh.lastError?.action || '?'}` : (bh.lastOk ? `ultimo: ${bh.lastOk.action} ${bh.lastOk.date || ''}` : 'nessuna conferma ancora') + (bh.appleMirror ? ' [Apple ON]' : '');
+      const bridgeItem = { name: 'calendarBridge', status: bad ? 'error' : 'ok', detail };
+      base.items = merged.filter((i: any) => i.name !== 'calendarBridge').concat([bridgeItem]);
+    } catch { base.items = merged; }
+    base.issues = base.items.filter((i: any) => i.status !== 'ok').length;
+  } catch { /* best-effort */ }
+  res.json({ ...base, agendaJobs: agenda, calendarBridge: getBridgeHealth() });
 });
 router.post('/selftest', async (_req: Request, res: Response) => {
   try { res.json(await runSelfCheck()); }
@@ -701,10 +750,94 @@ router.delete('/conversations/:phone', (req: Request, res: Response) => {
 
 // ─── Webhook ──────────────────────────────────────────────────────────────────
 
-router.post('/webhook/message', async (req: Request, res: Response) => {
+// INCIDENTE 29/07/2026 — ogni webhook produceva 2 righe di log corpose. Con un
+// picco di traffico si supera il limite Railway di 500 log/sec per replica
+// ("Messages dropped: 2054"): il processo resta impantanato nel logging, non
+// risponde piu' a /api/health e Railway restituisce 502. Il watchdog fa
+// `railway redeploy` (stesso codice) → riparte → risatura: loop, servizio giu'
+// ~50 minuti. Il logging di dettaglio dei webhook e' quindi OPT-IN.
+const WEBHOOK_VERBOSE = process.env.WEBHOOK_VERBOSE === '1';
+let _webhookCount = 0;
+
+router.post('/webhook/message', (req: Request, res: Response) => {
+  // ASYNC (fix definitivo 30/07): rispondi 200 SUBITO e ACCODA. Il processing
+  // pesante gira nel worker in background con uno yield tra un messaggio e l'altro,
+  // così l'event loop resta SEMPRE libero per /api/health, anche sotto flood
+  // (backlog Z-API dopo un downtime). La coda è LIMITATA (anti-OOM).
+  try { enqueueWebhook(req.body); } catch (e: any) { console.error('[Webhook] enqueue:', e?.message); }
+  return res.json({ queued: true });
+});
+
+// ─── Coda + worker webhook (processing asincrono, non bloccante) ─────────────
+const _webhookQueue: any[] = [];
+const WEBHOOK_QUEUE_MAX = 5000;
+let _webhookDropped = 0;
+let _webhookProcessed = 0;
+let _workerRunning = false;
+function enqueueWebhook(body: any): void {
+  if (_webhookQueue.length >= WEBHOOK_QUEUE_MAX) { _webhookQueue.shift(); _webhookDropped++; }
+  _webhookQueue.push(body);
+  if (!_workerRunning) setImmediate(runWebhookWorker);
+}
+async function runWebhookWorker(): Promise<void> {
+  if (_workerRunning) return;
+  _workerRunning = true;
   try {
-    const body = req.body;
-    console.log('[Webhook] Received:', JSON.stringify(body).substring(0, 200));
+    while (_webhookQueue.length) {
+      const item = _webhookQueue.shift();
+      try { await processInboundWebhook(item); _webhookProcessed++; }
+      catch (e: any) { console.error('[Webhook] worker:', e?.message); }
+      await new Promise((r) => setImmediate(r)); // YIELD: non bloccare mai il loop
+    }
+  } finally { _workerRunning = false; }
+}
+const _whTimer = setInterval(() => { if (_webhookQueue.length && !_workerRunning) runWebhookWorker(); }, 200);
+if ((_whTimer as any).unref) (_whTimer as any).unref();
+export function getWebhookStats() { return { depth: _webhookQueue.length, processed: _webhookProcessed, dropped: _webhookDropped, running: _workerRunning }; }
+
+/** Processing pesante di UN webhook (ex corpo dell'handler). Gira nel worker. */
+async function processInboundWebhook(body: any): Promise<void> {
+  // Shim `res`: il vecchio handler usciva con res.json/res.status; qui sono no-op
+  // (la risposta HTTP è già stata inviata). Un `return res.json(...)` = uscita.
+  const _noop: any = () => _noop;
+  const res: any = { json: _noop, status: () => res, send: _noop, sendStatus: _noop };
+  try {
+    _webhookCount++;
+    // ─── DRAIN switch (DB-flag `webhook_drain`, togglabile SENZA redeploy) ────
+    // Se attivo: 200 immediato e stop, PRIMA di ogni lavoro. Serve a DRENARE un
+    // backlog Z-API (es. dopo un downtime) senza saturare l'event loop: Z-API
+    // riceve 200 e smette di ri-consegnare, il loop resta libero e /api/health
+    // risponde. Una sola SELECT su app_settings (tabella piccola, chiave) → costo
+    // trascurabile. Default OFF; si riaccende il processing normale mettendolo a 0.
+    try {
+      const _drain = (db.prepare(`SELECT value FROM app_settings WHERE key = 'webhook_drain'`).get() as any)?.value;
+      if (_drain === '1') return res.json({ drained: true });
+    } catch { /* se la tabella non è pronta, prosegui normalmente */ }
+    if (WEBHOOK_VERBOSE) {
+      console.log('[Webhook] Received:', JSON.stringify(body).substring(0, 200));
+    } else if (_webhookCount % 100 === 0) {
+      // battito: conferma che i webhook arrivano, senza inondare i log
+      console.log(`[Webhook] ricevuti ${_webhookCount} messaggi (log di dettaglio: WEBHOOK_VERBOSE=1)`);
+    }
+
+    // ─── SHED anti-flood (hardening 29/07/2026) ───────────────────────────────
+    // Scarta SUBITO — prima di qualsiasi lavoro pesante/DB — i webhook a basso
+    // valore: NEWSLETTER e RICEVUTE DI STATO (delivery/read/status). In un flood
+    // (es. backlog Z-API riversato dopo un downtime) questi dominano il volume e,
+    // processati in sincrono con better-sqlite3, bloccano l'event loop → /api/health
+    // non risponde → Railway riavvia → loop. Sono messaggi che NON vanno né loggati
+    // né gestiti: rispondi 200 e ritorna, così il loop resta libero per l'healthcheck
+    // e per i messaggi VERI dei clienti. (Non tocca i 'receivedcallback' reali.)
+    {
+      const _t0 = String(body.type || '').toLowerCase();
+      const _ph0 = String(body.phone || body.sender || '');
+      const _isStatus = body.isStatusReply === true || _t0 === 'deliverycallback'
+        || _t0 === 'readcallback' || _t0 === 'messagestatuscallback' || _t0 === 'statuscallback';
+      const _isNews = body.isNewsletter === true || _ph0.includes('@newsletter');
+      if (_isStatus || _isNews) {
+        return res.json({ ignored: true, reason: _isNews ? 'newsletter' : 'status', shed: true });
+      }
+    }
 
     // Extract fields
     const phone = body.phone || body.sender || '';
@@ -729,7 +862,9 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
     const imageUrl = body.image?.imageUrl || body.image?.url || body.image?.mediaUrl || body.imageUrl || null;
     const isImage = msgType === 'image' || msgType === 'imagemessage' || !!imageUrl;
     const caption = body.image?.caption || body.caption || '';
-    console.log(`[Webhook] type=${msgType} isAudio=${isAudio} isImage=${isImage} audioUrl=${audioUrl?.substring(0,60)} imageUrl=${imageUrl?.substring(0,60)} body.keys=${Object.keys(body).join(',')}`);
+    if (WEBHOOK_VERBOSE) {
+      console.log(`[Webhook] type=${msgType} isAudio=${isAudio} isImage=${isImage} audioUrl=${audioUrl?.substring(0,60)} imageUrl=${imageUrl?.substring(0,60)} body.keys=${Object.keys(body).join(',')}`);
+    }
 
     // Ignora solo newsletter
     if (phone && phone.includes('@newsletter')) {
@@ -753,7 +888,12 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
     // segnaposto "[Immagine]" e rispondeva in modo generico. Ora analizza la foto (tipo di
     // documento, mittente/ente, riferimenti visibili) così la risposta può essere pertinente
     // a quanto ricevuto. Isolato: se l'analisi fallisce, resta il segnaposto testuale.
-    if (isImage && imageUrl && !fromMe) {
+    // GUARDIA carico (rev. 27/07/2026): NON analizzare le immagini dei GRUPPI.
+    // I gruppi sono sola lettura (il bot non risponde mai): un flood di immagini di
+    // gruppo faceva partire un download + una chiamata AI per OGNI immagine, saturando
+    // il processo durante il blackout di rete. L'analisi serve solo per rispondere ai
+    // CLIENTI, quindi si limita alle chat non di gruppo.
+    if (isImage && imageUrl && !fromMe && !isGroup && !isLegacyGroup) {
       try {
         const { analyzeImageUrl } = await import('./docvision.js');
         const desc = await analyzeImageUrl(imageUrl);
@@ -1012,10 +1152,18 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
     if (!isGroup && content && content.trim().length > 2) {
       const fromControl = fromMe || phone === getControlNumber();
       if (fromControl) {
+        // Il testo del vocale è GIÀ trascritto in `content` (🎤 …) a questo punto,
+        // quindi anche le conferme a voce di Mariano vengono lette. Prima i comandi
+        // RIGIDI (OK/NO <id>); se non lo è, il PONTE conferma→agenda legge la
+        // risposta in linguaggio naturale (conferma/spostamento/disdetta) e
+        // aggiorna Google (+ Apple se abilitato). Non invia mai nulla al cliente.
+        const replyText = content.replace(/^🎤\s*/, '');
         setImmediate(async () => {
           try {
-            const reply = await handleControlCommand(content);
-            if (reply) await sendTextMessage(getControlNumber(), reply);
+            const reply = await handleControlCommand(replyText);
+            if (reply) { await sendTextMessage(getControlNumber(), reply); return; }
+            const bridge = await handleControlAppointmentReply(phone, replyText);
+            if (bridge) await sendTextMessage(getControlNumber(), bridge);
           } catch (e: any) { console.error('[Chatbot] Comando controllo:', e.message); }
         });
       }
@@ -1075,6 +1223,17 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
               res.draftText = san.clean;
               console.warn(`[Sanitizer] ${cName} (${phone}): rimosso preambolo di ragionamento (${san.removed.length} blocco/i) prima dell'invio.`);
             }
+            // ─── GUARDIA COERENZA DATA/TESTO (incidente 13/07, Conti Domenico) ────────
+            // Se il testo cita un giorno della settimana o un "N mese" incoerente con la
+            // data REALE dell'appuntamento registrato/confermato → niente auto-invio: il
+            // cliente riceverebbe una data sbagliata. Resta bozza da rivedere.
+            for (const evd of [res.proposedEvent?.date, res.confirmedEvent?.date]) {
+              const issue = evd ? dateCoherenceIssue(res.draftText, evd) : null;
+              if (issue) {
+                if (wouldAutoSend) { res.needsHuman = true; sanitizerDiverted = true; }
+                console.warn(`[DateGuard] ${cName} (${phone}): ${issue} → bozza da rivedere, nessun auto-invio.`);
+              }
+            }
             const id = saveDraft({ phone, contactName: cName, incoming: content, result: res });
             // APPUNTAMENTI in autonomia: il flusso agenda (proposta/conferma/spostamento)
             // parte da solo DOPO aver incrociato Google Calendar — automatismo voluto e
@@ -1128,7 +1287,7 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
     console.error('[Webhook] Error:', err);
     res.status(500).json({ error: err.message });
   }
-});
+}
 
 router.get('/webhook/url', (req: Request, res: Response) => {
   const host = req.get('host') || 'localhost:5000';
@@ -1464,7 +1623,10 @@ router.post('/admin/cleanup-test-data', (req: Request, res: Response) => {
     const r3 = db.prepare(`DELETE FROM conversations WHERE phone LIKE '%120363%'`).run();
     const r4 = db.prepare(`DELETE FROM live_messages WHERE phone LIKE '%120363%'`).run();
     deleted += r3.changes + r4.changes;
-    res.json({ success: true, deleted });
+    // Rimuovi anche i lead del sito marcati [TEST SISTEMA]
+    const leadsDeleted = cleanupTestLeads();
+    deleted += leadsDeleted;
+    res.json({ success: true, deleted, leadsDeleted });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
@@ -1552,6 +1714,8 @@ router.post('/bot/appointments/:id/confirm', async (req: Request, res: Response)
     if (!appt) return res.status(404).json({ error: 'Appuntamento non trovato' });
     if (appt.status !== 'da_confermare') return res.status(400).json({ error: 'Appuntamento già gestito' });
     const r = await confirmAppointmentRow(appt, { notify: false });
+    // Outbound Make (orchestrazioni extra); NON riscrive sul Calendar. Fire-and-forget.
+    notifyMake({ event: 'appointment_confirmed', appointmentId: id, phone: appt.phone, contactName: appt.contact_name, date: appt.date, start: appt.start, end: appt.end, reason: appt.reason, calendarUpdated: r.calendarUpdated }).catch(() => {});
     res.json({ success: true, calendarUpdated: r.calendarUpdated });
   } catch (err: any) {
     console.error('[Bot appointment confirm] Error:', err);
@@ -1565,6 +1729,7 @@ router.post('/bot/appointments/:id/cancel', async (req: Request, res: Response) 
     const appt = getAppointmentById(id);
     if (!appt) return res.status(404).json({ error: 'Appuntamento non trovato' });
     await cancelAppointmentRow(appt);
+    notifyMake({ event: 'appointment_canceled', appointmentId: id, phone: appt.phone, contactName: appt.contact_name, date: appt.date, start: appt.start, reason: appt.reason }).catch(() => {});
     res.json({ success: true });
   } catch (err: any) {
     console.error('[Bot appointment cancel] Error:', err);
@@ -1603,7 +1768,11 @@ router.post('/bot/jobs/:job/run', async (req: Request, res: Response) => {
     if (job === 'cleanup') return res.json(await runAppointmentCleanup(true));
     if (job === 'briefing') return res.json(await runMorningBriefing(true));
     if (job === 'deadlines') return res.json(await runDeadlineReminders(true));
-    res.status(400).json({ error: `Job sconosciuto: ${job} (validi: reminders, waitlist, sla, aging, cleanup, briefing, deadlines)` });
+    // Notifiche d'agenda verso Mariano (digest 08:00 + reminder T-10).
+    if (job === 'agenda-digest') return res.json(await runAgendaDigest({ force: true }));
+    if (job === 'agenda-digest-test') return res.json(await runAgendaDigest({ test: true }));
+    if (job === 'agenda-reminders') return res.json(await runAgendaReminders({ force: true }));
+    res.status(400).json({ error: `Job sconosciuto: ${job} (validi: reminders, waitlist, sla, aging, cleanup, briefing, deadlines, agenda-digest, agenda-digest-test, agenda-reminders)` });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
@@ -1622,6 +1791,102 @@ router.get('/bot/briefing', (_req: Request, res: Response) => {
     const { text, empty } = composeBriefing(data);
     res.json({ preview: text, empty, data });
   } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── PEC contenzioso (SOLA LETTURA; nessuna risposta/deposito automatico) ────────
+router.get('/pec/status', (_req: Request, res: Response) => {
+  try { res.json(getPecStatus()); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+router.get('/pec/events', (req: Request, res: Response) => {
+  try { res.json(getPecEvents(parseInt(String(req.query.limit || '100'), 10))); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+router.post('/pec/poll/run', async (_req: Request, res: Response) => {
+  try { res.json(await pollPec(true)); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+// SIMULAZIONE (dry-run): classifica e calcola i termini da un testo PEC di prova, SENZA
+// scrivere nulla, senza toccare la casella reale né il calendario. Serve per verifica.
+router.post('/pec/simulate', (req: Request, res: Response) => {
+  try {
+    const { sender = '', subject = '', body = '', baseDate } = req.body || {};
+    const text = `${subject}\n${body}`;
+    const cls = classifyPec(String(sender), String(subject), String(body));
+    const hearing = extractHearingDate(text);
+    const base = baseDate || new Date().toISOString().slice(0, 10);
+    const terms = computeDeadlinesFromEvent({ eventType: cls.eventType, category: cls.category, hearingDate: hearing, baseDate: base });
+    const link = extractHearingLink(text);           // CASO 1
+    const oc = classifyOutcome(text);                // CASO 2
+    const amount = oc.isSentenza ? extractLiquidatedAmount(text) : null;
+    const recupero = (oc.esito === 'favorevole' || oc.esito === 'parziale')  // CASO 3
+      ? computeRecoveryDeadline(base, parseInt(String(req.query.recoveryDays || process.env.PEC_RECOVERY_DAYS || '60'), 10) || 60, amount)
+      : null;
+    // (A) TERMINE DI APPELLO: breve 60gg se sentenza notificata, altrimenti lungo 6 mesi.
+    const previewDays = parseInt(String(req.query.appealPreviewDays || process.env.APPEAL_PREVIEW_DAYS || '5'), 10) || 5;
+    const notified = oc.isSentenza && hasSentenceNotification(text);
+    const appello = oc.isSentenza
+      ? computeAppealDeadline({ depositDate: base, notificationDate: notified ? base : null, previewDays })
+      : null;
+    // (B) NOTIFICA ex L.53/1994 COMPOSTA (dry-run): testo + destinatari + allegato, SENZA invio.
+    const sentenceRef = extractSentenceRef(text);
+    const organo = extractOrgano(text);
+    const sentDate = extractSentenceDate(text);
+    const recipients = selectCounterpartyPec(text, String(sender), String(sender));
+    const notifica = (oc.esito === 'favorevole' || oc.esito === 'parziale') ? {
+      testo: composeNotificaText({ sentenceRef, organo, sentenceDateHuman: formatDateIT(sentDate) }),
+      sentenceRef, organo, sentenceDate: sentDate,
+      destinatari: recipients,
+      statoDestinatari: recipients.length ? 'ok' : 'destinatari_da_verificare',
+      allegato: 'copia informatica della sentenza (PDF ricevuto) — non incluso nel dry-run',
+      inviato: false,
+      nota: 'DRY-RUN: notifica COMPOSTA ma NON inviata. Invio reale solo via POST /api/pec/notifiche/:id/approva-invia (o flag PEC_AUTOSEND_NOTIFICA).',
+    } : null;
+    res.json({
+      classification: cls, hearingDate: hearing, rg: extractRG(text), dates: extractDates(text), termini: terms,
+      udienzaTelematica: { remote: link.remote, provider: link.provider, url: link.url, linkDaVerificare: link.remote && !link.url },
+      sentenza: { isSentenza: oc.isSentenza, esito: oc.esito, importoLiquidato: amount, importoNota: '[DA VERIFICARE]', notificata: notified },
+      recuperoSomme: recupero,
+      appello,
+      notificaL53: notifica,
+      nota: 'DRY-RUN: nessuna scrittura, nessun calendario, nessun invio. Termini/importi [DA CONFERMARE]/[DA VERIFICARE].',
+    });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── NOTIFICHE ex L. 53/1994 (coda ad alta priorità; invio SOLO su approvazione) ──
+// Lettura della coda: NON espone il base64 dell'allegato. Include i conteggi per stato.
+router.get('/pec/notifiche', (req: Request, res: Response) => {
+  try { res.json({ autosend: pecAutosendNotifica(), counts: getNotificheCounts(), items: getNotifiche(parseInt(String(req.query.limit || '100'), 10)) }); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+// VIA LIBERA UMANO: unico punto da cui parte l'invio reale della notifica alla controparte.
+router.post('/pec/notifiche/:id/approva-invia', async (req: Request, res: Response) => {
+  try {
+    const r = await sendNotifica(parseInt(String(req.params.id), 10));
+    res.status(r.ok ? 200 : 409).json(r);
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+// INVIO MASSIVO PROTETTO — azione umana esplicita: invia SOLO le notifiche 'pronta' con
+// destinatari verificati (esclude 'destinatari_da_verificare'). Ritorna inviate/saltate.
+router.post('/pec/notifiche/approva-invia-tutte', async (_req: Request, res: Response) => {
+  try { res.json(await approveAllNotifiche()); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+
+// ─── BACKSCAN — scansione a ritroso ultimi N mesi (default 2, min 2) ──────────
+// Prepara in coda notifiche/richieste per le sentenze vinte trovate. Idempotente.
+// Se PEC non configurata → {ok:false, reason} (nessun errore sporco).
+router.post('/pec/backscan', async (req: Request, res: Response) => {
+  try {
+    const months = parseInt(String(req.query.months || req.body?.months || '2'), 10) || 2;
+    const r = await backscanPec(months);
+    res.status(r.ok ? 200 : 200).json(r);
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
+});
+router.get('/pec/backscan/status', (_req: Request, res: Response) => {
+  try { res.json(getBackscanStatus()); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
 // ─── SMS (scaffold): stato configurazione. OFF finché SMS_PROVIDER non è impostato ──
@@ -1813,7 +2078,17 @@ router.post('/bot/backfill-digest', async (req: Request, res: Response) => {
 });
 
 router.get('/bot/flow-health', (_req: Request, res: Response) => {
-  res.json(getFlowHealth());
+  // Salute del flusso messaggi + salute dei DUE job d'agenda (digest 08:00 / reminder T-10):
+  // se lo scheduler dedicato muore, tickAgeSec cresce e lo stato passa a 'error' (anti "verde ma morto").
+  res.json({ ...getFlowHealth(), agendaJobs: getAgendaJobsHealth(), calendarBridge: getBridgeHealth(), webhookQueue: getWebhookStats() });
+});
+
+// ─── AGENDA DI OGGI: anteprima (sola lettura, NESSUN invio) ──────────────────
+// Mostra la fonte REALE usata (Google Calendar diretto e/o bot_appointments), se
+// popolata, e il testo del digest che verrebbe inviato alle 08:00.
+router.get('/bot/agenda/today', async (_req: Request, res: Response) => {
+  try { res.json(await getAgendaTodayPreview()); }
+  catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
 // Diagnostica: numero WhatsApp collegato + webhook configurato (per capire se i

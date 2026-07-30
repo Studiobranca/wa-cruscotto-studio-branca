@@ -87,5 +87,48 @@ check('rossanaLeakPreambolo safe dopo pulizia', r.safe === true);
 check('rossanaLeakPreambolo clean inizia con "Ciao Rossella!"', r.clean.startsWith('Ciao Rossella!'), r.clean.slice(0, 30));
 check('rossanaLeakPreambolo SENZA "Dallo storico"', !/Dallo storico|non emerge/i.test(r.clean));
 
+// 9) Leak REALE del 13/07 (Conti Domenico): preambolo di ragionamento SENZA i marcatori
+//    storici ("Chiedo quale preferisce… glielo chiedo nel messaggio"), poi il vero
+//    messaggio che inizia con "Buongiorno,". Deve essere ripulito (regola saluto).
+const contiLeak = `Giovedì 16 luglio ci sono slot disponibili. Chiedo quale preferisce e nel frattempo noto che ha inviato la tessera sanitaria ma non è chiaro il contesto — glielo chiedo. Prima però noto che "la busta non so dove sia" potrebbe riferirsi a un atto/documento pertinente per la pratica: glielo chiedo nel messaggio.
+
+Buongiorno,
+
+grazie per aver inviato la Sua tessera sanitaria — è utile per identificarLa in modo univoco in studio.
+
+Per quanto riguarda *giovedì 16 luglio* mattina, i seguenti slot sono liberi:
+- ore 09:00
+- ore 10:00
+
+Quale preferisce?
+
+Assistente Virtuale — Studio Tributario Branca`;
+r = sanitizeClientText(contiLeak, TOOLS);
+check('contiLeak changed (preambolo rimosso)', r.changed === true);
+check('contiLeak safe dopo pulizia', r.safe === true);
+check('contiLeak clean inizia con "Buongiorno,"', r.clean.startsWith('Buongiorno,'), r.clean.slice(0, 30));
+check('contiLeak SENZA "glielo chiedo nel messaggio"', !/glielo chiedo nel messaggio/i.test(r.clean));
+check('contiLeak SENZA "Chiedo quale preferisce"', !/Chiedo quale preferisce/i.test(r.clean));
+
+// 10) Regola saluto: testo legittimo che inizia GIÀ col saluto → intatto.
+const legittimo = `Buongiorno,
+
+l'appuntamento di giovedì 16 luglio alle 10:00 è confermato.
+
+Assistente Virtuale — Studio Tributario Branca`;
+r = sanitizeClientText(legittimo, TOOLS);
+check('legittimo NON cambiato', r.changed === false);
+check('legittimo safe', r.safe === true);
+
+// 11) Regola saluto: testo legittimo SENZA alcun saluto (conferma secca) → intatto.
+const confermaSecca = `✅ Perfetto, *martedì 14 luglio alle ore 11:00* è confermato in agenda.
+
+La aspettiamo in studio in Via Operai 102, Barcellona P.G. (ME).
+
+Assistente Virtuale — Studio Tributario Branca`;
+r = sanitizeClientText(confermaSecca, TOOLS);
+check('confermaSecca NON cambiata', r.changed === false);
+check('confermaSecca safe', r.safe === true);
+
 console.log(`\n${fails === 0 ? 'TUTTI I TEST OK' : fails + ' TEST FALLITI'}`);
 process.exit(fails === 0 ? 0 : 1);

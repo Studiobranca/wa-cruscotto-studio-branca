@@ -207,6 +207,7 @@ export async function createCalendarEvent(params: {
   startDate: string; // ISO8601
   endDate: string;   // ISO8601
   calendarId?: string;
+  location?: string; // es. link udienza telematica (mostrato cliccabile su Calendar)
 }): Promise<{ success: boolean; eventId?: string; eventLink?: string; error?: string }> {
   const token = await getGoogleAccessToken();
   if (!token) {
@@ -219,6 +220,7 @@ export async function createCalendarEvent(params: {
     const event = {
       summary: params.title,
       description: params.description,
+      ...(params.location ? { location: params.location } : {}),
       start: { dateTime: params.startDate, timeZone: 'Europe/Rome' },
       end: { dateTime: params.endDate, timeZone: 'Europe/Rome' },
       reminders: {

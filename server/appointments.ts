@@ -99,15 +99,36 @@ function romeOffset(ds: string): string {
   return parseInt(rome) - 12 === 2 ? '+02:00' : '+01:00';
 }
 
-export async function getAvailability(days = 14): Promise<{ slots: Slot[]; calendarChecked: boolean }> {
-  const today = new Date();
+const MAX_LOOKAHEAD = 120; // cap duro: oltre non cerchiamo la riapertura (anti-runaway)
+
+export async function getAvailability(days = 14, fromDate?: Date): Promise<{ slots: Slot[]; calendarChecked: boolean; reopening?: boolean }> {
+  const today = fromDate ?? new Date(); // fromDate solo per test deterministici; in produzione = oggi
+  const dsOf = (i: number) => {
+    const d = new Date(today.getFullYear(), today.getMonth(), today.getDate() + i);
+    return { ds: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`, dow: d.getDay() };
+  };
   const all: Slot[] = [];
   for (let i = 1; i <= days; i++) {
-    const d = new Date(today.getFullYear(), today.getMonth(), today.getDate() + i);
-    const ds = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-    all.push(...daySlots(ds, d.getDay()));
+    const { ds, dow } = dsOf(i);
+    all.push(...daySlots(ds, dow));
   }
-  if (!all.length) return { slots: [], calendarChecked: false };
+  // CHIUSURA ESTIVA (26/07–31/08) o finestra interamente chiusa: se nei prossimi
+  // `days` giorni non esiste NEMMENO uno slot teorico (studio chiuso), guarda OLTRE
+  // la chiusura e proponi le PRIME DATE DI RIAPERTURA (max ~4 giorni aperti), restando
+  // nel flusso appuntamento invece di spingere la lista d'attesa. (UX 28/07/2026)
+  let reopening = false;
+  if (!all.length) {
+    let openDays = 0; let lastDate = '';
+    for (let i = days + 1; i <= MAX_LOOKAHEAD; i++) {
+      const { ds, dow } = dsOf(i);
+      const s = daySlots(ds, dow);
+      if (!s.length) continue;
+      if (ds !== lastDate) { if (openDays >= 4) break; openDays++; lastDate = ds; }
+      all.push(...s);
+      reopening = true;
+    }
+  }
+  if (!all.length) return { slots: [], calendarChecked: false, reopening };
 
   // Occupato da Google Calendar (freeBusy su 'primary')
   let busy: { start: number; end: number }[] = [];
@@ -143,7 +164,7 @@ export async function getAvailability(days = 14): Promise<{ slots: Slot[]; calen
     const en = Date.parse(`${s.date}T${s.end}:00${off}`);
     return !busy.some(b => b.start < en && b.end > st);
   });
-  return { slots: free, calendarChecked };
+  return { slots: free, calendarChecked, reopening };
 }
 
 /**
@@ -203,6 +224,19 @@ export function formatAvailabilityIT(slots: Slot[], maxDays = 4, maxPerDay = 3):
 export function formatDateIT(ds: string): string {
   const day = parseInt(ds.slice(8, 10), 10), month = MONTH_IT[parseInt(ds.slice(5, 7), 10) - 1];
   return `${day} ${month}`;
+}
+
+/** Giorno della settimana italiano di una data YYYY-MM-DD (calcolo a mezzogiorno UTC:
+ *  indipendente dal fuso del server). */
+export function weekdayIT(ds: string): string {
+  return DOW_IT[new Date(`${ds}T12:00:00Z`).getUTCDay()] || '';
+}
+
+/** Data COMPLETA in italiano con giorno della settimana, es. "giovedì 16 luglio 2026".
+ *  È la formulazione che il bot deve COPIARE nel testo al cliente (incidente 13/07:
+ *  il modello scriveva "giovedì 16" ma registrava il 17 — il giorno lo calcola il server). */
+export function formatDateFullIT(ds: string): string {
+  return `${weekdayIT(ds)} ${formatDateIT(ds)} ${ds.slice(0, 4)}`;
 }
 
 export interface NowStatus {
