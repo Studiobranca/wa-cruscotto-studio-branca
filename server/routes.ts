@@ -759,9 +759,49 @@ router.delete('/conversations/:phone', (req: Request, res: Response) => {
 const WEBHOOK_VERBOSE = process.env.WEBHOOK_VERBOSE === '1';
 let _webhookCount = 0;
 
-router.post('/webhook/message', async (req: Request, res: Response) => {
+router.post('/webhook/message', (req: Request, res: Response) => {
+  // ASYNC (fix definitivo 30/07): rispondi 200 SUBITO e ACCODA. Il processing
+  // pesante gira nel worker in background con uno yield tra un messaggio e l'altro,
+  // così l'event loop resta SEMPRE libero per /api/health, anche sotto flood
+  // (backlog Z-API dopo un downtime). La coda è LIMITATA (anti-OOM).
+  try { enqueueWebhook(req.body); } catch (e: any) { console.error('[Webhook] enqueue:', e?.message); }
+  return res.json({ queued: true });
+});
+
+// ─── Coda + worker webhook (processing asincrono, non bloccante) ─────────────
+const _webhookQueue: any[] = [];
+const WEBHOOK_QUEUE_MAX = 5000;
+let _webhookDropped = 0;
+let _webhookProcessed = 0;
+let _workerRunning = false;
+function enqueueWebhook(body: any): void {
+  if (_webhookQueue.length >= WEBHOOK_QUEUE_MAX) { _webhookQueue.shift(); _webhookDropped++; }
+  _webhookQueue.push(body);
+  if (!_workerRunning) setImmediate(runWebhookWorker);
+}
+async function runWebhookWorker(): Promise<void> {
+  if (_workerRunning) return;
+  _workerRunning = true;
   try {
-    const body = req.body;
+    while (_webhookQueue.length) {
+      const item = _webhookQueue.shift();
+      try { await processInboundWebhook(item); _webhookProcessed++; }
+      catch (e: any) { console.error('[Webhook] worker:', e?.message); }
+      await new Promise((r) => setImmediate(r)); // YIELD: non bloccare mai il loop
+    }
+  } finally { _workerRunning = false; }
+}
+const _whTimer = setInterval(() => { if (_webhookQueue.length && !_workerRunning) runWebhookWorker(); }, 200);
+if ((_whTimer as any).unref) (_whTimer as any).unref();
+export function getWebhookStats() { return { depth: _webhookQueue.length, processed: _webhookProcessed, dropped: _webhookDropped, running: _workerRunning }; }
+
+/** Processing pesante di UN webhook (ex corpo dell'handler). Gira nel worker. */
+async function processInboundWebhook(body: any): Promise<void> {
+  // Shim `res`: il vecchio handler usciva con res.json/res.status; qui sono no-op
+  // (la risposta HTTP è già stata inviata). Un `return res.json(...)` = uscita.
+  const _noop: any = () => _noop;
+  const res: any = { json: _noop, status: () => res, send: _noop, sendStatus: _noop };
+  try {
     _webhookCount++;
     // ─── DRAIN switch (DB-flag `webhook_drain`, togglabile SENZA redeploy) ────
     // Se attivo: 200 immediato e stop, PRIMA di ogni lavoro. Serve a DRENARE un
@@ -1247,7 +1287,7 @@ router.post('/webhook/message', async (req: Request, res: Response) => {
     console.error('[Webhook] Error:', err);
     res.status(500).json({ error: err.message });
   }
-});
+}
 
 router.get('/webhook/url', (req: Request, res: Response) => {
   const host = req.get('host') || 'localhost:5000';
@@ -2040,7 +2080,7 @@ router.post('/bot/backfill-digest', async (req: Request, res: Response) => {
 router.get('/bot/flow-health', (_req: Request, res: Response) => {
   // Salute del flusso messaggi + salute dei DUE job d'agenda (digest 08:00 / reminder T-10):
   // se lo scheduler dedicato muore, tickAgeSec cresce e lo stato passa a 'error' (anti "verde ma morto").
-  res.json({ ...getFlowHealth(), agendaJobs: getAgendaJobsHealth(), calendarBridge: getBridgeHealth() });
+  res.json({ ...getFlowHealth(), agendaJobs: getAgendaJobsHealth(), calendarBridge: getBridgeHealth(), webhookQueue: getWebhookStats() });
 });
 
 // ─── AGENDA DI OGGI: anteprima (sola lettura, NESSUN invio) ──────────────────

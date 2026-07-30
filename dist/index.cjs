@@ -109389,9 +109389,56 @@ router.delete("/conversations/:phone", (req, res) => {
 });
 var WEBHOOK_VERBOSE = process.env.WEBHOOK_VERBOSE === "1";
 var _webhookCount = 0;
-router.post("/webhook/message", async (req, res) => {
+router.post("/webhook/message", (req, res) => {
   try {
-    const body = req.body;
+    enqueueWebhook(req.body);
+  } catch (e) {
+    console.error("[Webhook] enqueue:", e?.message);
+  }
+  return res.json({ queued: true });
+});
+var _webhookQueue = [];
+var WEBHOOK_QUEUE_MAX = 5e3;
+var _webhookDropped = 0;
+var _webhookProcessed = 0;
+var _workerRunning = false;
+function enqueueWebhook(body) {
+  if (_webhookQueue.length >= WEBHOOK_QUEUE_MAX) {
+    _webhookQueue.shift();
+    _webhookDropped++;
+  }
+  _webhookQueue.push(body);
+  if (!_workerRunning) setImmediate(runWebhookWorker);
+}
+async function runWebhookWorker() {
+  if (_workerRunning) return;
+  _workerRunning = true;
+  try {
+    while (_webhookQueue.length) {
+      const item = _webhookQueue.shift();
+      try {
+        await processInboundWebhook(item);
+        _webhookProcessed++;
+      } catch (e) {
+        console.error("[Webhook] worker:", e?.message);
+      }
+      await new Promise((r) => setImmediate(r));
+    }
+  } finally {
+    _workerRunning = false;
+  }
+}
+var _whTimer = setInterval(() => {
+  if (_webhookQueue.length && !_workerRunning) runWebhookWorker();
+}, 200);
+if (_whTimer.unref) _whTimer.unref();
+function getWebhookStats() {
+  return { depth: _webhookQueue.length, processed: _webhookProcessed, dropped: _webhookDropped, running: _workerRunning };
+}
+async function processInboundWebhook(body) {
+  const _noop = () => _noop;
+  const res = { json: _noop, status: () => res, send: _noop, sendStatus: _noop };
+  try {
     _webhookCount++;
     try {
       const _drain = db_default.prepare(`SELECT value FROM app_settings WHERE key = 'webhook_drain'`).get()?.value;
@@ -109779,7 +109826,7 @@ Da confermare.`,
     console.error("[Webhook] Error:", err);
     res.status(500).json({ error: err.message });
   }
-});
+}
 router.get("/webhook/url", (req, res) => {
   const host = req.get("host") || "localhost:5000";
   const protocol = req.get("x-forwarded-proto") || "http";
@@ -110517,7 +110564,7 @@ router.post("/bot/backfill-digest", async (req, res) => {
   res.json({ daysScanned: days + 1, eventsWritten: written.length, days: written });
 });
 router.get("/bot/flow-health", (_req, res) => {
-  res.json({ ...getFlowHealth(), agendaJobs: getAgendaJobsHealth(), calendarBridge: getBridgeHealth() });
+  res.json({ ...getFlowHealth(), agendaJobs: getAgendaJobsHealth(), calendarBridge: getBridgeHealth(), webhookQueue: getWebhookStats() });
 });
 router.get("/bot/agenda/today", async (_req, res) => {
   try {
