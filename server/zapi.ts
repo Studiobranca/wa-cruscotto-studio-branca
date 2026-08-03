@@ -9,11 +9,24 @@ export const zapiHeaders = {
   'client-token': ZAPI_CLIENT_TOKEN,
 };
 
+// ─── GUARDIA anti-hang (rev. 27/07/2026, incidente egress ~20:00) ────────────
+// Ogni fetch verso Z-API ha un timeout DURO (AbortSignal.timeout): durante un
+// blackout di rete in uscita (connect-timeout ~10s per chiamata) il polling
+// contatti ogni 30s accumulava socket appesi e saturava il processo, rendendo
+// il server HTTP intermittente (health/UI in timeout). Con il timeout la
+// chiamata fallisce in fretta e il ciclo non resta bloccato. Configurabile via
+// env ZAPI_TIMEOUT_MS (default 6000).
+const ZAPI_TIMEOUT_MS = Number(process.env.ZAPI_TIMEOUT_MS) || 6000;
+function zapiSignal(): AbortSignal | undefined {
+  try { return AbortSignal.timeout(ZAPI_TIMEOUT_MS); } catch { return undefined; }
+}
+
 export async function zapiGet(endpoint: string): Promise<any> {
   const url = `${ZAPI_BASE}${endpoint}`;
   const response = await fetch(url, {
     method: 'GET',
     headers: zapiHeaders,
+    signal: zapiSignal(),
   });
   if (!response.ok) {
     const text = await response.text();
@@ -28,6 +41,7 @@ export async function zapiPost(endpoint: string, body: any): Promise<any> {
     method: 'POST',
     headers: zapiHeaders,
     body: JSON.stringify(body),
+    signal: zapiSignal(),
   });
   if (!response.ok) {
     const text = await response.text();
@@ -42,6 +56,7 @@ export async function zapiPut(endpoint: string, body: any): Promise<any> {
     method: 'PUT',
     headers: zapiHeaders,
     body: JSON.stringify(body),
+    signal: zapiSignal(),
   });
   if (!response.ok) {
     const text = await response.text();

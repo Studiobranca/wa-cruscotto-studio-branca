@@ -27,9 +27,16 @@ export function startPolling(intervalMs = 30000): void {
   }
 
   console.log(`[Polling] Starting with interval ${intervalMs}ms`);
-  
-  // Run immediately
-  runPollingCycle();
+
+  // INCIDENTE 29/07/2026 — il primo ciclo partiva SUBITO all'avvio: il sync
+  // contatti (1779 contatti su 19 pagine verso Z-API) teneva occupato l'event
+  // loop ben oltre i 30s di `healthcheckTimeout`, quindi Railway non
+  // instradava mai il traffico e il servizio restava irraggiungibile — con
+  // redeploy automatici che ripetevano lo stesso blocco all'infinito.
+  // Il primo ciclo ora è differito: prima l'app deve risultare viva.
+  const primoRitardoMs = Number(process.env.POLL_FIRST_DELAY_MS) || 90000;
+  setTimeout(runPollingCycle, primoRitardoMs);
+  console.log(`[Polling] primo ciclo differito di ${primoRitardoMs}ms (health check prima di tutto)`);
 
   pollingInterval = setInterval(runPollingCycle, intervalMs);
 }

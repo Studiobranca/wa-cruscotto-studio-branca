@@ -11,10 +11,11 @@
  */
 
 import db from './db.js';
-import { getAvailability, formatAvailabilityIT, isSlotBusy, getNowStatus, formatDateIT } from './appointments.js';
+import { getAvailability, formatAvailabilityIT, isSlotBusy, getNowStatus, formatDateIT, formatDateFullIT } from './appointments.js';
 import { shouldBlockSlot } from './agenda_logic.js';
 import { sendTextMessage } from './zapi.js';
 import { createCalendarEvent, updateCalendarEvent, appendEventDescription } from './integrations.js';
+import { mirrorToApple, deleteFromApple, appleEnabled } from './caldav.js';
 import { broadcastEvent } from './sse.js';
 import { resolveIdentities, isVipContact } from './contacts.js';
 import { sanitizeClientText, type SanitizeResult } from './sanitize.js';
@@ -228,6 +229,16 @@ export async function confirmAppointmentRow(appt: any, opts: { notify?: boolean 
     calOk = r.success;
   }
   markAppointmentConfirmed(appt.id);
+  if (appleEnabled()) {
+    try {
+      await mirrorToApple({
+        uid: appt.event_id || `cruscotto-appt-${appt.id}`,
+        summary: `✅ ${appt.reason || 'Appuntamento'} — ${appt.contact_name || appt.phone}`,
+        description: `Appuntamento confermato.\nCliente: ${appt.contact_name || ''} (${appt.phone})\nMotivo: ${appt.reason || '-'}`,
+        date: appt.date, start: appt.start, end: appt.end || undefined,
+      });
+    } catch (e: any) { console.error('[CalDAV] mirror conferma:', e.message); }
+  }
   if (opts.notify) {
     const esito = calOk
       ? 'Agenda aggiornata (evento confermato).'
@@ -253,6 +264,7 @@ export async function cancelAppointmentRow(appt: any): Promise<void> {
     });
   }
   db.prepare(`UPDATE bot_appointments SET status = 'annullato' WHERE id = ?`).run(appt.id);
+  if (appleEnabled()) { try { await deleteFromApple(appt.event_id || `cruscotto-appt-${appt.id}`); } catch (e: any) { console.error('[CalDAV] mirror disdetta:', e.message); } }
 }
 
 /** Fa SCADERE una proposta [DA CONFERMARE] mai confermata: aggiorna l'evento Calendar a
@@ -269,6 +281,7 @@ export async function expireAppointmentRow(appt: any): Promise<void> {
     } catch (e: any) { console.error('[Chatbot] scadenza evento Calendar:', e.message); }
   }
   db.prepare(`UPDATE bot_appointments SET status = 'scaduto' WHERE id = ?`).run(appt.id);
+  if (appleEnabled()) { try { await deleteFromApple(appt.event_id || `cruscotto-appt-${appt.id}`); } catch (e: any) { console.error('[CalDAV] mirror scadenza:', e.message); } }
 }
 
 /** Righe appuntamento (per job/endpoint agenda). */
@@ -498,6 +511,16 @@ GESTIONE OPERATIVA:
      (termini che potrebbero già decorrere, atto che non riesci a inquadrare con certezza):
      chiama need_human, non indovinare.
 
+DATE E GIORNI DELLA SETTIMANA (zero-errori — incidente 13/07/2026):
+- NON calcolare MAI a mente il giorno della settimana di una data: COPIA sempre la coppia
+  giorno+data esattamente come la restituiscono get_availability, propose_booking,
+  confirm_appointment e il blocco appuntamenti nel system (es. "giovedì 16 luglio 2026").
+- In propose_booking la data va copiata CARATTERE PER CARATTERE da uno slot dell'elenco
+  "Slot con data esatta" di get_availability: verifica DUE volte che il giorno della
+  settimana che stai per scrivere al cliente corrisponda a quello slot.
+- Se il risultato di un tool indica un giorno DIVERSO da quello che intendevi proporre,
+  fermati e correggi (richiama il tool con lo slot giusto) PRIMA di scrivere al cliente.
+
 URGENZE (cartella esattoriale, avviso di accertamento, atto notificato con termini in
 decorrenza, udienza, pignoramento): chiama need_human per allertare il Dott. Branca, MA
 fornisci comunque al cliente un inquadramento tecnico utile (di che atto si tratta, quale
@@ -705,6 +728,12 @@ interface DraftResult {
   // true quando il bot ha registrato documentazione ricevuta (tool note_documents):
   // su email autorizza l'invio automatico della risposta (conferma ricezione + integrazione).
   docNoted?: boolean;
+  // Slot "date start" realmente offerti da get_availability in QUESTA generazione:
+  // propose_booking accetta SOLO questi (anti data inventata, incidente 13/07).
+  offeredSlots?: string[];
+  // Appuntamento confermato in questa generazione (confirm_appointment): serve alla
+  // guardia di coerenza data/testo prima dell'auto-invio.
+  confirmedEvent?: { date: string; start: string } | null;
 }
 
 // Esito della generazione: 'work' (bozza da approvare) o 'personal' (chat privata,
@@ -787,15 +816,21 @@ async function runTool(name: string, input: any, out: DraftResult, phone: string
   if (name === 'get_availability') {
     out.appointmentFlow = true;
     const days = Math.min(Math.max(parseInt(input?.days, 10) || 14, 1), 30);
-    const { slots, calendarChecked } = await getAvailability(days);
+    const { slots, calendarChecked, reopening } = await getAvailability(days);
     if (!slots.length) {
       return `${calendarChecked ? '' : '(agenda non verificata su Calendar) '}NESSUNA disponibilità nei prossimi ${days} giorni (agenda piena o chiusura dello studio). NON proporre MAI date o orari a mano. Proponi al cliente la LISTA D'ATTESA: se accetta di essere ricontattato quando si libereranno nuove date, chiama add_to_waitlist con il motivo dell'appuntamento; verrà ricontattato in automatico su questo stesso canale. Nel frattempo può inviare la documentazione su questa chat o via email.`;
     }
     const txt = formatAvailabilityIT(slots);
+    out.offeredSlots = slots.map((s) => `${s.date} ${s.start}`);
     // Elenco macchina-leggibile con DATA ESATTA (YYYY-MM-DD): il modello DEVE
     // copiare questi valori in propose_booking, mai inventare la data/anno.
     const iso = slots.slice(0, 12).map((s) => `${s.date} ${s.start}`).join('; ');
-    return `${calendarChecked ? '' : '(agenda non verificata su Calendar) '}Prossime disponibilità (da mostrare al cliente):\n${txt}\n\nSlot con data esatta da usare in propose_booking (date=YYYY-MM-DD, start=HH:MM): ${iso}`;
+    // Chiusura estiva: getAvailability ha guardato OLTRE la chiusura e queste sono le
+    // PRIME date utili alla riapertura → proponile normalmente, NON la lista d'attesa.
+    const reopenNote = reopening
+      ? 'Lo studio è in CHIUSURA estiva: queste sono le PRIME date utili alla RIAPERTURA. Proponile normalmente al cliente restando nel flusso appuntamento (ricorda comunque la chiusura come da istruzioni), NON offrire la lista d\'attesa. '
+      : '';
+    return `${calendarChecked ? '' : '(agenda non verificata su Calendar) '}${reopenNote}Prossime disponibilità (da mostrare al cliente):\n${txt}\n\nSlot con data esatta da usare in propose_booking (date=YYYY-MM-DD, start=HH:MM): ${iso}`;
   }
   if (name === 'check_walkin_now') {
     out.appointmentFlow = true;
@@ -820,9 +855,15 @@ async function runTool(name: string, input: any, out: DraftResult, phone: string
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !/^\d{1,2}:\d{2}$/.test(start)) {
       return 'Errore: data o ora non valide. Usa get_availability e riprova con uno slot esatto.';
     }
+    // Anti data-inventata (incidente 13/07: testo "giovedì 16", registrato il 17):
+    // se in questa generazione get_availability ha restituito gli slot, la coppia
+    // data+ora DEVE essere una di quelle — altrimenti il modello ha trascritto male.
+    if (out.offeredSlots && !out.offeredSlots.includes(`${date} ${start}`)) {
+      return `Errore: lo slot ${date} ${start} NON è tra le disponibilità restituite da get_availability. Copia ESATTAMENTE una coppia date+start dall'elenco "Slot con data esatta" (controlla di non aver confuso il giorno della settimana con la data), poi richiama propose_booking.`;
+    }
     out.proposedEvent = { date, start, end: endTime(start), reason: String(input?.reason || 'Appuntamento') };
     out.appointmentFlow = true;
-    return 'Proposta registrata. Comunica al cliente lo slot e che resta in attesa di conferma, ringrazia e — se l\'incontro riguarda documenti da esaminare — CHIARISCI che deve inviarli PRIMA dell\'appuntamento (es. atti/cartelle notificate, fatture, dichiarazioni, contratti, avvisi), su questa chat WhatsApp OPPURE via email a studiobranca@tiscali.it o studiobranca@icloud.com: solo così potranno essere visionati e poi discussi durante l\'incontro. Infine chiedigli di confermare quando avrà la certezza di poter venire.';
+    return `Proposta registrata per ${formatDateFullIT(date)} alle ${start}. NEL MESSAGGIO al cliente scrivi giorno e data ESATTAMENTE così: "${formatDateFullIT(date)}" (COPIALI, non ricalcolarli). Se questo NON è il giorno che il cliente aveva chiesto, NON rispondere: richiama propose_booking con lo slot giusto. Poi comunica al cliente lo slot e che resta in attesa di conferma, ringrazia e — se l'incontro riguarda documenti da esaminare — CHIARISCI che deve inviarli PRIMA dell'appuntamento (es. atti/cartelle notificate, fatture, dichiarazioni, contratti, avvisi), su questa chat WhatsApp OPPURE via email a studiobranca@tiscali.it o studiobranca@icloud.com: solo così potranno essere visionati e poi discussi durante l'incontro. Infine chiedigli di confermare quando avrà la certezza di poter venire.`;
   }
   if (name === 'confirm_appointment') {
     out.appointmentFlow = true;
@@ -831,7 +872,8 @@ async function runTool(name: string, input: any, out: DraftResult, phone: string
       return 'Non risulta alcun appuntamento in attesa di conferma per questo cliente: non confermare nulla, prosegui normalmente.';
     }
     const r = await confirmAppointmentRow(appt, { notify: true });
-    return `Appuntamento confermato e ${r.calendarUpdated ? 'agenda aggiornata' : 'segnalato al Dott. Branca'}. Scrivi al cliente un breve messaggio che CONFERMA l'appuntamento del ${appt.date} alle ${appt.start}, ringrazia, e — se l'incontro riguarda documenti da esaminare — RIBADISCI che deve inviarli PRIMA dell'appuntamento (su questa chat WhatsApp oppure via email a studiobranca@tiscali.it o studiobranca@icloud.com), così potranno essere visionati e discussi durante l'incontro; indica che lo studio è in Via Operai 102, Barcellona P.G. (ME).`;
+    out.confirmedEvent = { date: appt.date, start: appt.start };
+    return `Appuntamento confermato e ${r.calendarUpdated ? 'agenda aggiornata' : 'segnalato al Dott. Branca'}. Scrivi al cliente un breve messaggio che CONFERMA l'appuntamento di ${formatDateFullIT(appt.date)} alle ${appt.start} — scrivi giorno e data ESATTAMENTE così: "${formatDateFullIT(appt.date)}" (COPIALI, non ricalcolare il giorno della settimana) — ringrazia, e — se l'incontro riguarda documenti da esaminare — RIBADISCI che deve inviarli PRIMA dell'appuntamento (su questa chat WhatsApp oppure via email a studiobranca@tiscali.it o studiobranca@icloud.com), così potranno essere visionati e discussi durante l'incontro; indica che lo studio è in Via Operai 102, Barcellona P.G. (ME).`;
   }
   if (name === 'cancel_appointment') {
     out.appointmentFlow = true;
@@ -851,7 +893,7 @@ async function runTool(name: string, input: any, out: DraftResult, phone: string
         `❌ ${first.contact_name || phone} ha DISDETTO l'appuntamento:\n📅 ${first.date} ore ${first.start} — ${first.reason || 'Appuntamento'}${motivo ? `\nMotivo: ${motivo}` : ''}\nAgenda aggiornata (evento annullato).`,
       );
     } catch (e: any) { console.error('[Chatbot] notifica disdetta fallita:', e.message); }
-    return `Appuntamento del ${first.date} alle ${first.start} DISDETTO e agenda aggiornata. Scrivi al cliente un breve messaggio che conferma la disdetta, ringrazia, e resta a disposizione per fissare un nuovo appuntamento quando vorrà (se indica già una nuova preferenza, usa get_availability per proporre slot reali).`;
+    return `Appuntamento di ${formatDateFullIT(first.date)} alle ${first.start} DISDETTO e agenda aggiornata. Scrivi al cliente un breve messaggio che conferma la disdetta (se citi la data, scrivila ESATTAMENTE così: "${formatDateFullIT(first.date)}"), ringrazia, e resta a disposizione per fissare un nuovo appuntamento quando vorrà (se indica già una nuova preferenza, usa get_availability per proporre slot reali).`;
   }
   if (name === 'add_to_waitlist') {
     out.appointmentFlow = true;
@@ -943,12 +985,12 @@ export async function generateReplyCore(
   const pendingAppt = getPendingAppointment(key);
   let apptBlock = '';
   if (upcomingAppt && upcomingAppt.status === 'confermato') {
-    apptBlock = `\n\n⚠️ QUESTO CLIENTE HA GIÀ UN APPUNTAMENTO CONFERMATO IN AGENDA: ${upcomingAppt.date} alle ${upcomingAppt.start}${upcomingAppt.reason ? ` (${upcomingAppt.reason})` : ''}.
+    apptBlock = `\n\n⚠️ QUESTO CLIENTE HA GIÀ UN APPUNTAMENTO CONFERMATO IN AGENDA: ${formatDateFullIT(upcomingAppt.date)} (${upcomingAppt.date}) alle ${upcomingAppt.start}${upcomingAppt.reason ? ` (${upcomingAppt.reason})` : ''}.
 - NON proporre e NON fissare un nuovo appuntamento per la stessa questione: l'appuntamento c'è già. Ricordaglielo con garbo (data e ora).
 - Solo se il cliente chiede ESPLICITAMENTE di SPOSTARLO, usa get_availability per riproporre nuovi slot (alla registrazione del nuovo con propose_booking il vecchio si annulla da solo); se chiede di DISDIRE senza riprogrammare, chiama cancel_appointment.
 - Se serve, ricorda che la documentazione utile va inviata ${dest} PRIMA dell'incontro.`;
   } else if (pendingAppt) {
-    apptBlock = `\n\nAPPUNTAMENTO IN ATTESA DI CONFERMA per questo cliente: ${pendingAppt.date} alle ${pendingAppt.start}${pendingAppt.reason ? ` (${pendingAppt.reason})` : ''}.
+    apptBlock = `\n\nAPPUNTAMENTO IN ATTESA DI CONFERMA per questo cliente: ${formatDateFullIT(pendingAppt.date)} (${pendingAppt.date}) alle ${pendingAppt.start}${pendingAppt.reason ? ` (${pendingAppt.reason})` : ''}.
 - NON proporre un secondo appuntamento per la stessa cosa: ce n'è già uno in attesa.
 - Se nell'ULTIMO messaggio il cliente CONFERMA che può venire (es. "confermo", "sì va bene", "ci sono", "perfetto", "ok per quel giorno"), chiama confirm_appointment e poi conferma con garbo.
 - Se invece chiede di SPOSTARE l'orario, usa get_availability per riproporre nuovi slot; se vuole DISDIRE, chiama cancel_appointment; se è incerto, NON chiamare confirm_appointment.`;
@@ -1042,19 +1084,14 @@ export function saveDraft(d: {
   return Number(info.lastInsertRowid);
 }
 
-function safeParseProposedEvent(raw: any): any | null {
-  if (!raw) return null;
-  try { return JSON.parse(raw); }
-  catch (e) { console.error('[chatbot] proposed_event JSON corrotto, ignorato:', e); return null; }
-}
 export function getPendingDrafts(): any[] {
   const rows = db.prepare(`SELECT * FROM bot_drafts WHERE status = 'pending' ORDER BY created_at DESC`).all() as any[];
-  return rows.map((r) => ({ ...r, proposed_event: safeParseProposedEvent(r.proposed_event) }));
+  return rows.map((r) => ({ ...r, proposed_event: r.proposed_event ? JSON.parse(r.proposed_event) : null }));
 }
 export function getDraft(id: number): any | null {
   const r = db.prepare(`SELECT * FROM bot_drafts WHERE id = ?`).get(id) as any;
   if (!r) return null;
-  return { ...r, proposed_event: safeParseProposedEvent(r.proposed_event) };
+  return { ...r, proposed_event: r.proposed_event ? JSON.parse(r.proposed_event) : null };
 }
 export function markDraftSent(id: number): void {
   db.prepare(`UPDATE bot_drafts SET status = 'sent', sent_at = datetime('now') WHERE id = ?`).run(id);
@@ -1134,10 +1171,20 @@ export async function materializeProposedEvent(
     startDate: `${ev.date}T${ev.start}:00`,
     endDate: `${ev.date}T${ev.end}:00`,
   });
-  recordAppointment({
+  const apptId = recordAppointment({
     phone: key, contactName, eventId: calendar?.eventId ?? null,
     date: ev.date, start: ev.start, end: ev.end, reason: ev.reason,
   });
+  if (appleEnabled()) {
+    try {
+      await mirrorToApple({
+        uid: calendar?.eventId || `cruscotto-appt-${apptId}`,
+        summary: `[DA CONFERMARE] ${ev.reason} — ${contactName || key}`,
+        description: `Proposta dall'${src}. Cliente: ${contactName || ''} (${key})`,
+        date: ev.date, start: ev.start, end: ev.end,
+      });
+    } catch (e: any) { console.error('[CalDAV] mirror proposta:', e.message); }
+  }
   if (docNotes.length) markDocNotesAttached(key);
   return calendar;
 }

@@ -38,7 +38,18 @@ const META_MARKERS: RegExp[] = [
   /\bnello\s+storico\b/i,
   /\bdalla\s+conversazione\s+risulta\b/i,
   /\bnon\s+emerge\s+che\b/i,
+  // Leak del 13/07 (Conti Domenico): deliberazione in "stage direction" senza i marcatori
+  // storici — il modello RACCONTA cosa sta per chiedere invece di chiederlo.
+  /\bglielo\s+chiedo\s+nel\s+messaggio\b/i,
+  /\bchiedo\s+quale\s+preferisc\w*\b/i,
+  /\bnon\s+è\s+chiaro\s+il\s+contesto\b/i,
+  /\bnel\s+frattempo\s+noto\b/i,
 ];
+
+// Saluti/incipit tipici del VERO messaggio per il cliente. Se un paragrafo successivo
+// al primo inizia così, tutto ciò che precede è quasi certamente preambolo di
+// ragionamento (il prompt impone di cominciare direttamente dal saluto).
+const GREETING_RE = /^(buongiorno|buonasera|buon\s+pomeriggio|salve|gentile\b|egregi|spett\.?|carissim|ciao\b)/i;
 
 function buildToolRe(toolNames: string[]): RegExp | null {
   const names = (toolNames || []).filter(Boolean).map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
@@ -71,7 +82,20 @@ export function sanitizeClientText(raw: string, toolNames: string[]): SanitizeRe
     removed.push(paras[i].trim());
     i++;
   }
-  const clean = paras.slice(i).join('\n\n').trim();
+  let rest = paras.slice(i);
+
+  // Regola strutturale (leak del 13/07): se il messaggio NON inizia con un saluto ma un
+  // paragrafo successivo SÌ, i paragrafi prima del saluto sono preambolo di ragionamento
+  // sfuggito ai marcatori → si rimuovono. (Se il testo inizia già col saluto, o non
+  // contiene alcun saluto, non cambia nulla.)
+  if (rest.length > 1 && !GREETING_RE.test((rest[0] || '').trim())) {
+    const g = rest.findIndex((p, idx) => idx > 0 && GREETING_RE.test((p || '').trim()));
+    if (g > 0) {
+      removed.push(...rest.slice(0, g).map((p) => p.trim()));
+      rest = rest.slice(g);
+    }
+  }
+  const clean = rest.join('\n\n').trim();
 
   const residualTool = !!toolRe && toolRe.test(clean);
   const changed = removed.length > 0;
