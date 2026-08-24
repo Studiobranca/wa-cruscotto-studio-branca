@@ -1012,7 +1012,8 @@ async function processInboundWebhook(body: any): Promise<void> {
     // Auto-reply: prima le regole keyword (progetto iniziale), poi il messaggio
     // fisso per conversazione come fallback. Entrambe scattano SOLO se il
     // contatto ha l'auto-risposta attiva (auto_reply_enabled).
-    if (!fromMe && !isControl) {
+    // REGOLA PERMANENTE (24/08/2026): nessuna auto-risposta ai gruppi
+    if (!fromMe && !isControl && !isGroup && !isLegacyGroup) {
       const conv = db.prepare(`SELECT auto_reply_enabled, auto_reply_message FROM conversations WHERE phone = ?`).get(phone) as any;
       if (conv?.auto_reply_enabled) {
         let replyText: string | null = null;
