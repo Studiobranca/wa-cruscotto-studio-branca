@@ -81,6 +81,33 @@ try { db.exec(`ALTER TABLE conversations ADD COLUMN is_group INTEGER DEFAULT 0`)
 try { db.exec(`ALTER TABLE live_messages ADD COLUMN is_group INTEGER DEFAULT 0`); } catch {}
 try { db.exec(`ALTER TABLE live_messages ADD COLUMN sender_name TEXT`); } catch {}
 
+
+// ─── INDICI CRITICI per performance (09/2026) ────────────────────────────────
+// Senza questi indici, la query GET /conversations con subquery correlate
+// scansiona tutta live_messages per ogni conversazione → timeout con 28k+ msg.
+try { db.exec(`CREATE INDEX IF NOT EXISTS idx_lm_phone ON live_messages(phone)`); } catch {}
+try { db.exec(`CREATE INDEX IF NOT EXISTS idx_lm_phone_created ON live_messages(phone, created_at DESC)`); } catch {}
+try { db.exec(`CREATE INDEX IF NOT EXISTS idx_lm_phone_read ON live_messages(phone, is_read, direction)`); } catch {}
+try { db.exec(`CREATE INDEX IF NOT EXISTS idx_lm_created ON live_messages(created_at DESC)`); } catch {}
+try { db.exec(`CREATE INDEX IF NOT EXISTS idx_conv_archived ON conversations(is_archived, priority)`); } catch {}
+
+// Cache aggregati: aggiorna contatori in conversations da live_messages (una tantum)
+// Risolve lo skew accumulato durante i periodi senza sync
+try {
+  db.exec(`
+    UPDATE conversations SET
+      total_received = COALESCE((
+        SELECT COUNT(*) FROM live_messages
+        WHERE phone = conversations.phone AND direction = 'received'
+      ), 0),
+      total_sent = COALESCE((
+        SELECT COUNT(*) FROM live_messages
+        WHERE phone = conversations.phone AND direction != 'received'
+      ), 0)
+    WHERE total_received = 0 AND total_sent = 0
+  `);
+} catch {}
+
 // ─── Automazioni (ripristino dal progetto iniziale wa-cruscotto) ─────────────
 db.exec(`
   CREATE TABLE IF NOT EXISTS auto_reply_rules (
