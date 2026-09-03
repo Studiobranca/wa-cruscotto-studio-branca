@@ -1,6 +1,4 @@
-import { useEffect, useRef } from 'react';
-import { useOverview, useWeeklyData, useHourlyData, useTodayReport, useSSE } from '../lib/hooks';
-import { flashScreen } from '../lib/useFlash';
+import { useOverview, useWeeklyData, useHourlyData, useTodayReport } from '../lib/hooks';
 import { queryClient } from '../lib/queryClient';
 import KPICard from '../components/KPICard';
 import Loader from '../components/Loader';
@@ -15,50 +13,6 @@ export default function Dashboard() {
   const { data: weekly = [] } = useWeeklyData();
   const { data: hourly = [] } = useHourlyData();
   const { data: todayReport = [] } = useTodayReport();
-  // Suono VIP via Web Audio API
-  const playVipSound = () => {
-    try {
-      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
-      const play = (freq: number, start: number, duration: number, vol = 0.4) => {
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        osc.type = 'sine';
-        osc.frequency.setValueAtTime(freq, ctx.currentTime + start);
-        gain.gain.setValueAtTime(0, ctx.currentTime + start);
-        gain.gain.linearRampToValueAtTime(vol, ctx.currentTime + start + 0.01);
-        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + start + duration);
-        osc.start(ctx.currentTime + start);
-        osc.stop(ctx.currentTime + start + duration);
-      };
-      // Doppio tono: Do5 poi Mi5 — caldo e riconoscibile
-      play(523, 0,    0.18, 0.45);
-      play(659, 0.22, 0.28, 0.55);
-    } catch {}
-  };
-
-  const connectSSE = useSSE((type, data) => {
-    if (type === 'message' && data?.type === 'received') {
-      // Suono VIP
-      if (data?.priority === 'vip') playVipSound();
-      // Flash schermo: rosso=VIP, giallo=audio, verde=testo
-      if (data?.priority === 'vip') {
-        flashScreen('red');
-      } else if (data?.isAudio) {
-        flashScreen('yellow');
-      } else {
-        flashScreen('green');
-      }
-    }
-  });
-  const esRef = useRef<EventSource | null>(null);
-
-  useEffect(() => {
-    esRef.current = connectSSE();
-    return () => esRef.current?.close();
-  }, []);
-
   if (overviewLoading) return <Loader text="Caricamento dashboard..." />;
 
   const formatDay = (dateStr: string) => {
