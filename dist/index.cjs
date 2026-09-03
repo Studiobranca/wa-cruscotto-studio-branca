@@ -23986,6 +23986,29 @@ var init_db = __esm({
       db.exec(`ALTER TABLE live_messages ADD COLUMN sender_name TEXT`);
     } catch {
     }
+    setImmediate(() => {
+      try {
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_lm_phone ON live_messages(phone)`);
+      } catch {
+      }
+      try {
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_lm_phone_created ON live_messages(phone, created_at DESC)`);
+      } catch {
+      }
+      try {
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_lm_phone_read ON live_messages(phone, is_read, direction)`);
+      } catch {
+      }
+      try {
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_lm_created ON live_messages(created_at DESC)`);
+      } catch {
+      }
+      try {
+        db.exec(`CREATE INDEX IF NOT EXISTS idx_conv_archived ON conversations(is_archived, priority)`);
+      } catch {
+      }
+      console.log("[DB] Indici creati/verificati (async)");
+    });
     db.exec(`
   CREATE TABLE IF NOT EXISTS auto_reply_rules (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109096,50 +109119,56 @@ router.get("/analytics/hourly", (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+router.get("/db/diag", (_req, res) => {
+  try {
+    const t0 = Date.now();
+    const n = db_default.prepare("SELECT COUNT(*) as n FROM conversations").get()?.n ?? 0;
+    const t1 = Date.now();
+    const lm = db_default.prepare("SELECT COUNT(*) as n FROM live_messages").get()?.n ?? 0;
+    res.json({ conversations: n, live_messages: lm, t_ms: t1 - t0 });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 router.get("/conversations", (req, res) => {
   try {
     const { archived, search } = req.query;
     let query = `
-      SELECT 
-        id, phone, contact_name as contactName,
-        COALESCE(is_group, 0) as isGroup,
-        CASE 
-          WHEN (SELECT COUNT(*) FROM live_messages WHERE phone = conversations.phone) > 0
-          THEN (SELECT content FROM live_messages WHERE phone = conversations.phone ORDER BY created_at DESC LIMIT 1)
-          ELSE NULLIF(last_message, '')
-        END as lastMessage,
-        CASE 
-          WHEN (SELECT COUNT(*) FROM live_messages WHERE phone = conversations.phone) > 0
-          THEN (SELECT created_at FROM live_messages WHERE phone = conversations.phone ORDER BY created_at DESC LIMIT 1)
-          ELSE last_message_at
-        END as lastMessageAt,
-        (SELECT COUNT(*) FROM live_messages WHERE phone = conversations.phone AND is_read = 0 AND direction = 'received') + unread_count as unreadCount,
-        (SELECT COUNT(*) FROM live_messages WHERE phone = conversations.phone AND direction = 'received') + total_received as totalReceived,
-        total_sent as totalSent,
-        auto_reply_enabled as autoReplyEnabled, auto_reply_message as autoReplyMessage,
-        is_archived as isArchived, priority, priority_label as priorityLabel, created_at as createdAt
+      SELECT
+        id, phone,
+        contact_name      AS contactName,
+        COALESCE(is_group, 0) AS isGroup,
+        NULLIF(last_message, '') AS lastMessage,
+        last_message_at         AS lastMessageAt,
+        unread_count            AS unreadCount,
+        total_received          AS totalReceived,
+        total_sent              AS totalSent,
+        auto_reply_enabled      AS autoReplyEnabled,
+        auto_reply_message      AS autoReplyMessage,
+        is_archived             AS isArchived,
+        priority,
+        priority_label          AS priorityLabel,
+        created_at              AS createdAt
       FROM conversations
       WHERE is_archived = ?
-      AND phone NOT LIKE '%@newsletter%'
-      AND phone NOT LIKE '%120363%'
-      AND length(phone) >= 8
+        AND phone NOT LIKE '%@newsletter%'
+        AND phone NOT LIKE '%120363%'
+        AND length(phone) >= 8
     `;
     const params = [archived === "1" ? 1 : 0];
     if (search) {
       query += ` AND (contact_name LIKE ? OR phone LIKE ?)`;
       params.push(`%${search}%`, `%${search}%`);
     }
-    query += ` ORDER BY 
-      CASE priority 
-        WHEN 'vip' THEN 1 
-        WHEN 'high' THEN 2 
-        WHEN 'normal' THEN 3 
-        ELSE 4 
-      END,
-      MAX(
-        COALESCE((SELECT created_at FROM live_messages WHERE phone = conversations.phone ORDER BY created_at DESC LIMIT 1), '1970-01-01'),
-        COALESCE(last_message_at, '1970-01-01')
-      ) DESC
+    query += `
+      ORDER BY
+        CASE priority
+          WHEN 'vip'    THEN 1
+          WHEN 'high'   THEN 2
+          WHEN 'normal' THEN 3
+          ELSE 4
+        END,
+        COALESCE(last_message_at, '1970-01-01') DESC
     `;
     const rows = db_default.prepare(query).all(...params);
     res.json(rows);
@@ -109589,7 +109618,7 @@ _(Originale: ${textToTranslate})_`;
       direction,
       direction
     );
-    if (!fromMe && !isControl) {
+    if (!fromMe && !isControl && !isGroup && !isLegacyGroup) {
       const conv = db_default.prepare(`SELECT auto_reply_enabled, auto_reply_message FROM conversations WHERE phone = ?`).get(phone);
       if (conv?.auto_reply_enabled) {
         let replyText = null;
