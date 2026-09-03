@@ -448,13 +448,12 @@ router.get('/conversations', (req: Request, res: Response) => {
       ),
       lm_last AS (
         SELECT phone, content AS last_content, created_at AS last_at
-        FROM live_messages lm
-        WHERE lm.id = (
-          SELECT id FROM live_messages lm2
-          WHERE lm2.phone = lm.phone
-          ORDER BY created_at DESC LIMIT 1
+        FROM (
+          SELECT phone, content, created_at,
+                 ROW_NUMBER() OVER (PARTITION BY phone ORDER BY created_at DESC) AS rn
+          FROM live_messages
         )
-        GROUP BY phone
+        WHERE rn = 1
       )
       SELECT
         c.id, c.phone,
