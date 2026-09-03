@@ -6,6 +6,9 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
+# ARG per invalidare la cache del layer dist/
+ARG CACHEBUST=1788460453
+
 # Copia il codice pre-compilato
 COPY dist/ ./dist/
 
