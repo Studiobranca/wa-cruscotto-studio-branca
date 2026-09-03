@@ -23897,6 +23897,7 @@ var init_db = __esm({
     }
     db = new import_better_sqlite3.default(DB_PATH);
     db.pragma("journal_mode = WAL");
+    db.pragma("busy_timeout = 10000"); // 10s wait su DB lock
     db.pragma("foreign_keys = ON");
     db.exec(`
   CREATE TABLE IF NOT EXISTS conversations (
