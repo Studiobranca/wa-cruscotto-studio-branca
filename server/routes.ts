@@ -417,12 +417,9 @@ router.get('/analytics/hourly', (req: Request, res: Response) => {
 router.get('/conversations', (req: Request, res: Response) => {
   try {
     const { archived, search } = req.query;
-    const isArchived = archived === '1' ? 1 : 0;
-
-    // Usa SOLO la tabella conversations: dati già denormalizzati dal webhook.
-    // Nessun JOIN su live_messages = risposta istantanea con qualsiasi volume.
-    // unread_count, total_received, total_sent, last_message aggiornati ad ogni msg.
-    let sql = `
+    // FIX v2.21.5: eliminati i 5 subquery correlati che bloccavano il thread
+    // per 20s+ con 2960 conversazioni. Usa solo dati denormalizzati in conversations.
+    let query = `
       SELECT
         id, phone,
         contact_name      AS contactName,
@@ -439,20 +436,19 @@ router.get('/conversations', (req: Request, res: Response) => {
         priority_label          AS priorityLabel,
         created_at              AS createdAt
       FROM conversations
-      WHERE is_archived = @isArchived
+      WHERE is_archived = ?
         AND phone NOT LIKE '%@newsletter%'
         AND phone NOT LIKE '%120363%'
         AND length(phone) >= 8
     `;
-
-    const params: Record<string, any> = { isArchived };
+    const params: any[] = [archived === '1' ? 1 : 0];
 
     if (search) {
-      sql += ` AND (contact_name LIKE @search OR phone LIKE @search)`;
-      params.search = `%${search}%`;
+      query += ` AND (contact_name LIKE ? OR phone LIKE ?)`;
+      params.push(`%${search}%`, `%${search}%`);
     }
 
-    sql += `
+    query += `
       ORDER BY
         CASE priority
           WHEN 'vip'    THEN 1
@@ -463,7 +459,7 @@ router.get('/conversations', (req: Request, res: Response) => {
         COALESCE(last_message_at, '1970-01-01') DESC
     `;
 
-    const rows = db.prepare(sql).all(params);
+    const rows = db.prepare(query).all(...params);
     res.json(rows);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
