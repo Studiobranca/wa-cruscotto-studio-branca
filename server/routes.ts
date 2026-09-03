@@ -414,6 +414,27 @@ router.get('/analytics/hourly', (req: Request, res: Response) => {
 
 // ─── Conversations ────────────────────────────────────────────────────────────
 
+// ─── ROUTE DIAGNOSTICA (temp) ────────────────────────────────────────────────
+router.get('/db/diag', (req: Request, res: Response) => {
+  const t0 = Date.now();
+  try {
+    const count = (db.prepare('SELECT COUNT(*) as n FROM conversations WHERE is_archived = 0').get() as any)?.n ?? 0;
+    const t1 = Date.now();
+    const lmCount = (db.prepare('SELECT COUNT(*) as n FROM live_messages').get() as any)?.n ?? 0;
+    const t2 = Date.now();
+    const sample = db.prepare('SELECT id, phone, contact_name FROM conversations WHERE is_archived = 0 LIMIT 3').all();
+    const t3 = Date.now();
+    res.json({
+      conversations_count: count, t_conversations: t1 - t0,
+      live_messages_count: lmCount, t_live_messages: t2 - t1,
+      sample, t_sample: t3 - t2,
+      total_ms: t3 - t0
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.get('/conversations', (req: Request, res: Response) => {
   try {
     const { archived, search } = req.query;
