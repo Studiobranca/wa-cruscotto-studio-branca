@@ -91,23 +91,6 @@ try { db.exec(`CREATE INDEX IF NOT EXISTS idx_lm_phone_read ON live_messages(pho
 try { db.exec(`CREATE INDEX IF NOT EXISTS idx_lm_created ON live_messages(created_at DESC)`); } catch {}
 try { db.exec(`CREATE INDEX IF NOT EXISTS idx_conv_archived ON conversations(is_archived, priority)`); } catch {}
 
-// Cache aggregati: aggiorna contatori in conversations da live_messages (una tantum)
-// Risolve lo skew accumulato durante i periodi senza sync
-try {
-  db.exec(`
-    UPDATE conversations SET
-      total_received = COALESCE((
-        SELECT COUNT(*) FROM live_messages
-        WHERE phone = conversations.phone AND direction = 'received'
-      ), 0),
-      total_sent = COALESCE((
-        SELECT COUNT(*) FROM live_messages
-        WHERE phone = conversations.phone AND direction != 'received'
-      ), 0)
-    WHERE total_received = 0 AND total_sent = 0
-  `);
-} catch {}
-
 // ─── Automazioni (ripristino dal progetto iniziale wa-cruscotto) ─────────────
 db.exec(`
   CREATE TABLE IF NOT EXISTS auto_reply_rules (
