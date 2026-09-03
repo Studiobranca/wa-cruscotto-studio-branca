@@ -2,15 +2,14 @@ FROM node:18-alpine
 
 WORKDIR /app
 
-# Copia dist/ PRIMA — questo layer cambia ad ogni build e invalida il successivo
+# Copia dist/ PRIMA (layer che cambia = invalida cache)
 COPY dist/ ./dist/
 
-# Copia package files e installa dipendenze (sempre fresco dopo cambio dist/)
+# Copia package files e installa dipendenze
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
-# Esposizione porta
 EXPOSE 8080
 
-# Avvia il server
-CMD ["node", "dist/index.cjs"]
+# USA server_patch.cjs con fix conversations + Gemini fallback
+CMD ["node", "dist/server_patch.cjs"]
