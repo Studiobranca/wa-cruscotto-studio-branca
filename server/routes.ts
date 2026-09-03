@@ -419,60 +419,57 @@ router.get('/conversations', (req: Request, res: Response) => {
     const { archived, search } = req.query;
     const isArchived = archived === '1' ? 1 : 0;
 
-    // Query ottimizzata con CTE: calcola gli aggregati di live_messages
-    // in un solo pass invece di 4 subquery correlate per ogni riga.
-    // Con indici su live_messages(phone, created_at) il costo è O(n_conv)
-    // invece di O(n_conv × n_messages). Risolve il timeout con 28k+ messaggi.
-    let whereClause = `WHERE c.is_archived = @isArchived
-      AND c.phone NOT LIKE '%@newsletter%'
-      AND c.phone NOT LIKE '%120363%'
-      AND length(c.phone) >= 8`;
-
-    const params: Record<string, any> = { isArchived };
-
-    if (search) {
-      whereClause += ` AND (c.contact_name LIKE @search OR c.phone LIKE @search)`;
-      params.search = `%${search}%`;
-    }
-
-    const query = `
-      WITH lm_agg AS (
-        SELECT
-          phone,
-          MAX(created_at)  AS last_created,
-          MAX(content)     AS last_content_approx,
-          SUM(CASE WHEN is_read = 0 AND direction = 'received' THEN 1 ELSE 0 END) AS unread_live,
-          COUNT(CASE WHEN direction = 'received' THEN 1 END) AS recv_live
-        FROM live_messages
-        GROUP BY phone
-      ),
-      lm_last AS (
-        SELECT phone, content AS last_content, created_at AS last_at
-        FROM (
-          SELECT phone, content, created_at,
-                 ROW_NUMBER() OVER (PARTITION BY phone ORDER BY created_at DESC) AS rn
-          FROM live_messages
-        )
-        WHERE rn = 1
-      )
+    // Strategia: usa i dati già denormalizzati in conversations (last_message,
+    // last_message_at, unread_count, total_received) + un solo LEFT JOIN aggregato
+    // su live_messages per aggiungere i messaggi arrivati DOPO l'ultimo sync.
+    // Con gli indici idx_lm_phone e idx_conv_archived questo è O(n_conv) pulito.
+    let sql = `
       SELECT
         c.id, c.phone,
         c.contact_name      AS contactName,
         COALESCE(c.is_group, 0) AS isGroup,
-        COALESCE(ll.last_content, NULLIF(c.last_message, '')) AS lastMessage,
-        COALESCE(la.last_created, c.last_message_at)         AS lastMessageAt,
-        COALESCE(la.unread_live, 0) + c.unread_count         AS unreadCount,
-        COALESCE(la.recv_live, 0)  + c.total_received        AS totalReceived,
+        COALESCE(
+          lm.last_content,
+          NULLIF(c.last_message, '')
+        )                   AS lastMessage,
+        COALESCE(
+          lm.last_at,
+          c.last_message_at
+        )                   AS lastMessageAt,
+        COALESCE(lm.unread_live, 0) + c.unread_count   AS unreadCount,
+        COALESCE(lm.recv_live,  0) + c.total_received  AS totalReceived,
         c.total_sent        AS totalSent,
         c.auto_reply_enabled AS autoReplyEnabled,
         c.auto_reply_message AS autoReplyMessage,
         c.is_archived       AS isArchived,
-        c.priority, c.priority_label AS priorityLabel,
+        c.priority,
+        c.priority_label    AS priorityLabel,
         c.created_at        AS createdAt
       FROM conversations c
-      LEFT JOIN lm_agg la ON la.phone = c.phone
-      LEFT JOIN lm_last ll ON ll.phone = c.phone
-      ${whereClause}
+      LEFT JOIN (
+        SELECT
+          phone,
+          MAX(created_at)                                              AS last_at,
+          NULL AS last_content,  -- ultimo msg preso da c.last_message (già denorm.)
+          SUM(CASE WHEN is_read = 0 AND direction = 'received' THEN 1 ELSE 0 END) AS unread_live,
+          SUM(CASE WHEN direction = 'received' THEN 1 ELSE 0 END)     AS recv_live
+        FROM live_messages
+        GROUP BY phone
+      ) lm ON lm.phone = c.phone
+      WHERE c.is_archived = @isArchived
+        AND c.phone NOT LIKE '%@newsletter%'
+        AND c.phone NOT LIKE '%120363%'
+        AND length(c.phone) >= 8
+    `;
+
+    const params: Record<string, any> = { isArchived };
+
+    if (search) {
+      sql += ` AND (c.contact_name LIKE @search OR c.phone LIKE @search)`;
+      params.search = `%${search}%`;
+    }
+
+    sql += `
       ORDER BY
         CASE c.priority
           WHEN 'vip'    THEN 1
@@ -480,10 +477,10 @@ router.get('/conversations', (req: Request, res: Response) => {
           WHEN 'normal' THEN 3
           ELSE 4
         END,
-        COALESCE(la.last_created, c.last_message_at, '1970-01-01') DESC
+        COALESCE(lm.last_at, c.last_message_at, '1970-01-01') DESC
     `;
 
-    const rows = db.prepare(query).all(params);
+    const rows = db.prepare(sql).all(params);
     res.json(rows);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
