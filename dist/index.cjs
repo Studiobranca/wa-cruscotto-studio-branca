@@ -25945,45 +25945,24 @@ Data odierna: ${todayStr} (${todayISO}). Usa SEMPRE date coerenti con oggi e non
         })
       });
       if (!resp.ok) {
-        const errText = (await resp.text()).substring(0, 300);
-        const isCreditError = resp.status === 400 && errText.includes("credit balance");
-        if (isCreditError) {
-          const geminiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
-          if (geminiKey) {
-            console.warn("[Chatbot] Anthropic crediti esauriti \u2192 fallback Gemini Flash Lite");
+        const _errTxt = (await resp.text()).substring(0, 300);
+        if (resp.status === 400 && _errTxt.includes("credit balance")) {
+          const _gemKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+          if (_gemKey) {
+            console.warn("[Chatbot] Anthropic crediti esauriti → fallback Gemini");
             try {
-              const userMsg = messages.filter((m) => m.role === "user").map(
-                (m) => typeof m.content === "string" ? m.content : Array.isArray(m.content) ? m.content.filter((b) => b.type === "text").map((b) => b.text).join("\n") : ""
-              ).join("\n\n");
-              const gemResp = await fetch(`${GEMINI_URL}?key=${geminiKey}`, {
-                method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({
-                  system_instruction: { parts: [{ text: system }] },
-                  contents: [{ role: "user", parts: [{ text: userMsg }] }],
-                  generationConfig: { maxOutputTokens: 1200, temperature: 0.4 }
-                })
-              });
-              if (gemResp.ok) {
-                const gemData = await gemResp.json();
-                const gemText = gemData.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
-                if (gemText) {
-                  out.draftText = gemText;
-                  console.log(`[Chatbot] Gemini bozza generata per ${key}: ${gemText.substring(0, 80)}`);
-                  break;
-                }
-              } else {
-                console.error("[Chatbot] Gemini HTTP", gemResp.status);
+              const _uMsg = messages.filter((m) => m.role === "user").map((m) => typeof m.content === "string" ? m.content : Array.isArray(m.content) ? m.content.filter((b) => b.type === "text").map((b) => b.text).join("\n") : "").join("\n\n");
+              const _gResp = await fetch("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=" + _gemKey, {method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({system_instruction:{parts:[{text:system}]},contents:[{role:"user",parts:[{text:_uMsg}]}],generationConfig:{maxOutputTokens:1200,temperature:0.4}})});
+              if (_gResp.ok) {
+                const _gData = await _gResp.json();
+                const _gText = (_gData.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
+                if (_gText) { out.draftText = _gText; console.log("[Chatbot] Gemini ok"); break; }
               }
-            } catch (gemErr) {
-              console.error("[Chatbot] Errore Gemini:", gemErr.message);
-            }
-          } else {
-            console.warn("[Chatbot] Anthropic crediti esauriti + GEMINI_API_KEY mancante: bozza non generata.");
+            } catch(_ge) { console.error("[Chatbot] Gemini err:", _ge.message); }
           }
           return out.draftText ? { kind: "work", result: out } : null;
         }
-        console.error("[Chatbot] Anthropic HTTP", resp.status, errText);
+        console.error("[Chatbot] Anthropic HTTP", resp.status, _errTxt);
         return null;
       }
       data = await resp.json();
@@ -26215,7 +26194,7 @@ Rispondi "OK ${id} FORZA" per confermare comunque l'appuntamento.`;
   if (!r.ok) return `\u274C ${r.message}`;
   return `\u2705 Inviato a ${r.contactName || d.phone}.${r.hadEvent ? " Appuntamento [DA CONFERMARE] in agenda." : ""}`;
 }
-var ANTHROPIC_URL, ANTHROPIC_VERSION, DEFAULT_MODEL, GEMINI_URL, MAX_TOOL_LOOPS, HISTORY_LIMIT, SYSTEM_PROMPT, TOOLS, BOT_TOOL_NAMES, BREVO_URL, ALERT_SENDER;
+var ANTHROPIC_URL, ANTHROPIC_VERSION, DEFAULT_MODEL, MAX_TOOL_LOOPS, HISTORY_LIMIT, SYSTEM_PROMPT, TOOLS, BOT_TOOL_NAMES, BREVO_URL, ALERT_SENDER;
 var init_chatbot = __esm({
   "server/chatbot.ts"() {
     "use strict";
@@ -26232,7 +26211,6 @@ var init_chatbot = __esm({
     ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
     ANTHROPIC_VERSION = "2023-06-01";
     DEFAULT_MODEL = "claude-sonnet-4-6";
-    GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent";
     MAX_TOOL_LOOPS = 4;
     HISTORY_LIMIT = 30;
     db_default.exec(`
@@ -109623,7 +109601,7 @@ _(Originale: ${textToTranslate})_`;
       direction,
       direction
     );
-    if (!fromMe && !isControl && !isGroup && !isLegacyGroup) {
+    if (!fromMe && !isControl) {
       const conv = db_default.prepare(`SELECT auto_reply_enabled, auto_reply_message FROM conversations WHERE phone = ?`).get(phone);
       if (conv?.auto_reply_enabled) {
         let replyText = null;
