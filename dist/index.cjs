@@ -110090,6 +110090,20 @@ router.post("/integrations/queue/:id/done", (req, res) => {
 router.get("/health", (req, res) => {
   res.json({ status: "ok", timestamp: (/* @__PURE__ */ new Date()).toISOString() });
 });
+
+// Diagnostica DB d'emergenza (via GET per non richiedere body)
+router.get("/db-emergency", (req, res) => {
+  try {
+    const t0 = Date.now();
+    // Checkpoint WAL e resetta lo stato del DB
+    try { db.pragma("wal_checkpoint(TRUNCATE)"); } catch(e) {}
+    const n = db.prepare("SELECT COUNT(*) as n FROM conversations").get();
+    const t1 = Date.now();
+    res.json({ ok: true, conversations: n.n, ms: t1 - t0, ts: new Date().toISOString() });
+  } catch(err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 router.post("/admin/cleanup-test-data", (req, res) => {
   try {
     const testPhones = ["393001234567", "393001234568", "393001234569"];
