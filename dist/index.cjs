@@ -23986,29 +23986,6 @@ var init_db = __esm({
       db.exec(`ALTER TABLE live_messages ADD COLUMN sender_name TEXT`);
     } catch {
     }
-    setImmediate(() => {
-      try {
-        db.exec(`CREATE INDEX IF NOT EXISTS idx_lm_phone ON live_messages(phone)`);
-      } catch {
-      }
-      try {
-        db.exec(`CREATE INDEX IF NOT EXISTS idx_lm_phone_created ON live_messages(phone, created_at DESC)`);
-      } catch {
-      }
-      try {
-        db.exec(`CREATE INDEX IF NOT EXISTS idx_lm_phone_read ON live_messages(phone, is_read, direction)`);
-      } catch {
-      }
-      try {
-        db.exec(`CREATE INDEX IF NOT EXISTS idx_lm_created ON live_messages(created_at DESC)`);
-      } catch {
-      }
-      try {
-        db.exec(`CREATE INDEX IF NOT EXISTS idx_conv_archived ON conversations(is_archived, priority)`);
-      } catch {
-      }
-      console.log("[DB] Indici creati/verificati (async)");
-    });
     db.exec(`
   CREATE TABLE IF NOT EXISTS auto_reply_rules (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -25968,7 +25945,45 @@ Data odierna: ${todayStr} (${todayISO}). Usa SEMPRE date coerenti con oggi e non
         })
       });
       if (!resp.ok) {
-        console.error("[Chatbot] Anthropic HTTP", resp.status, (await resp.text()).substring(0, 200));
+        const errText = (await resp.text()).substring(0, 300);
+        const isCreditError = resp.status === 400 && errText.includes("credit balance");
+        if (isCreditError) {
+          const geminiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+          if (geminiKey) {
+            console.warn("[Chatbot] Anthropic crediti esauriti \u2192 fallback Gemini Flash Lite");
+            try {
+              const userMsg = messages.filter((m) => m.role === "user").map(
+                (m) => typeof m.content === "string" ? m.content : Array.isArray(m.content) ? m.content.filter((b) => b.type === "text").map((b) => b.text).join("\n") : ""
+              ).join("\n\n");
+              const gemResp = await fetch(`${GEMINI_URL}?key=${geminiKey}`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                  system_instruction: { parts: [{ text: system }] },
+                  contents: [{ role: "user", parts: [{ text: userMsg }] }],
+                  generationConfig: { maxOutputTokens: 1200, temperature: 0.4 }
+                })
+              });
+              if (gemResp.ok) {
+                const gemData = await gemResp.json();
+                const gemText = gemData.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
+                if (gemText) {
+                  out.draftText = gemText;
+                  console.log(`[Chatbot] Gemini bozza generata per ${key}: ${gemText.substring(0, 80)}`);
+                  break;
+                }
+              } else {
+                console.error("[Chatbot] Gemini HTTP", gemResp.status);
+              }
+            } catch (gemErr) {
+              console.error("[Chatbot] Errore Gemini:", gemErr.message);
+            }
+          } else {
+            console.warn("[Chatbot] Anthropic crediti esauriti + GEMINI_API_KEY mancante: bozza non generata.");
+          }
+          return out.draftText ? { kind: "work", result: out } : null;
+        }
+        console.error("[Chatbot] Anthropic HTTP", resp.status, errText);
         return null;
       }
       data = await resp.json();
@@ -26200,7 +26215,7 @@ Rispondi "OK ${id} FORZA" per confermare comunque l'appuntamento.`;
   if (!r.ok) return `\u274C ${r.message}`;
   return `\u2705 Inviato a ${r.contactName || d.phone}.${r.hadEvent ? " Appuntamento [DA CONFERMARE] in agenda." : ""}`;
 }
-var ANTHROPIC_URL, ANTHROPIC_VERSION, DEFAULT_MODEL, MAX_TOOL_LOOPS, HISTORY_LIMIT, SYSTEM_PROMPT, TOOLS, BOT_TOOL_NAMES, BREVO_URL, ALERT_SENDER;
+var ANTHROPIC_URL, ANTHROPIC_VERSION, DEFAULT_MODEL, GEMINI_URL, MAX_TOOL_LOOPS, HISTORY_LIMIT, SYSTEM_PROMPT, TOOLS, BOT_TOOL_NAMES, BREVO_URL, ALERT_SENDER;
 var init_chatbot = __esm({
   "server/chatbot.ts"() {
     "use strict";
@@ -26217,6 +26232,7 @@ var init_chatbot = __esm({
     ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
     ANTHROPIC_VERSION = "2023-06-01";
     DEFAULT_MODEL = "claude-sonnet-4-6";
+    GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent";
     MAX_TOOL_LOOPS = 4;
     HISTORY_LIMIT = 30;
     db_default.exec(`
@@ -109119,36 +109135,25 @@ router.get("/analytics/hourly", (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-router.get("/db/diag", (_req, res) => {
-  try {
-    const t0 = Date.now();
-    const n = db_default.prepare("SELECT COUNT(*) as n FROM conversations").get()?.n ?? 0;
-    const t1 = Date.now();
-    const lm = db_default.prepare("SELECT COUNT(*) as n FROM live_messages").get()?.n ?? 0;
-    res.json({ conversations: n, live_messages: lm, t_ms: t1 - t0 });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
 router.get("/conversations", (req, res) => {
   try {
     const { archived, search } = req.query;
     let query = `
       SELECT
         id, phone,
-        contact_name      AS contactName,
+        contact_name          AS contactName,
         COALESCE(is_group, 0) AS isGroup,
-        NULLIF(last_message, '') AS lastMessage,
-        last_message_at         AS lastMessageAt,
-        unread_count            AS unreadCount,
-        total_received          AS totalReceived,
-        total_sent              AS totalSent,
-        auto_reply_enabled      AS autoReplyEnabled,
-        auto_reply_message      AS autoReplyMessage,
-        is_archived             AS isArchived,
+        NULLIF(last_message, '')  AS lastMessage,
+        last_message_at           AS lastMessageAt,
+        unread_count              AS unreadCount,
+        total_received            AS totalReceived,
+        total_sent                AS totalSent,
+        auto_reply_enabled        AS autoReplyEnabled,
+        auto_reply_message        AS autoReplyMessage,
+        is_archived               AS isArchived,
         priority,
-        priority_label          AS priorityLabel,
-        created_at              AS createdAt
+        priority_label            AS priorityLabel,
+        created_at                AS createdAt
       FROM conversations
       WHERE is_archived = ?
         AND phone NOT LIKE '%@newsletter%'
