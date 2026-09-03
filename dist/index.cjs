@@ -110088,7 +110088,7 @@ router.post("/integrations/queue/:id/done", (req, res) => {
   }
 });
 router.get("/health", (req, res) => {
-  res.json({ status: "ok", timestamp: (/* @__PURE__ */ new Date()).toISOString() });
+  res.json({ status: "ok", timestamp: (/* @__PURE__ */ new Date()).toISOString(), v: "v2.21.11-patched" });
 });
 
 // Diagnostica DB d'emergenza (via GET per non richiedere body)
