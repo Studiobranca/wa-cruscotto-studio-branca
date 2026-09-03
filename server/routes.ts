@@ -414,32 +414,23 @@ router.get('/analytics/hourly', (req: Request, res: Response) => {
 
 // ─── Conversations ────────────────────────────────────────────────────────────
 
-// ─── ROUTE DIAGNOSTICA (temp) ────────────────────────────────────────────────
-router.get('/db/diag', (req: Request, res: Response) => {
-  const t0 = Date.now();
+// ROUTE DIAGNOSTICA TEMPORANEA
+router.get('/db/diag', (_req: Request, res: Response) => {
   try {
-    const count = (db.prepare('SELECT COUNT(*) as n FROM conversations WHERE is_archived = 0').get() as any)?.n ?? 0;
+    const t0 = Date.now();
+    const n = (db.prepare('SELECT COUNT(*) as n FROM conversations').get() as any)?.n ?? 0;
     const t1 = Date.now();
-    const lmCount = (db.prepare('SELECT COUNT(*) as n FROM live_messages').get() as any)?.n ?? 0;
-    const t2 = Date.now();
-    const sample = db.prepare('SELECT id, phone, contact_name FROM conversations WHERE is_archived = 0 LIMIT 3').all();
-    const t3 = Date.now();
-    res.json({
-      conversations_count: count, t_conversations: t1 - t0,
-      live_messages_count: lmCount, t_live_messages: t2 - t1,
-      sample, t_sample: t3 - t2,
-      total_ms: t3 - t0
-    });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
+    const lm = (db.prepare('SELECT COUNT(*) as n FROM live_messages').get() as any)?.n ?? 0;
+    res.json({ conversations: n, live_messages: lm, t_ms: t1 - t0 });
+  } catch (err: any) { res.status(500).json({ error: err.message }); }
 });
 
 router.get('/conversations', (req: Request, res: Response) => {
   try {
     const { archived, search } = req.query;
-    // FIX v2.21.5: eliminati i 5 subquery correlati che bloccavano il thread
-    // per 20s+ con 2960 conversazioni. Usa solo dati denormalizzati in conversations.
+    // FIX v2.21.8: eliminati i 5 subquery correlati su live_messages
+    // che bloccavano il thread Node.js per 20s con 2960+ conversazioni.
+    // Usa solo i dati denormalizzati in conversations.
     let query = `
       SELECT
         id, phone,
