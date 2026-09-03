@@ -83,13 +83,17 @@ try { db.exec(`ALTER TABLE live_messages ADD COLUMN sender_name TEXT`); } catch 
 
 
 // ─── INDICI CRITICI per performance (09/2026) ────────────────────────────────
-// Senza questi indici, la query GET /conversations con subquery correlate
-// scansiona tutta live_messages per ogni conversazione → timeout con 28k+ msg.
-try { db.exec(`CREATE INDEX IF NOT EXISTS idx_lm_phone ON live_messages(phone)`); } catch {}
-try { db.exec(`CREATE INDEX IF NOT EXISTS idx_lm_phone_created ON live_messages(phone, created_at DESC)`); } catch {}
-try { db.exec(`CREATE INDEX IF NOT EXISTS idx_lm_phone_read ON live_messages(phone, is_read, direction)`); } catch {}
-try { db.exec(`CREATE INDEX IF NOT EXISTS idx_lm_created ON live_messages(created_at DESC)`); } catch {}
-try { db.exec(`CREATE INDEX IF NOT EXISTS idx_conv_archived ON conversations(is_archived, priority)`); } catch {}
+// Creati in modo ASINCRONO (setImmediate) per non bloccare il thread principale
+// durante il primo avvio. Con 28k+ righe, CREATE INDEX può richiedere secondi
+// e bloccare le richieste HTTP se eseguito in modo sincrono al boot.
+setImmediate(() => {
+  try { db.exec(`CREATE INDEX IF NOT EXISTS idx_lm_phone ON live_messages(phone)`); } catch {}
+  try { db.exec(`CREATE INDEX IF NOT EXISTS idx_lm_phone_created ON live_messages(phone, created_at DESC)`); } catch {}
+  try { db.exec(`CREATE INDEX IF NOT EXISTS idx_lm_phone_read ON live_messages(phone, is_read, direction)`); } catch {}
+  try { db.exec(`CREATE INDEX IF NOT EXISTS idx_lm_created ON live_messages(created_at DESC)`); } catch {}
+  try { db.exec(`CREATE INDEX IF NOT EXISTS idx_conv_archived ON conversations(is_archived, priority)`); } catch {}
+  console.log('[DB] Indici creati/verificati (async)');
+});
 
 // ─── Automazioni (ripristino dal progetto iniziale wa-cruscotto) ─────────────
 db.exec(`
