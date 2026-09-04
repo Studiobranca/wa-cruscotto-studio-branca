@@ -151,3 +151,5 @@ con `agendaDigest:ok` e `agendaReminder:ok`.
 **Assunzione (modificabile).** Digest inviato **anche nel weekend** (`agenda_digest_weekends=1`),
 perché è l'agenda personale di Mariano. Per soli feriali: impostare `agenda_digest_weekends=0` in
 `app_settings` (nessun redeploy).
+
+# Restart automatico 2026-09-04T10:53:58Z — riavvio dopo crash
